@@ -27,21 +27,19 @@ struct nt36532 {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_info *panel_info;
+	struct drm_dsc_config dsc;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
 };
 
 struct panel_info {
-	unsigned int width_mm;
-	unsigned int height_mm;
-
 	unsigned int lanes;
 	enum mipi_dsi_pixel_format format;
 	unsigned long mode_flags;
 
 	const struct drm_display_mode display_mode;
 
-	struct drm_dsc_config * const dsc_cfg;
+	const struct drm_dsc_config *dsc_cfg;
 
 	int (*init_sequence)(struct nt36532 *ctx);
 
@@ -149,7 +147,7 @@ static int csot_init_sequence(struct nt36532 *ctx)
 
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x22);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_LUT, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2d, 0x01);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x24);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbc,
@@ -182,29 +180,28 @@ static int csot_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x23, 0x28);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x24, 0x2c);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x25, 0x30);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_GAMMA_CURVE, 0x34);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x26, 0x34);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x27, 0x38);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x28, 0x3c);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2a, 0x20);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2b, 0x20);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_PARTIAL_ROWS, 0xff);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_PARTIAL_COLUMNS,
-				     0xfd);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x30, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x31, 0xfd);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x32, 0xfc);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x33, 0xfa);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x34, 0xf8);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x35, 0xf6);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_ADDRESS_MODE, 0xf4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x36, 0xf4);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x37, 0xf2);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x38, 0xf0);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x39, 0xee);
-	mipi_dsi_dcs_set_pixel_format_multi(&dsi_ctx, 0xec);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3a, 0xec);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3b, 0xea);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_3D_CONTROL, 0xe9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3d, 0xe9);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3f, 0xe8);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_VSYNC_TIMING, 0xe7);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x40, 0xe7);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x41, 0xe6);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_GET_SCANLINE, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x45, 0xff);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x46, 0xf9);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x47, 0xf6);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x48, 0xf2);
@@ -216,10 +213,9 @@ static int csot_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4e, 0xde);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4f, 0xd9);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x50, 0xd6);
-	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 0x00d4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0xd4);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x52, 0xc2);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
-				     0xd0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0xd0);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x54, 0xcd);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x58, 0xff);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x59, 0xf6);
@@ -227,8 +223,7 @@ static int csot_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5b, 0xeb);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5c, 0xe8);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5d, 0xe5);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_CABC_MIN_BRIGHTNESS,
-				     0xe3);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5e, 0xe3);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5f, 0xe0);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0xde);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x61, 0xda);
@@ -241,9 +236,8 @@ static int csot_init_sequence(struct nt36532 *ctx)
 
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x27);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_PARTIAL_ROWS, 0xf0);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_PARTIAL_COLUMNS,
-				     0x2a, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x30, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x31, 0x2a, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd0, 0x31);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd1, 0x54);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xde, 0x40);
@@ -264,7 +258,8 @@ static int csot_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x01, 0x8c);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x10);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 0xff07);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
+				     0x07, 0xff);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
 				     0x2c);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x00);
@@ -275,7 +270,7 @@ static int csot_init_sequence(struct nt36532 *ctx)
 
 	/* Enable DSC */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x90, 0x03);
-	drm_dsc_pps_payload_pack(&pps, ctx->panel_info->dsc_cfg);
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
 	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9d, 0x01);
 
@@ -303,9 +298,11 @@ static const struct drm_display_mode csot_display_mode = {
 	.vsync_start = 2120 + 26,
 	.vsync_end = 2120 + 26 + 2,
 	.vtotal = 2120 + 26 + 2 + 208,
+	.width_mm = 250,
+	.height_mm = 177,
 };
 
-static struct drm_dsc_config csot_dsc_cfg = {
+static const struct drm_dsc_config csot_dsc_cfg = {
 	.dsc_version_major = 1,
 	.dsc_version_minor = 2,
 	.slice_height = 20,
@@ -349,6 +346,8 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	if (!panel_info)
 		return -ENODEV;
 
+	ctx->dsc = *panel_info->dsc_cfg;
+
 	if (panel_info->is_dual_dsi) {
 		num_dsi = 2;
 		dsi1 = of_graph_get_remote_node(dsi->dev.of_node, 1, -1);
@@ -362,8 +361,6 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 		if (!dsi1_host)
 			return dev_err_probe(dev, -EPROBE_DEFER,
 					     "cannot get secondary DSI host\n");
-
-		dsi_info.node = dsi1;
 
 		ctx->dsi[1] = devm_mipi_dsi_device_register_full(dev, dsi1_host,
 								 &dsi_info);
@@ -380,6 +377,10 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 
 	ctx->panel.prepare_prev_first = true;
 
+	ret = drm_panel_of_backlight(&ctx->panel);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to get backlight\n");
+
 	ret = devm_drm_panel_add(dev, &ctx->panel);
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "failed to add panel\n");
@@ -388,7 +389,7 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 		ctx->dsi[i]->lanes = panel_info->lanes;
 		ctx->dsi[i]->format = panel_info->format;
 		ctx->dsi[i]->mode_flags = panel_info->mode_flags;
-		ctx->dsi[i]->dsc = panel_info->dsc_cfg;
+		ctx->dsi[i]->dsc = &ctx->dsc;
 		ret = devm_mipi_dsi_attach(dev, ctx->dsi[i]);
 		if (ret < 0) {
 			return dev_err_probe(dev, ret,
@@ -400,8 +401,6 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 }
 
 static const struct panel_info csot_panel_info = {
-	.width_mm = 250,
-	.height_mm = 177,
 	.lanes = 4,
 	.format = MIPI_DSI_FMT_RGB888,
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |
@@ -427,6 +426,6 @@ static struct mipi_dsi_driver nt36532_driver = {
 };
 module_mipi_dsi_driver(nt36532_driver);
 
-MODULE_AUTHOR("Junjie Cao <caojunjie650@gmail.com>");
+MODULE_AUTHOR("Junjie Cao <junjie.cao@linux.dev>");
 MODULE_DESCRIPTION("DRM driver for Novatek NT36532 based MIPI DSI panels");
 MODULE_LICENSE("GPL");
