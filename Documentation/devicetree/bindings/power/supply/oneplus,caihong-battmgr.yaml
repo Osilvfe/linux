@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/oneplus,caihong-battmgr.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OnePlus Caihong PMIC GLINK battery policy properties
+
+maintainers:
+  - Osilvfe <64585305+Osilvfe@users.noreply.github.com>
+
+description:
+  Private battery-management firmware capabilities used by the OnePlus
+  Caihong development platform. The properties are referenced by the generic
+  Qualcomm PMIC GLINK binding because they live on that firmware-interface
+  node, while their device policy remains defined here.
+
+select: false
+
+$defs:
+  pps-read-buffer:
+    type: boolean
+    description:
+      The firmware implements the OnePlus read-only PPS capability-buffer
+      request used to retrieve the connected source PDO table.
+
+  pps-fixed-5v:
+    type: boolean
+    description:
+      The firmware implements the OnePlus fixed-PDO request used to return a
+      connected USB PD source to 5 V. It requires PPS capability reads.
+
+  pps-5v5-1a:
+    type: boolean
+    description:
+      Enable the bounded 5.5 V at 1 A programmable-PDO development test. It
+      requires the fixed-5-V fallback interface.
+
+  pps-ramp-9v-1a:
+    type: boolean
+    description:
+      Enable the source-only 5.5-V to 9-V ramp in 0.5-V steps at 1 A. It does
+      not enable a charge pump.
+
+  pps-ramp-9v2-1a:
+    type: boolean
+    description:
+      Extend the validated 9-V ramp with 9.1-V and 9.2-V requests at 1 A.
+
+  pps-ramp-2to1-1a:
+    type: boolean
+    description:
+      Enable the gauge-derived source ramp used for bounded 2-to-1 charge-pump
+      development tests. This gate alone never enables a charge pump.
+
+  pps-run-2to1-5m:
+    type: boolean
+    description:
+      Enable the bounded end-to-end primary charge-pump development run with
+      direct handoff and fixed-5-V cleanup.
+
+  pps-policy-2to1-1a:
+    type: boolean
+    description:
+      Enable the asynchronous single-primary 2-to-1 development policy with
+      USB, battery-voltage, battery-temperature and pump-local safety checks.
+
+  pps-policy-auto-start:
+    type: boolean
+    description:
+      Arm the single-primary policy on physical detach and start it once on a
+      subsequent confirmed source attachment.
+
+  pps-secondary-500ms:
+    type: boolean
+    description:
+      Enable the independently bounded secondary charge-pump test gate.
+
+  pps-dual-500ms:
+    type: boolean
+    description:
+      Enable the staged dual-pump development policy, including bounded boost,
+      continuous monitoring and fixed-5-V cleanup.
+
+additionalProperties: true
+...

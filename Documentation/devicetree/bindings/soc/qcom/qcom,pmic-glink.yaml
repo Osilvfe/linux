@@ -64,6 +64,39 @@ properties:
       The array should contain a gpio entry for each PMIC Glink connector, in reg order.
       It is defined that GPIO active level means "CC2" or Reversed/Flipped orientation.
 
+  oneplus,pps-read-buffer:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-read-buffer
+
+  oneplus,pps-fixed-5v:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-fixed-5v
+
+  oneplus,pps-5v5-1a:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-5v5-1a
+
+  oneplus,pps-ramp-9v-1a:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-ramp-9v-1a
+
+  oneplus,pps-ramp-9v2-1a:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-ramp-9v2-1a
+
+  oneplus,pps-ramp-2to1-1a:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-ramp-2to1-1a
+
+  oneplus,pps-run-2to1-5m:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-run-2to1-5m
+
+  oneplus,pps-policy-2to1-1a:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-policy-2to1-1a
+
+  oneplus,pps-policy-auto-start:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-policy-auto-start
+
+  oneplus,pps-secondary-500ms:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-secondary-500ms
+
+  oneplus,pps-dual-500ms:
+    $ref: /schemas/power/supply/oneplus,caihong-battmgr.yaml#/$defs/pps-dual-500ms
+
   nvmem-cells:
     minItems: 3
     maxItems: 3
@@ -131,4 +164,3 @@ examples:
         };
     };
 ...
-

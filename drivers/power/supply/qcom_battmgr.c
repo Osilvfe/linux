@@ -104,6 +104,8 @@ enum qcom_battmgr_variant {
 #define CHARGE_CTRL_END_THR_MAX		100
 #define CHARGE_CTRL_DELTA_SOC		5
 
+#include "qcom_battmgr_caihong.h"
+
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
 	__le32 battery_id;
@@ -322,6 +324,7 @@ struct qcom_battmgr {
 
 	int error;
 	struct completion ack;
+#include "qcom_battmgr_caihong_state.inc"
 
 	bool service_up;
 
@@ -339,6 +342,8 @@ struct qcom_battmgr {
 	 */
 	struct mutex lock;
 };
+
+#include "qcom_battmgr_caihong_policy.inc"
 
 static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 {
@@ -1217,7 +1222,12 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		power_supply_changed(battmgr->wls_psy);
 		break;
 	default:
-		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
+		/* Vendor firmware may send private notification IDs. The Qualcomm
+		 * downstream driver ignores these as well; property reads still query
+		 * the remote service synchronously.
+		 */
+		dev_dbg_ratelimited(battmgr->dev, "unknown notification: %#x\n",
+				    notification);
 		break;
 	}
 }
@@ -1426,7 +1436,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->status.voltage_ocv = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_VOLT_NOW:
-			battmgr->status.voltage_now = le32_to_cpu(resp->intval.value);
+			val = le32_to_cpu(resp->intval.value);
+			battmgr->status.voltage_now = val;
+			qcom_battmgr_caihong_cache_vbat(battmgr, val);
 			break;
 		case BATT_VOLT_MAX:
 			battmgr->info.voltage_max = le32_to_cpu(resp->intval.value);
@@ -1574,6 +1586,9 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 	struct qcom_battmgr *battmgr = priv;
 	unsigned int opcode = le32_to_cpu(hdr->opcode);
 
+	if (qcom_battmgr_caihong_handle_response(battmgr, data, len))
+		return;
+
 	if (opcode == BATTMGR_NOTIFICATION)
 		qcom_battmgr_notification(battmgr, data, len);
 	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
@@ -1593,9 +1608,21 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
-	if (ret)
+	mutex_unlock(&battmgr->lock);
+	if (ret) {
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+		return;
+	}
+
+	/* The supplies are registered before the remote service is up, so their
+	 * initial synthetic uevents can fail with -EAGAIN. Refresh them once the
+	 * service has accepted notifications to give userspace valid state.
+	 */
+	power_supply_changed(battmgr->bat_psy);
+	power_supply_changed(battmgr->usb_psy);
+	power_supply_changed(battmgr->wls_psy);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
@@ -1603,10 +1630,12 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 	struct qcom_battmgr *battmgr = priv;
 
 	if (state == SERVREG_SERVICE_STATE_UP) {
-		battmgr->service_up = true;
+		WRITE_ONCE(battmgr->service_up, true);
 		schedule_work(&battmgr->enable_work);
+		qcom_battmgr_caihong_service_event(battmgr, true);
 	} else {
-		battmgr->service_up = false;
+		WRITE_ONCE(battmgr->service_up, false);
+		qcom_battmgr_caihong_service_event(battmgr, false);
 	}
 }
 
@@ -1651,6 +1680,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
+
+	ret = qcom_battmgr_caihong_init(battmgr);
+	if (ret)
+		return ret;
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
 	if (match)
@@ -1720,7 +1753,18 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 
 	pmic_glink_client_register(battmgr->client);
 
-	return 0;
+	return qcom_battmgr_caihong_register(battmgr);
+}
+
+static void qcom_battmgr_remove(struct auxiliary_device *adev)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+
+	if (!battmgr)
+		return;
+
+	qcom_battmgr_caihong_remove(battmgr);
+	cancel_work_sync(&battmgr->enable_work);
 }
 
 static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
@@ -1732,6 +1776,7 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
 static struct auxiliary_driver qcom_battmgr_driver = {
 	.name = "pmic_glink_power_supply",
 	.probe = qcom_battmgr_probe,
+	.remove = qcom_battmgr_remove,
 	.id_table = qcom_battmgr_id_table,
 };
 
