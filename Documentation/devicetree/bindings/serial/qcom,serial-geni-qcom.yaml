@@ -54,6 +54,13 @@ properties:
   power-domains:
     maxItems: 1
 
+  qcom,force-fifo-mode:
+    type: boolean
+    description:
+      Use programmed-I/O FIFO transfers instead of DMA. This is intended for
+      devices whose UART-connected peripheral is incompatible with the DMA
+      receive path.
+
   reg:
     maxItems: 1
 
