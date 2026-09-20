@@ -33,6 +33,7 @@
 
 	aliases {
 		serial1 = &uart14;
+		serial5 = &uart7;
 	};
 
 	gpio-keys {
@@ -58,6 +59,16 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 		orientation-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
+		oneplus,pps-read-buffer;
+		oneplus,pps-fixed-5v;
+		oneplus,pps-5v5-1a;
+		oneplus,pps-ramp-9v-1a;
+		oneplus,pps-ramp-9v2-1a;
+		oneplus,pps-ramp-2to1-1a;
+		oneplus,pps-run-2to1-5m;
+		oneplus,pps-policy-2to1-1a;
+		oneplus,pps-secondary-500ms;
+		oneplus,pps-dual-500ms;
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -549,7 +560,27 @@
 
 	status = "okay";
 
-	// sc8547-charger-slave@6F
+	sc8547_secondary: charger@6f {
+		compatible = "southchip,sc8547";
+		reg = <0x6f>;
+		southchip,role = "secondary";
+		southchip,allow-experimental-control;
+		southchip,experimental-reg00 = <0x36>;
+		southchip,experimental-reg02 = <0x01>;
+		southchip,experimental-reg04 = <0x50>;
+		southchip,experimental-reg05 = <0x1b>;
+		southchip,allow-experimental-cp-pulse;
+		southchip,experimental-vbus-min-uv = <7650000>;
+		southchip,experimental-vbus-max-uv = <9400000>;
+		southchip,experimental-start-delta-uv = <450000>;
+		southchip,experimental-start-overshoot-max-uv = <200000>;
+		southchip,experimental-start-reference-max-uv = <4350000>;
+		southchip,experimental-pulse-vbus-min-uv = <7300000>;
+		southchip,experimental-pulse-ratio-error-max-uv = <250000>;
+		southchip,experimental-vbat-min-uv = <3600000>;
+		southchip,experimental-vbat-max-uv = <4500000>;
+		southchip,experimental-tdie-max-mc = <70000>;
+	};
 };
 
 &i2c_hub_2 {
@@ -557,7 +588,28 @@
 
 	status = "okay";
 
-	// oplus,sc8547a@6F
+	sc8547_primary: charger@6f {
+		compatible = "southchip,sc8547a";
+		reg = <0x6f>;
+		southchip,role = "primary";
+		southchip,allow-experimental-control;
+		southchip,experimental-reg00 = <0x36>;
+		southchip,experimental-reg01 = <0xbf>;
+		southchip,experimental-reg02 = <0x01>;
+		southchip,experimental-reg04 = <0x50>;
+		southchip,experimental-reg05 = <0x1b>;
+		southchip,experimental-reg0d = <0x50>;
+		southchip,allow-experimental-cp-pulse;
+		southchip,experimental-vbus-min-uv = <7650000>;
+		southchip,experimental-vbus-max-uv = <9400000>;
+		southchip,experimental-start-delta-uv = <450000>;
+		southchip,experimental-start-overshoot-max-uv = <200000>;
+		southchip,experimental-pulse-vbus-min-uv = <7300000>;
+		southchip,experimental-pulse-ratio-error-max-uv = <250000>;
+		southchip,experimental-vbat-min-uv = <3600000>;
+		southchip,experimental-vbat-max-uv = <4350000>;
+		southchip,experimental-tdie-max-mc = <70000>;
+	};
 };
 
 &i2c_hub_3 {
@@ -845,6 +897,38 @@
 
 &qupv3_id_1 {
 	status = "okay";
+
+	uart7: serial@a9c000 {
+		compatible = "qcom,geni-uart";
+		reg = <0 0x00a9c000 0 0x4000>;
+		interrupts = <GIC_SPI 579 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&gcc GCC_QUPV3_WRAP1_S7_CLK>;
+		clock-names = "se";
+		interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
+				 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
+				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ACTIVE_ONLY>;
+		interconnect-names = "qup-core", "qup-config";
+		power-domains = <&rpmhpd RPMHPD_CX>;
+		operating-points-v2 = <&qup_opp_table_100mhz>;
+		pinctrl-0 = <&pogo_uart_default>;
+		pinctrl-names = "default";
+		qcom,force-fifo-mode;
+		status = "okay";
+
+		keyboard {
+			compatible = "oneplus,caihong-pogo";
+			current-speed = <921600>;
+			power-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+			wake-gpios = <&tlmm 137 GPIO_ACTIVE_LOW>;
+			tx-enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+			touchpad-size-x = <2764>;
+			touchpad-size-y = <1630>;
+			touchpad-resolution-x = <23>;
+			touchpad-resolution-y = <23>;
+			oneplus,crc-ibm-init = <0xc596>;
+		};
+	};
 };
 
 &remoteproc_adsp {
@@ -936,6 +1020,37 @@
 		bias-pull-down;
 	};
 
+	pogo_uart_default: pogo-uart-default-state {
+		tx-pins {
+			pins = "gpio62";
+			function = "qup1_se7";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		rx-pins {
+			pins = "gpio63";
+			function = "qup1_se7";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		control-pins {
+			pins = "gpio14", "gpio100";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		wake-pins {
+			pins = "gpio137";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-up;
+			input-enable;
+		};
+	};
+
 	ts_default: ts-default-state {
 		pins = "gpio162";
 		function = "gpio";
@@ -951,13 +1066,6 @@
 		bias-pull-down;
 	};
 };
-/*
-&uart7 {
-	status = "okay";
-
-	// pogo pin keyboard
-};
-*/
 &uart14 {
 	status = "okay";
 
