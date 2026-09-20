@@ -217,6 +217,16 @@ config BATTERY_QCOM_BATTMGR
 	  which is used on modern Qualcomm platforms to provide battery and
 	  power supply information.
 
+config BATTERY_QCOM_BATTMGR_CAIHONG
+	bool "OnePlus Caihong battery-manager policy"
+	depends on BATTERY_QCOM_BATTMGR=y
+	help
+	  Enable the OnePlus firmware extensions and dual-SC8547 charging
+	  policy used by the OnePlus Pad Pro (Caihong).  This device-specific
+	  policy is also gated by properties on the PMIC-GLINK device node.
+
+	  Leave this disabled for other Qualcomm platforms.
+
 config BATTERY_OLPC
 	tristate "One Laptop Per Child battery"
 	depends on OLPC_EC
