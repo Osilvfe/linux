@@ -8,6 +8,8 @@
 
 /dts-v1/;
 
+#include <dt-bindings/clock/qcom,sm8650-camcc.h>
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include "sm8650.dtsi"
 #include "pm8550.dtsi"
@@ -647,6 +649,139 @@
 	};
 };
 
+/*
+ * Mainline camera bring-up. The downstream Caihong overlay connects the rear
+ * SC1320CS to CSIPHY1 and the front SC820CS to CSIPHY4.
+ */
+&camss {
+	/* SM8650 CAMSS groups CSIPHY0/1 on the shared 01 rail pair. */
+	vdd-csiphy01-0p9-supply = <&vreg_l2i_0p88>;
+	vdd-csiphy01-1p2-supply = <&vreg_l3i_1p2>;
+	/* SM8650 CAMSS groups CSIPHY2/4 on the shared 24 rail pair. */
+	vdd-csiphy24-0p9-supply = <&vreg_l2i_0p88>;
+	vdd-csiphy24-1p2-supply = <&vreg_l3i_1p2>;
+	status = "okay";
+
+	ports {
+		port@1 {
+			reg = <1>;
+
+			caihong_csiphy1_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&caihong_rear_cam_ep>;
+			};
+		};
+
+		port@4 {
+			reg = <4>;
+
+			caihong_csiphy4_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&caihong_front_cam_ep>;
+			};
+		};
+	};
+};
+
+/* Caihong's downstream overlay drives the rear MCLK1 pin at 4 mA. */
+&cam1_default {
+	drive-strength = <4>;
+};
+
+&cam1_sleep {
+	drive-strength = <4>;
+};
+
+&cci0 {
+	status = "okay";
+};
+
+&cci0_i2c0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	clock-frequency = <400000>;
+	/* The downstream Caihong CCI timing enables SCL clock stretching. */
+	hw-scl-stretch-en = <1>;
+
+	/* Hardware probe while powered: SC820CS responds at Linux address 0x10. */
+	front_camera: camera@10 {
+		compatible = "smartsens,sc820cs";
+		reg = <0x10>;
+		orientation = <0>;
+		rotation = <180>;
+
+		clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		clock-names = "xvclk";
+		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam4_default>, <&cam4_reset_active>;
+		pinctrl-1 = <&cam4_sleep>, <&cam4_reset_suspend>;
+		pinctrl-names = "default", "sleep";
+
+		dovdd-supply = <&vreg_l4b_1p8>;
+		avdd-supply = <&vreg_l16b_2p8>;
+		dvdd-supply = <&vreg_l2g_1p2>;
+
+		port {
+			caihong_front_cam_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <366000000>;
+				remote-endpoint = <&caihong_csiphy4_ep>;
+			};
+		};
+	};
+};
+
+&cci0_i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	clock-frequency = <400000>;
+	hw-scl-stretch-en = <1>;
+
+	rear_camera: camera@36 {
+		compatible = "smartsens,sc1320cs";
+		reg = <0x36>;
+		orientation = <1>;
+		rotation = <180>;
+		lens-focus = <&rear_camera_focus>;
+		flash-leds = <&rear_flash_yellow>, <&rear_flash_white>;
+
+		clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		clock-names = "xvclk";
+		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 82 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam1_default>, <&cam1_reset_active>;
+		pinctrl-1 = <&cam1_sleep>, <&cam1_reset_suspend>;
+		pinctrl-names = "default", "sleep";
+
+		dovdd-supply = <&vreg_l4b_1p8>;
+		avdd-supply = <&vreg_l16b_2p8>;
+		dvdd-supply = <&vreg_l2g_1p2>;
+
+		port {
+			caihong_rear_cam_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <600000000>;
+				remote-endpoint = <&caihong_csiphy1_ep>;
+			};
+		};
+	};
+
+	rear_camera_focus: lens@c {
+		compatible = "giantec,gt9772";
+		reg = <0x0c>;
+
+		vio-supply = <&vreg_l4b_1p8>;
+		vaf-supply = <&vreg_l9b_2p8>;
+	};
+};
+
 // qrd use this ?
 &qup_i2c3_data_clk {
 	/* Use internal I2C pull-up */
@@ -851,6 +986,30 @@
 	};
 };
 
+&pm8550_flash {
+	status = "okay";
+
+	rear_flash_yellow: led-0 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_YELLOW>;
+		led-sources = <1>;
+		led-max-microamp = <500000>;
+		flash-max-microamp = <1500000>;
+		flash-max-timeout-us = <1280000>;
+		function-enumerator = <0>;
+	};
+
+	rear_flash_white: led-1 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_WHITE>;
+		led-sources = <2>;
+		led-max-microamp = <500000>;
+		flash-max-microamp = <1500000>;
+		flash-max-timeout-us = <1280000>;
+		function-enumerator = <1>;
+	};
+};
+
 &pm8550b_eusb2_repeater {
 	/* 0x51 */
 	qcom,tune-usb2-amplitude = /bits/ 8 <0xd>;
@@ -990,6 +1149,36 @@
 
 &tlmm {
 	gpio-reserved-ranges = <36 4>, <74 1>;
+
+	cam4_reset_active: cam4-reset-active-state {
+		pins = "gpio7";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam4_reset_suspend: cam4-reset-suspend-state {
+		pins = "gpio7";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+
+	cam1_reset_active: cam1-reset-active-state {
+		pins = "gpio82";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam1_reset_suspend: cam1-reset-suspend-state {
+		pins = "gpio82";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
 
 	bt_default: bt-default-state {
 		bt-en-pins {
