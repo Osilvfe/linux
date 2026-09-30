@@ -11,6 +11,8 @@
 #include <linux/kernel.h>
 #include <linux/of.h>
 
+#include <media/v4l2-event.h>
+
 #include "camss.h"
 #include "camss-csid.h"
 #include "camss-csid-gen3.h"
@@ -57,7 +59,9 @@
 
 #define CSID_CSI2_RDIN_IRQ_STATUS(rdi)	(0xEC + 0x10 * (rdi))
 #define		RUP_DONE_IRQ_STATUS		BIT(23)
+#define		INPUT_SOF_IRQ_STATUS		BIT(12)
 
+#define CSID_CSI2_RDIN_IRQ_MASK(rdi)	(0xF0 + 0x10 * (rdi))
 #define CSID_CSI2_RDIN_IRQ_CLEAR(rdi)	(0xF4 + 0x10 * (rdi))
 #define CSID_CSI2_RDIN_IRQ_SET(rdi)	(0xF8 + 0x10 * (rdi))
 
@@ -276,8 +280,18 @@ static irqreturn_t csid_isr(int irq, void *dev)
 	/* Read and clear IRQ status for each enabled RDI channel */
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
 		if (csid->phy.en_vc & BIT(i)) {
+			struct v4l2_event event = {
+				.type = V4L2_EVENT_FRAME_SYNC,
+			};
+
 			val = readl(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
 			writel(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
+
+			if (val & INPUT_SOF_IRQ_STATUS) {
+				event.u.frame_sync.frame_sequence =
+					csid->frame_sequence[i]++;
+				v4l2_event_queue(csid->subdev.devnode, &event);
+			}
 
 			if (val & RUP_DONE_IRQ_STATUS)
 				/* clear the reg update bit */
@@ -322,6 +336,9 @@ static int csid_reset(struct csid_device *csid)
 
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
 		if (csid->phy.en_vc & BIT(i)) {
+			csid->frame_sequence[i] = 0;
+			writel(INPUT_SOF_IRQ_STATUS | RUP_DONE_IRQ_STATUS,
+			       csid->base + CSID_CSI2_RDIN_IRQ_MASK(i));
 			writel(BIT(BUF_DONE_IRQ_STATUS_RDI_OFFSET + i),
 			       csid->base + CSID_BUF_DONE_IRQ_CLEAR);
 			writel(IRQ_CMD_CLEAR, csid->base + CSID_IRQ_CMD);
@@ -349,6 +366,7 @@ static int csid_reset(struct csid_device *csid)
 static void csid_subdev_init(struct csid_device *csid)
 {
 	csid->testgen.nmodes = CSID_PAYLOAD_MODE_DISABLED;
+	csid->frame_sync_supported = true;
 }
 
 const struct csid_hw_ops csid_ops_gen3 = {

@@ -155,6 +155,8 @@ struct csid_device {
 	u32 irq;
 	char irq_name[30];
 	u32 reg_update;
+	u32 frame_sequence[MSM_CSID_MAX_SRC_STREAMS];
+	bool frame_sync_supported;
 	struct camss_clock *clock;
 	int nclocks;
 	struct regulator_bulk_data *supplies;

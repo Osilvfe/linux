@@ -9,6 +9,8 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 
+#include <media/v4l2-event.h>
+
 #include "camss.h"
 #include "camss-csid.h"
 #include "camss-csid-gen2.h"
@@ -343,8 +345,11 @@ static int csid_reset(struct csid_device *csid)
 	}
 
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++) {
-		/* Enable RUP done for the client port */
-		writel(CSID_CSI2_RDIN_RUP_DONE, csid->base + CSID_CSI2_RDIN_IRQ_MASK(i));
+		/* Enable register-update and input frame-start notifications. */
+		writel(CSID_CSI2_RDIN_RUP_DONE |
+		       CSID_CSI2_RDIN_INFO_INPUT_SOF,
+		       csid->base + CSID_CSI2_RDIN_IRQ_MASK(i));
+		csid->frame_sequence[i] = 0;
 	}
 
 	/* Clear RDI status */
@@ -391,9 +396,19 @@ static irqreturn_t csid_isr(int irq, void *dev)
 
 	/* Process state for each RDI channel */
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++) {
+		struct v4l2_event event = {
+			.type = V4L2_EVENT_FRAME_SYNC,
+		};
+
 		val = readl(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
 		if (val)
 			writel(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
+
+		if (val & CSID_CSI2_RDIN_INFO_INPUT_SOF) {
+			event.u.frame_sync.frame_sequence =
+				csid->frame_sequence[i]++;
+			v4l2_event_queue(csid->subdev.devnode, &event);
+		}
 
 		if (val & CSID_CSI2_RDIN_RUP_DONE)
 			csid_rup_complete(csid, i);
@@ -420,7 +435,10 @@ static void csid_subdev_reg_update(struct csid_device *csid, int port_id, bool i
 		csid_reg_update(csid, port_id);
 }
 
-static void csid_subdev_init(struct csid_device *csid) {}
+static void csid_subdev_init(struct csid_device *csid)
+{
+	csid->frame_sync_supported = true;
+}
 
 const struct csid_hw_ops csid_ops_680 = {
 	.configure_testgen_pattern = NULL,
