@@ -714,6 +714,7 @@
 		clock-names = "xvclk";
 		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
 		assigned-clock-rates = <19200000>;
+		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
 
 		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
 		pinctrl-0 = <&cam4_default>, <&cam4_reset_active>;
@@ -753,6 +754,7 @@
 		clock-names = "xvclk";
 		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
 		assigned-clock-rates = <19200000>;
+		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
 
 		reset-gpios = <&tlmm 82 GPIO_ACTIVE_LOW>;
 		pinctrl-0 = <&cam1_default>, <&cam1_reset_active>;
