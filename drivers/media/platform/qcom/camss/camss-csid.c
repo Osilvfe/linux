@@ -760,6 +760,7 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
 static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct csid_device *csid = v4l2_get_subdevdata(sd);
+	unsigned int i;
 	int ret;
 
 	if (enable) {
@@ -775,6 +776,10 @@ static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 		if (!csid->testgen.enabled &&
 		    !media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_SINK]))
 			return -ENOLINK;
+
+		if (csid->frame_sync_supported)
+			for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
+				csid->frame_sequence[i] = 0;
 	}
 
 	if (csid->phy.need_vc_update) {
@@ -1315,9 +1320,23 @@ static int csid_link_setup(struct media_entity *entity,
 	return 0;
 }
 
+static int csid_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+				struct v4l2_event_subscription *sub)
+{
+	struct csid_device *csid = v4l2_get_subdevdata(sd);
+
+	if (sub->type != V4L2_EVENT_FRAME_SYNC)
+		return v4l2_ctrl_subdev_subscribe_event(sd, fh, sub);
+
+	if (!csid->frame_sync_supported || sub->id)
+		return -EINVAL;
+
+	return v4l2_event_subscribe(fh, sub, 0, NULL);
+}
+
 static const struct v4l2_subdev_core_ops csid_core_ops = {
 	.s_power = csid_set_power,
-	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+	.subscribe_event = csid_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 };
 
