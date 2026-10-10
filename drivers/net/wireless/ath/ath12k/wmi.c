@@ -8424,7 +8424,11 @@ static int ath12k_wmi_tlv_fw_stats_data_parse(struct ath12k_base *ab,
 		}
 
 		arvif = ath12k_mac_get_arvif(ar, le32_to_cpu(src->vdev_id));
-		if (arvif) {
+		/* Firmware reports every active VDEV in this event.  An AP VDEV
+		 * has no beacon station entry, so there is nothing to update in
+		 * the station-mode RSSI cache for it.
+		 */
+		if (arvif && arvif->ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
 			spin_lock_bh(&ab->base_lock);
 			arsta = ath12k_link_sta_find_by_addr(ab, arvif->bssid);
 			if (arsta) {
@@ -8433,9 +8437,9 @@ static int ath12k_wmi_tlv_fw_stats_data_parse(struct ath12k_base *ab,
 					   "wmi stats vdev id %d snr %d\n",
 					   src->vdev_id, src->beacon_snr);
 			} else {
-				ath12k_warn(ab,
-					    "not found link sta with bssid %pM for vdev stat\n",
-					    arvif->bssid);
+				ath12k_dbg(ab, ATH12K_DBG_WMI,
+					   "station entry disappeared for vdev stat bssid %pM\n",
+					   arvif->bssid);
 			}
 			spin_unlock_bh(&ab->base_lock);
 		}
@@ -8446,7 +8450,8 @@ static int ath12k_wmi_tlv_fw_stats_data_parse(struct ath12k_base *ab,
 		if (!dst)
 			continue;
 		ath12k_wmi_pull_vdev_stats(src, dst);
-		stats->stats_id = WMI_REQUEST_VDEV_STAT;
+		if (!(le32_to_cpu(ev->stats_id) & WMI_REQUEST_RSSI_PER_CHAIN_STAT))
+			stats->stats_id = WMI_REQUEST_VDEV_STAT;
 		list_add_tail(&dst->list, &stats->vdevs);
 	}
 	for (i = 0; i < le32_to_cpu(ev->num_bcn_stats); i++) {
@@ -8523,6 +8528,12 @@ static int ath12k_wmi_tlv_rssi_chain_parse(struct ath12k_base *ab,
 	if (!stats)
 		return -EINVAL;
 
+	/* Mark the response as an RSSI response even when the firmware also
+	 * includes an AP VDEV for which no station record exists.  This lets the
+	 * waiter complete after the AP record is skipped below.
+	 */
+	stats->stats_id = WMI_REQUEST_RSSI_PER_CHAIN_STAT;
+
 	stats->pdev_id = le32_to_cpu(ev->pdev_id);
 	vdev_id = le32_to_cpu(stats_rssi->vdev_id);
 	guard(rcu)();
@@ -8535,9 +8546,18 @@ static int ath12k_wmi_tlv_rssi_chain_parse(struct ath12k_base *ab,
 
 	arvif = ath12k_mac_get_arvif(ar, vdev_id);
 	if (!arvif) {
-		ath12k_warn(ab, "not found vif for vdev id %d\n", vdev_id);
-		return -EPROTO;
+		ath12k_dbg(ab, ATH12K_DBG_WMI,
+			   "ignoring RSSI stats for unknown vdev id %d\n", vdev_id);
+		return 0;
 	}
+
+	/* Per-chain beacon RSSI is meaningful only for a managed STA.  In
+	 * concurrent STA+AP operation firmware returns this TLV for the AP VDEV
+	 * too; treating that normal record as a parse error causes a spurious
+	 * fw-stats timeout every few seconds.
+	 */
+	if (arvif->ahvif->vdev_type != WMI_VDEV_TYPE_STA)
+		return 0;
 
 	ath12k_dbg(ab, ATH12K_DBG_WMI,
 		   "stats bssid %pM vif %p\n",
@@ -8546,10 +8566,10 @@ static int ath12k_wmi_tlv_rssi_chain_parse(struct ath12k_base *ab,
 	guard(spinlock_bh)(&ab->base_lock);
 	arsta = ath12k_link_sta_find_by_addr(ab, arvif->bssid);
 	if (!arsta) {
-		ath12k_warn(ab,
-			    "not found link sta with bssid %pM for rssi chain\n",
-			    arvif->bssid);
-		return -EPROTO;
+		ath12k_dbg(ab, ATH12K_DBG_WMI,
+			   "station entry disappeared for RSSI stats bssid %pM\n",
+			   arvif->bssid);
+		return 0;
 	}
 
 	BUILD_BUG_ON(ARRAY_SIZE(arsta->chain_signal) >
@@ -8557,8 +8577,6 @@ static int ath12k_wmi_tlv_rssi_chain_parse(struct ath12k_base *ab,
 
 	for (j = 0; j < ARRAY_SIZE(arsta->chain_signal); j++)
 		arsta->chain_signal[j] = le32_to_cpu(stats_rssi->rssi_avg_beacon[j]);
-
-	stats->stats_id = WMI_REQUEST_RSSI_PER_CHAIN_STAT;
 
 	return 0;
 }
@@ -8579,8 +8597,11 @@ static int ath12k_wmi_tlv_fw_stats_parse(struct ath12k_base *ab,
 		break;
 	case WMI_TAG_PER_CHAIN_RSSI_STATS:
 		parse->rssi = ptr;
-		if (le32_to_cpu(parse->ev->stats_id) & WMI_REQUEST_RSSI_PER_CHAIN_STAT)
+		if (parse->ev &&
+		    le32_to_cpu(parse->ev->stats_id) & WMI_REQUEST_RSSI_PER_CHAIN_STAT) {
 			parse->rssi_num = le32_to_cpu(parse->rssi->num_per_chain_rssi);
+			parse->stats->stats_id = WMI_REQUEST_RSSI_PER_CHAIN_STAT;
+		}
 		break;
 	case WMI_TAG_ARRAY_STRUCT:
 		if (parse->rssi_num && !parse->chain_rssi_done) {
