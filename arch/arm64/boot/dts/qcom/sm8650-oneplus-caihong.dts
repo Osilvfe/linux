@@ -4,13 +4,16 @@
  *
  * Copyright (c) 2023, Linaro Limited
  * Copyright (c) 2025, 2026 Pengyu Luo <mitltlatltl@gmail.com>
+ * Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
  */
 
 /dts-v1/;
 
-#include <dt-bindings/clock/qcom,sm8650-camcc.h>
-#include <dt-bindings/leds/common.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/clock/qcom,sm8650-camcc.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include "sm8650.dtsi"
 #include "pm8550.dtsi"
 #include "pm8550b.dtsi"
@@ -41,7 +44,7 @@
 	gpio-keys {
 		compatible = "gpio-keys";
 
-		pinctrl-0 = <&volume_up_n>;
+		pinctrl-0 = <&volume_up_n>, <&hall_sensor_default>;
 		pinctrl-names = "default";
 
 		key-volume-up {
@@ -49,6 +52,15 @@
 			linux,code = <KEY_VOLUMEDOWN>;
 			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
 			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+
+		event-hall-sensor {
+			label = "BU52053NVX Hall Switch";
+			gpios = <&tlmm 66 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LID>;
 			linux,can-disable;
 			wakeup-source;
 		};
@@ -62,15 +74,13 @@
 		#size-cells = <0>;
 		orientation-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
 		oneplus,pps-read-buffer;
-		oneplus,pps-fixed-5v;
-		oneplus,pps-5v5-1a;
-		oneplus,pps-ramp-9v-1a;
-		oneplus,pps-ramp-9v2-1a;
-		oneplus,pps-ramp-2to1-1a;
-		oneplus,pps-run-2to1-5m;
-		oneplus,pps-policy-2to1-1a;
-		oneplus,pps-secondary-500ms;
-		oneplus,pps-dual-500ms;
+		oneplus,pps-auto-start;
+		oneplus,otg-ap-control;
+		oneplus,battery-current-inverted;
+		oneplus,report-full-at-100;
+		oneplus,power-now-from-vi;
+		oneplus,ui-soc-smoothing;
+		oneplus,ffc-policy;
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -120,6 +130,99 @@
 			reg = <0 0xd4e23000 0 0x2dd000>;
 			no-map;
 		};
+	};
+
+	sound {
+		compatible = "qcom,sm8650-sndcard", "qcom,sm8450-sndcard";
+		model = "SM8650-MTP";
+		audio-routing = "IN1_HPHL", "HPHL_OUT",
+				"IN2_HPHR", "HPHR_OUT",
+				"AMIC1", "MIC BIAS1",
+				"AMIC3", "MIC BIAS3",
+				"AMIC4", "MIC BIAS4",
+				"AMIC5", "MIC BIAS3",
+				"TX SWR_INPUT0", "ADC1_OUTPUT",
+				"TX SWR_INPUT1", "ADC2_OUTPUT",
+				"TX SWR_INPUT2", "ADC3_OUTPUT",
+				"TX SWR_INPUT3", "ADC4_OUTPUT";
+
+		wcd-playback-dai-link {
+			link-name = "WCD Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai RX_CODEC_DMA_RX_0>;
+			};
+
+			codec {
+				sound-dai = <&wcd939x 0>, <&swr1 0>, <&lpass_rxmacro 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+
+		wcd-capture-dai-link {
+			link-name = "WCD Capture";
+
+			cpu {
+				sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
+			};
+
+			codec {
+				sound-dai = <&wcd939x 1>, <&swr2 0>, <&lpass_txmacro 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+
+		tdm-speaker-dai-link {
+			link-name = "Secondary TDM Speakers";
+
+			cpu {
+				sound-dai = <&q6apmbedai SECONDARY_TDM_RX_0>;
+			};
+
+			codec {
+				sound-dai = <&caihong_amp0>, <&caihong_amp1>,
+					    <&caihong_amp2>, <&caihong_amp3>,
+					    <&caihong_amp5>, <&caihong_amp6>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+	};
+
+	wcd939x: audio-codec {
+		compatible = "qcom,wcd9395-codec", "qcom,wcd9390-codec";
+
+		pinctrl-0 = <&wcd_default>;
+		pinctrl-names = "default";
+
+		qcom,micbias1-microvolt = <1800000>;
+		qcom,micbias2-microvolt = <1800000>;
+		qcom,micbias3-microvolt = <1800000>;
+		qcom,micbias4-microvolt = <1800000>;
+		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000
+							 500000 500000 500000 500000>;
+		qcom,mbhc-headset-vthreshold-microvolt = <1700000>;
+		qcom,mbhc-headphone-vthreshold-microvolt = <50000>;
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		reset-gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&vreg_l15b_1p8>;
+		vdd-rxtx-supply = <&vreg_l15b_1p8>;
+		vdd-io-supply = <&vreg_l15b_1p8>;
+		vdd-mic-bias-supply = <&vreg_bob1>;
+
+		#sound-dai-cells = <1>;
+
 	};
 
 	smp2p-modem {
@@ -566,22 +669,6 @@
 		compatible = "southchip,sc8547";
 		reg = <0x6f>;
 		southchip,role = "secondary";
-		southchip,allow-experimental-control;
-		southchip,experimental-reg00 = <0x36>;
-		southchip,experimental-reg02 = <0x01>;
-		southchip,experimental-reg04 = <0x50>;
-		southchip,experimental-reg05 = <0x1b>;
-		southchip,allow-experimental-cp-pulse;
-		southchip,experimental-vbus-min-uv = <7650000>;
-		southchip,experimental-vbus-max-uv = <9400000>;
-		southchip,experimental-start-delta-uv = <450000>;
-		southchip,experimental-start-overshoot-max-uv = <200000>;
-		southchip,experimental-start-reference-max-uv = <4350000>;
-		southchip,experimental-pulse-vbus-min-uv = <7300000>;
-		southchip,experimental-pulse-ratio-error-max-uv = <250000>;
-		southchip,experimental-vbat-min-uv = <3600000>;
-		southchip,experimental-vbat-max-uv = <4500000>;
-		southchip,experimental-tdie-max-mc = <70000>;
 	};
 };
 
@@ -594,23 +681,6 @@
 		compatible = "southchip,sc8547a";
 		reg = <0x6f>;
 		southchip,role = "primary";
-		southchip,allow-experimental-control;
-		southchip,experimental-reg00 = <0x36>;
-		southchip,experimental-reg01 = <0xbf>;
-		southchip,experimental-reg02 = <0x01>;
-		southchip,experimental-reg04 = <0x50>;
-		southchip,experimental-reg05 = <0x1b>;
-		southchip,experimental-reg0d = <0x50>;
-		southchip,allow-experimental-cp-pulse;
-		southchip,experimental-vbus-min-uv = <7650000>;
-		southchip,experimental-vbus-max-uv = <9400000>;
-		southchip,experimental-start-delta-uv = <450000>;
-		southchip,experimental-start-overshoot-max-uv = <200000>;
-		southchip,experimental-pulse-vbus-min-uv = <7300000>;
-		southchip,experimental-pulse-ratio-error-max-uv = <250000>;
-		southchip,experimental-vbat-min-uv = <3600000>;
-		southchip,experimental-vbat-max-uv = <4350000>;
-		southchip,experimental-tdie-max-mc = <70000>;
 	};
 };
 
@@ -625,7 +695,38 @@
 
 	status = "okay";
 
-	// awinic,aw882xx_smartpa @34,35,37
+	caihong_amp0: audio-codec@34 {
+		compatible = "awinic,aw88261";
+		reg = <0x34>;
+		#sound-dai-cells = <0>;
+		dvdd-supply = <&vreg_l15b_1p8>;
+		firmware-name = "awinic/caihong-aw88261-acf.bin";
+		awinic,audio-channel = <0>;
+		awinic,sync-flag;
+		sound-name-prefix = "Amp0";
+	};
+
+	caihong_amp2: audio-codec@35 {
+		compatible = "awinic,aw88261";
+		reg = <0x35>;
+		#sound-dai-cells = <0>;
+		dvdd-supply = <&vreg_l15b_1p8>;
+		firmware-name = "awinic/caihong-aw88261-acf.bin";
+		awinic,audio-channel = <2>;
+		awinic,sync-flag;
+		sound-name-prefix = "Amp2";
+	};
+
+	caihong_amp6: audio-codec@37 {
+		compatible = "awinic,aw88261";
+		reg = <0x37>;
+		#sound-dai-cells = <0>;
+		dvdd-supply = <&vreg_l15b_1p8>;
+		firmware-name = "awinic/caihong-aw88261-acf.bin";
+		awinic,audio-channel = <6>;
+		awinic,sync-flag;
+		sound-name-prefix = "Amp6";
+	};
 };
 
 &i2c_hub_7 {
@@ -633,7 +734,38 @@
 
 	status = "okay";
 
-	// awinic,aw882xx_smartpa @34,35,37
+	caihong_amp1: audio-codec@34 {
+		compatible = "awinic,aw88261";
+		reg = <0x34>;
+		#sound-dai-cells = <0>;
+		dvdd-supply = <&vreg_l15b_1p8>;
+		firmware-name = "awinic/caihong-aw88261-acf.bin";
+		awinic,audio-channel = <1>;
+		awinic,sync-flag;
+		sound-name-prefix = "Amp1";
+	};
+
+	caihong_amp3: audio-codec@35 {
+		compatible = "awinic,aw88261";
+		reg = <0x35>;
+		#sound-dai-cells = <0>;
+		dvdd-supply = <&vreg_l15b_1p8>;
+		firmware-name = "awinic/caihong-aw88261-acf.bin";
+		awinic,audio-channel = <3>;
+		awinic,sync-flag;
+		sound-name-prefix = "Amp3";
+	};
+
+	caihong_amp5: audio-codec@37 {
+		compatible = "awinic,aw88261";
+		reg = <0x37>;
+		#sound-dai-cells = <0>;
+		dvdd-supply = <&vreg_l15b_1p8>;
+		firmware-name = "awinic/caihong-aw88261-acf.bin";
+		awinic,audio-channel = <5>;
+		awinic,sync-flag;
+		sound-name-prefix = "Amp5";
+	};
 };
 
 &i2c2 {
@@ -646,6 +778,19 @@
 		 */
 		compatible = "kinetic,ktz8866-dummy";
 		reg = <0x11>;
+	};
+
+	/* Registry-confirmed I2C2 sensor addresses for controlled AP probing. */
+	mmc5603@30 {
+		compatible = "memsic,mmc5603";
+		reg = <0x30>;
+		status = "okay";
+	};
+
+	tcs3701@39 {
+		compatible = "ams,tcs3701";
+		reg = <0x39>;
+		status = "okay";
 	};
 };
 
@@ -719,6 +864,7 @@
 		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
 		pinctrl-0 = <&cam4_default>, <&cam4_reset_active>;
 		pinctrl-1 = <&cam4_sleep>, <&cam4_reset_suspend>;
+		/* The generic Linux pinctrl core selects the standard default state. */
 		pinctrl-names = "default", "sleep";
 
 		dovdd-supply = <&vreg_l4b_1p8>;
@@ -736,6 +882,11 @@
 	};
 };
 
+/*
+ * Rear SC1320CS bring-up. Read-only hardware probing confirmed the sensor at
+ * Linux 7-bit address 0x36; the module keeps a small fallback list for board
+ * revisions but starts from this confirmed DT address.
+ */
 &cci0_i2c1 {
 	#address-cells = <1>;
 	#size-cells = <0>;
@@ -796,6 +947,7 @@
 	wcd_usbss: typec-mux@e {
 		compatible = "qcom,wcd9395-usbss", "qcom,wcd9390-usbss";
 		reg = <0xe>;
+		qcom,vooc-dpdm-switch;
 
 		vdd-supply = <&vreg_l15b_1p8>;
 		// reset-gpios = <&tlmm 152 GPIO_ACTIVE_HIGH>; // ?
@@ -818,9 +970,7 @@
 			port@1 {
 				reg = <1>;
 
-				wcd_usbss_headset_out: endpoint {
-					// remote-endpoint = <&wcd_codec_headset_in>;
-				};
+				wcd_usbss_headset_out: endpoint {};
 			};
 		};
 	};
@@ -866,7 +1016,7 @@
 		compatible = "csot,ppc100hb1-1";
 		reg = <0>;
 
-		// backlight = <&backlight>;
+		backlight = <&backlight>;
 
 		reset-gpios = <&tlmm 133 GPIO_ACTIVE_LOW>;
 
@@ -955,6 +1105,7 @@
 	wifi@0 {
 		compatible = "pci17cb,1107";
 		reg = <0x10000 0x0 0x0 0x0 0x0>;
+		firmware-name = "caihong";
 
 		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
 		vddaon-supply = <&vreg_pmu_aon_0p59>;
@@ -965,9 +1116,6 @@
 		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
 		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
 		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
-
-		// It is broken nowadays, ignore it.
-		status = "disabled";
 	};
 };
 
@@ -1118,17 +1266,23 @@
 		reg = <0>;
 
 		interrupts-extended = <&tlmm 162 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
 
 		spi-max-frequency = <12000000>;
 
 		panel = <&panel>;
-		// novatek,pen-support;
+		novatek,pen-support;
+		novatek,pen-max-pressure = <16383>;
+		novatek,pen-max-tilt = <60>;
 		firmware-name = "novatek/DT-novatek-nt36532.bin";
 
 		// nvt_get_fw_info, from fw?
 		touchscreen-size-x = <21200>;
 		touchscreen-size-y = <30000>;
 		touchscreen-max-pressure = <1000>;
+		/* Raw touch axes precede the landscape swap below. */
+		touchscreen-x-mm = <177>;
+		touchscreen-y-mm = <250>;
 		touchscreen-swapped-x-y;
 		touchscreen-inverted-x;
 
@@ -1145,13 +1299,115 @@
 	status = "disabled";
 };
 
+&lpass_rxmacro {
+	status = "okay";
+};
+
+&lpass_txmacro {
+	status = "okay";
+};
+
 &lpass_vamacro {
 	qcom,dmic-sample-rate = <600000>;
+	status = "okay";
+};
+
+&q6apmbedai {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	pinctrl-0 = <&tdm1_active>;
+	pinctrl-1 = <&tdm1_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	dai@28 {
+		reg = <SECONDARY_TDM_RX_0>;
+		clocks = <&q6prmcc LPASS_CLK_ID_SEC_TDM_IBIT
+				      LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+		clock-names = "bclk";
+	};
+};
+
+&swr1 {
+	status = "okay";
+
+	wcd_rx: codec@0,4 {
+		compatible = "sdw20217010e00";
+		reg = <0 4>;
+		qcom,rx-port-mapping = <1 2 3 4 5 9>;
+	};
+};
+
+&swr2 {
+	status = "okay";
+
+	wcd_tx: codec@0,3 {
+		compatible = "sdw20217010e00";
+		reg = <0 3>;
+		qcom,tx-port-mapping = <2 2 3 4>;
+	};
 };
 
 &tlmm {
 	gpio-reserved-ranges = <36 4>, <74 1>;
 
+	hall_sensor_default: hall-sensor-default-state {
+		pins = "gpio66";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
+
+	wcd_default: wcd-reset-n-active-state {
+		pins = "gpio107";
+		function = "gpio";
+		drive-strength = <16>;
+		bias-disable;
+		output-low;
+	};
+
+	tdm1_active: tdm1-active-state {
+		clk-pins {
+			pins = "gpio121";
+			function = "i2s1_sck";
+			drive-strength = <6>;
+			bias-disable;
+			output-high;
+		};
+
+		data0-pins {
+			pins = "gpio122";
+			function = "i2s1_data0";
+			drive-strength = <6>;
+			bias-disable;
+		};
+
+		ws-pins {
+			pins = "gpio123";
+			function = "i2s1_ws";
+			drive-strength = <6>;
+			bias-disable;
+			output-high;
+		};
+
+		data1-pins {
+			pins = "gpio124";
+			function = "i2s1_data1";
+			drive-strength = <6>;
+			bias-pull-down;
+		};
+	};
+
+	tdm1_sleep: tdm1-sleep-state {
+		pins = "gpio121", "gpio122", "gpio123", "gpio124";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+
+	/* GPIO7 is the front SC820CS reset line on Caihong. */
 	cam4_reset_active: cam4-reset-active-state {
 		pins = "gpio7";
 		function = "gpio";
@@ -1272,9 +1528,6 @@
 		vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
 
 		max-speed = <3200000>;
-
-		// TODO: fix it
-		local-bd-address = [ 00 11 22 33 44 55 ];
 	};
 };
 
@@ -1303,8 +1556,7 @@
  */
 
 &usb_1 {
-	// dr_mode = "otg";
-	dr_mode = "peripheral";
+	dr_mode = "otg";
 	usb-role-switch;
 
 	status = "okay";
