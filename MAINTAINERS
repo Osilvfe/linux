@@ -20163,6 +20163,27 @@ S:	Maintained
 F:	Documentation/ABI/testing/sysfs-bus-platform-onboard-usb-dev
 F:	drivers/usb/misc/onboard_usb_dev.c
 
+ONEPLUS PAD PRO (CAIHONG) SUPPORT
+M:	Osilvfe <osilvfe@gmail.com>
+S:	Maintained
+F:	Documentation/devicetree/bindings/input/oneplus,caihong-pogo.yaml
+F:	Documentation/devicetree/bindings/input/touchscreen/novatek,nt36532e.yaml
+F:	Documentation/devicetree/bindings/media/i2c/giantec,gt9772.yaml
+F:	Documentation/devicetree/bindings/media/i2c/smartsens,sc1320cs.yaml
+F:	Documentation/devicetree/bindings/media/i2c/smartsens,sc820cs.yaml
+F:	Documentation/devicetree/bindings/power/supply/southchip,sc8547.yaml
+F:	arch/arm64/boot/dts/qcom/sm8650-oneplus-caihong.dts
+F:	drivers/iio/light/tcs3701.c
+F:	drivers/input/keyboard/oneplus_pogo.c
+F:	drivers/input/touchscreen/nt36532e.c
+F:	drivers/media/i2c/gt9772.c
+F:	drivers/media/i2c/sc1320cs*
+F:	drivers/media/i2c/sc820cs*
+F:	drivers/power/supply/caihong_pen_power.c
+F:	drivers/power/supply/qcom_battmgr_caihong*
+F:	drivers/power/supply/sc8547.c
+F:	include/linux/power/qcom_battmgr_caihong.h
+
 ONENAND FLASH DRIVER
 M:	Kyungmin Park <kyungmin.park@samsung.com>
 L:	linux-mtd@lists.infradead.org
