@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/touchscreen/novatek,nt36532e.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Novatek NT36532E no-flash touchscreen and pen controller
+
+maintainers:
+  - Osilvfe <osilvfe@gmail.com>
+
+allOf:
+  - $ref: touchscreen.yaml#
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: novatek,nt36532e
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  reset-gpios:
+    maxItems: 1
+
+  panel: true
+
+  firmware-name:
+    maxItems: 1
+
+  novatek,pen-support:
+    type: boolean
+
+  novatek,pen-max-pressure:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  novatek,pen-max-tilt:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - firmware-name
+
+unevaluatedProperties: false
+...

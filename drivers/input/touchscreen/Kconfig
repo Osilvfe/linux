@@ -701,6 +701,17 @@ config TOUCHSCREEN_NOVATEK_NVT_TS
 	  To compile this driver as a module, choose M here: the
 	  module will be called novatek-nvt-ts.
 
+config TOUCHSCREEN_NT36532E
+	tristate "Novatek NT36532E SPI touchscreen and pen"
+	depends on SPI_MASTER
+	depends on DRM_PANEL
+	help
+	  Enable support for the no-flash Novatek NT36532E touchscreen and
+	  active pen controller used by the OnePlus Pad Pro (Caihong).
+
+	  This driver can be built as a module. If so, the module will be
+	  called nt36532e_ts.
+
 config TOUCHSCREEN_IMAGIS
 	tristate "Imagis touchscreen support"
 	depends on I2C
