@@ -9,11 +9,13 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/bitfield.h>
 #include <linux/gpio/consumer.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/wcd939x-usbss.h>
 
 #define WCD_USBSS_PMP_OUT1			0x2
 
@@ -197,7 +199,13 @@ struct wcd939x_usbss {
 	enum typec_orientation orientation;
 	unsigned long mode;
 	unsigned int svid;
+	bool allow_vooc_dpdm;
+	bool vooc_dpdm_enabled;
 };
+
+/* Caihong's VOOC path uses the USBSS DP2/DN2 pair.  Keep this explicit and
+ * opt-in: the normal USB/DP mux remains the default for every other board. */
+static struct wcd939x_usbss *wcd939x_usbss_vooc;
 
 static const struct regmap_range_cfg wcd939x_usbss_ranges[] = {
 	{
@@ -531,6 +539,91 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
 	return 0;
 }
 
+static int wcd939x_usbss_set_vooc_dpdm_locked(struct wcd939x_usbss *usbss,
+						      bool enable)
+{
+	int ret, restore_ret;
+
+	if (!usbss->allow_vooc_dpdm)
+		return -EPERM;
+
+	if (enable) {
+		/* A DP altmode or analog headset must never be stolen by VOOC. */
+		if (usbss->svid || usbss->mode == TYPEC_MODE_AUDIO)
+			return -EBUSY;
+
+		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_USB_SS_CNTL,
+					 WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+					 FIELD_PREP(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+						    WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_USB));
+		if (ret)
+			goto restore;
+
+		ret = regmap_clear_bits(usbss->regmap,
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_DP_AUXP_TO_MGX_SWITCHES |
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_DP_AUXM_TO_MGX_SWITCHES |
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES |
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES |
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_SENSE_SWITCHES |
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_MIC_SWITCHES |
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE_AGND_SWITCHES);
+		if (ret)
+			goto restore;
+
+		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+					 WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES |
+					 WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+					 FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+						    WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_DN2) |
+					 FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
+						    WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_DR2));
+		if (ret)
+			goto restore;
+
+		ret = regmap_set_bits(usbss->regmap,
+				      WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES |
+				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES);
+		if (ret)
+			goto restore;
+
+		usbss->vooc_dpdm_enabled = true;
+		dev_dbg(&usbss->client->dev, "VOOC DPDM route selected\n");
+		return 0;
+
+restore:
+	restore_ret = wcd939x_usbss_set(usbss);
+	if (restore_ret)
+		dev_warn(&usbss->client->dev,
+			 "failed to restore USBSS route after VOOC error: %d\n",
+			 restore_ret);
+	return ret;
+	}
+
+	usbss->vooc_dpdm_enabled = false;
+	ret = wcd939x_usbss_set(usbss);
+	if (!ret)
+		dev_dbg(&usbss->client->dev, "VOOC DPDM route restored\n");
+	return ret;
+}
+
+int wcd939x_usbss_set_vooc_dpdm(bool enable)
+{
+	struct wcd939x_usbss *usbss = READ_ONCE(wcd939x_usbss_vooc);
+	int ret;
+
+	if (!usbss)
+		return -ENODEV;
+
+	mutex_lock(&usbss->lock);
+	ret = wcd939x_usbss_set_vooc_dpdm_locked(usbss, enable);
+	mutex_unlock(&usbss->lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(wcd939x_usbss_set_vooc_dpdm);
+
 static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
 				    enum typec_orientation orientation)
 {
@@ -596,6 +689,8 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 
 	usbss->client = client;
 	mutex_init(&usbss->lock);
+	usbss->allow_vooc_dpdm = device_property_read_bool(dev,
+								"qcom,vooc-dpdm-switch");
 
 	usbss->regmap = devm_regmap_init_i2c(client, &wcd939x_usbss_regmap_config);
 	if (IS_ERR(usbss->regmap))
@@ -721,6 +816,8 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 	}
 
 	i2c_set_clientdata(client, usbss);
+	if (usbss->allow_vooc_dpdm)
+		WRITE_ONCE(wcd939x_usbss_vooc, usbss);
 
 	return 0;
 
@@ -742,6 +839,9 @@ err_mux_put:
 static void wcd939x_usbss_remove(struct i2c_client *client)
 {
 	struct wcd939x_usbss *usbss = i2c_get_clientdata(client);
+
+	if (READ_ONCE(wcd939x_usbss_vooc) == usbss)
+		WRITE_ONCE(wcd939x_usbss_vooc, NULL);
 
 	typec_mux_unregister(usbss->mux);
 	typec_switch_unregister(usbss->sw);
