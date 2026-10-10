@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/giantec,gt9772.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Giantec GT9772 voice-coil lens actuator
+
+maintainers:
+  - Osilvfe <osilvfe@gmail.com>
+
+properties:
+  compatible:
+    const: giantec,gt9772
+
+  reg:
+    maxItems: 1
+
+  vio-supply: true
+  vaf-supply: true
+
+required:
+  - compatible
+  - reg
+  - vio-supply
+  - vaf-supply
+
+additionalProperties: false
+...
