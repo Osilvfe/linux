@@ -59,6 +59,7 @@ properties:
           - adi,lt7182s
             # AMS iAQ-Core VOC Sensor
           - ams,iaq-core
+          - ams,tcs3701
             # Aosong temperature & humidity sensors with I2C interface
           - aosong,aht10
           - aosong,aht20
