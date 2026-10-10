@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/southchip,sc8547.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Southchip SC8547 and SC8547A charge pumps
+
+maintainers:
+  - Osilvfe <osilvfe@gmail.com>
+
+properties:
+  compatible:
+    enum:
+      - southchip,sc8547
+      - southchip,sc8547a
+
+  reg:
+    maxItems: 1
+
+  southchip,role:
+    enum: [ primary, secondary ]
+    description: Charge-pump role in a paired installation.
+
+required:
+  - compatible
+  - reg
+  - southchip,role
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@6f {
+            compatible = "southchip,sc8547a";
+            reg = <0x6f>;
+            southchip,role = "primary";
+        };
+    };
+...
