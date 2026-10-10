@@ -621,6 +621,17 @@ config TCS3472
 	  This driver can also be built as a module.  If so, the module
 	  will be called tcs3472.
 
+config TCS3701
+	tristate "AMS TCS3701 color and proximity sensor"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Enable direct IIO access to the AMS TCS3701 ambient-light, color
+	  and proximity sensor.
+
+	  This driver can be built as a module. If so, the module will be
+	  called tcs3701.
+
 config SENSORS_TSL2563
 	tristate "TAOS TSL2560, TSL2561, TSL2562 and TSL2563 ambient light sensors"
 	depends on I2C
