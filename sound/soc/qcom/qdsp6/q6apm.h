@@ -68,6 +68,13 @@ struct q6apm {
 	struct idr sub_graphs_idr;
 	struct idr containers_idr;
 	struct idr modules_idr;
+
+	struct device *caihong_calibration_dma_dev;
+	long long caihong_calibration_sid;
+	void *caihong_calibration_buf;
+	dma_addr_t caihong_calibration_dma_addr;
+	phys_addr_t caihong_calibration_dsp_addr;
+	uint32_t caihong_calibration_mem_map_handle;
 };
 
 struct audio_buffer {

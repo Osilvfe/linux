@@ -28,9 +28,27 @@ static const struct regmap_config aw88261_remap_config = {
 	.val_format_endian = REGMAP_ENDIAN_BIG,
 };
 
+static int aw88261_dev_init_check(struct aw_device *aw_dev)
+{
+	int ret;
+
+	usleep_range(AW88261_2000_US, AW88261_2000_US + 10);
+	ret = regmap_write(aw_dev->regmap, AW88261_EFCTRL2_REG,
+			   AW88261_INIT_CHECK_VALUE);
+	if (ret)
+		return ret;
+
+	usleep_range(AW88261_3000_US, AW88261_3000_US + 10);
+
+	return 0;
+}
+
 static void aw88261_dev_set_volume(struct aw_device *aw_dev, unsigned int value)
 {
-	unsigned int volume = min(value, (unsigned int)AW88261_MUTE_VOL);
+	unsigned int volume;
+
+	volume = min(value + aw_dev->volume_desc.init_volume,
+		     (unsigned int)AW88261_MUTE_VOL);
 
 	regmap_update_bits(aw_dev->regmap, AW88261_SYSCTRL2_REG,
 		~AW88261_VOL_MASK, DB_TO_REG_VAL(volume));
@@ -109,6 +127,7 @@ static int aw88261_dev_get_iis_status(struct aw_device *aw_dev)
 
 static int aw88261_dev_check_pll(struct aw_device *aw_dev)
 {
+	unsigned int sysst = 0;
 	int ret, i;
 
 	for (i = 0; i < AW88261_DEV_SYSST_CHECK_MAX; i++) {
@@ -120,6 +139,13 @@ static int aw88261_dev_check_pll(struct aw_device *aw_dev)
 			return ret;
 		}
 	}
+
+	ret = regmap_read(aw_dev->regmap, AW88261_SYSST_REG, &sysst);
+	if (ret)
+		dev_err(aw_dev->dev, "PLL lock failed; SYSST read failed: %d\n", ret);
+	else
+		dev_err(aw_dev->dev, "PLL lock failed; SYSST=0x%04x required=0x%04x\n",
+			sysst, AW88261_BIT_PLL_CHECK);
 
 	return -EPERM;
 }
@@ -197,7 +223,7 @@ static int aw88261_dev_configure_syspll(struct aw88261 *aw88261)
 static int aw88261_dev_check_sysst(struct aw_device *aw_dev)
 {
 	unsigned int check_val;
-	unsigned int reg_val;
+	unsigned int reg_val = 0;
 	int ret, i;
 
 	for (i = 0; i < AW88261_DEV_SYSST_CHECK_MAX; i++) {
@@ -215,6 +241,11 @@ static int aw88261_dev_check_sysst(struct aw_device *aw_dev)
 			return 0;
 		}
 	}
+
+	dev_err(aw_dev->dev,
+		"SYSST clock check failed: raw=0x%04x observed=0x%04x required=0x%04x missing=0x%04x\n",
+		reg_val, check_val, AW88261_BIT_SYSST_CHECK,
+		AW88261_BIT_SYSST_CHECK & ~check_val);
 
 	return -EPERM;
 }
@@ -789,6 +820,7 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 {
 	struct snd_soc_component *component = dai->component;
 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
+	unsigned int slot_mask;
 	int chan;
 
 	switch (slots) {
@@ -823,6 +855,14 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 		return -EINVAL;
 	}
 
+	slot_mask = GENMASK(slots - 1, 0);
+	if ((tx_mask | rx_mask) & ~slot_mask) {
+		dev_err(aw88261->aw_pa->dev,
+			"slot mask tx=%#x rx=%#x exceeds %d slots\n",
+			tx_mask, rx_mask, slots);
+		return -EINVAL;
+	}
+
 	switch (slot_width) {
 	case 16:
 		aw88261->tdm_bck_value = AW88261_I2SBCK_32FS_VALUE;
@@ -848,17 +888,44 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 	}
 
 	if (rx_mask != 0) {
-		if ((chan = __ffs(rx_mask)) > 16)
-			return -EINVAL;
+		chan = __ffs(rx_mask);
 
 		aw88261->rxl_slotvld_mask = chan << AW88261_I2S_RXL_SLOTVLD_START_BIT;
+		rx_mask &= ~BIT(chan);
+		if (rx_mask)
+			chan = __ffs(rx_mask);
+		aw88261->rxr_slotvld_mask = chan << AW88261_I2S_RXR_SLOTVLD_START_BIT;
 	}
 
-	if ((rx_mask & ~BIT(chan)) != 0) {
-		if ((chan = __ffs(rx_mask & ~BIT(chan))) > 16)
-			return -EINVAL;
+	return 0;
+}
 
-		aw88261->rxr_slotvld_mask = chan << AW88261_I2S_RXR_SLOTVLD_START_BIT;
+static int aw88261_trigger(struct snd_pcm_substream *substream, int cmd,
+			   struct snd_soc_dai *dai)
+{
+	struct snd_soc_component *component = dai->component;
+	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
+
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+		return 0;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		mutex_lock(&aw88261->lock);
+		aw88261_start(aw88261);
+		mutex_unlock(&aw88261->lock);
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		mutex_lock(&aw88261->lock);
+		aw88261_dev_stop(aw88261->aw_pa);
+		mutex_unlock(&aw88261->lock);
+		break;
+	default:
+		return -EINVAL;
 	}
 
 	return 0;
@@ -868,6 +935,7 @@ static const struct snd_soc_dai_ops aw88261_dai_ops = {
 	.set_fmt = aw88261_set_fmt,
 	.hw_params = aw88261_hw_params,
 	.set_tdm_slot = aw88261_set_tdm_slot,
+	.trigger = aw88261_trigger,
 };
 
 static struct snd_soc_dai_driver aw88261_dai[] = {
@@ -1039,16 +1107,7 @@ static int aw88261_playback_event(struct snd_soc_dapm_widget *w,
 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
 
 	mutex_lock(&aw88261->lock);
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		aw88261_start(aw88261);
-		break;
-	case SND_SOC_DAPM_POST_PMD:
-		aw88261_dev_stop(aw88261->aw_pa);
-		break;
-	default:
-		break;
-	}
+	aw88261_dev_stop(aw88261->aw_pa);
 	mutex_unlock(&aw88261->lock);
 
 	return 0;
@@ -1058,7 +1117,7 @@ static const struct snd_soc_dapm_widget aw88261_dapm_widgets[] = {
 	 /* playback */
 	SND_SOC_DAPM_AIF_IN_E("AIF_RX", "Speaker_Playback", 0, 0, 0, 0,
 					aw88261_playback_event,
-					SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+					SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_OUTPUT("DAC Output"),
 
 	/* capture */
@@ -1285,7 +1344,12 @@ static int aw88261_init(struct aw88261 *aw88261, struct i2c_client *i2c, struct 
 	aw_dev->volume_desc.mute_volume = AW88261_MUTE_VOL;
 	aw88261_parse_channel_dt(aw88261);
 
-	return ret;
+	ret = aw88261_dev_init_check(aw_dev);
+	if (ret)
+		return dev_err_probe(aw_dev->dev, ret,
+				     "failed to run PID 2113 init check\n");
+
+	return 0;
 }
 
 static int aw88261_i2c_probe(struct i2c_client *i2c)

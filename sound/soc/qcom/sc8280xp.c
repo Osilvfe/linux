@@ -4,6 +4,7 @@
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/pcm.h>
@@ -12,6 +13,7 @@
 #include <sound/jack.h>
 #include <linux/input-event-codes.h>
 #include "qdsp6/q6afe.h"
+#include "qdsp6/q6prm.h"
 #include "common.h"
 #include "sdw.h"
 
@@ -22,6 +24,64 @@ struct sc8280xp_snd_data {
 	struct snd_soc_jack dp_jack[8];
 	bool jack_setup;
 };
+
+#define CAIHONG_TDM_SLOTS	8
+#define CAIHONG_TDM_SLOT_WIDTH	32
+#define CAIHONG_TDM_RX_MASK	0xff
+#define CAIHONG_TDM_BCLK_RATE	(48000 * CAIHONG_TDM_SLOTS * CAIHONG_TDM_SLOT_WIDTH)
+
+static int sc8280xp_caihong_tdm_hw_params(struct snd_pcm_substream *substream,
+					 struct snd_pcm_hw_params *params)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_dai *codec_dai;
+	u32 channel;
+	int ret;
+	int i;
+
+	if (params_rate(params) != 48000 ||
+	    params_format(params) != SNDRV_PCM_FORMAT_S32_LE ||
+	    params_channels(params) != 8)
+		return -EINVAL;
+
+	ret = snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_BP_FP);
+	if (ret && ret != -ENOTSUPP)
+		return ret;
+
+	ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, CAIHONG_TDM_RX_MASK,
+				       CAIHONG_TDM_SLOTS, CAIHONG_TDM_SLOT_WIDTH);
+	if (ret)
+		return ret;
+
+	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+		ret = of_property_read_u32(codec_dai->component->dev->of_node,
+					   "awinic,audio-channel", &channel);
+		if (ret || channel >= CAIHONG_TDM_SLOTS)
+			return ret ?: -EINVAL;
+
+		ret = snd_soc_dai_set_fmt(codec_dai,
+					  SND_SOC_DAIFMT_DSP_B |
+					  SND_SOC_DAIFMT_IB_NF |
+					  SND_SOC_DAIFMT_BP_FP);
+		if (ret && ret != -ENOTSUPP)
+			return ret;
+
+		ret = snd_soc_dai_set_tdm_slot(codec_dai, BIT(channel),
+					       BIT(channel),
+					       CAIHONG_TDM_SLOTS,
+					       CAIHONG_TDM_SLOT_WIDTH);
+		if (ret)
+			return ret;
+	}
+
+	ret = snd_soc_dai_set_sysclk(cpu_dai, LPAIF_MI2S_BCLK,
+				     CAIHONG_TDM_BCLK_RATE, SND_SOC_CLOCK_OUT);
+	if (ret && ret != -ENOTSUPP)
+		return ret;
+
+	return 0;
+}
 
 static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 {
@@ -82,6 +142,12 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	channels->min = 2;
 	channels->max = 2;
 	switch (cpu_dai->id) {
+	case SECONDARY_TDM_RX_0:
+		snd_mask_reset(fmt, SNDRV_PCM_FORMAT_S16_LE);
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
+		channels->min = 8;
+		channels->max = 8;
+		break;
 	case TX_CODEC_DMA_TX_0:
 	case TX_CODEC_DMA_TX_1:
 	case TX_CODEC_DMA_TX_2:
@@ -121,6 +187,10 @@ static const struct snd_soc_ops sc8280xp_be_ops = {
 	.prepare = sc8280xp_snd_prepare,
 };
 
+static const struct snd_soc_ops sc8280xp_caihong_tdm_ops = {
+	.hw_params = sc8280xp_caihong_tdm_hw_params,
+};
+
 static void sc8280xp_add_be_ops(struct snd_soc_card *card)
 {
 	struct snd_soc_dai_link *link;
@@ -130,7 +200,10 @@ static void sc8280xp_add_be_ops(struct snd_soc_card *card)
 		if (link->no_pcm == 1) {
 			link->init = sc8280xp_snd_init;
 			link->be_hw_params_fixup = sc8280xp_be_hw_params_fixup;
-			link->ops = &sc8280xp_be_ops;
+			if (link->id == SECONDARY_TDM_RX_0)
+				link->ops = &sc8280xp_caihong_tdm_ops;
+			else
+				link->ops = &sc8280xp_be_ops;
 		}
 	}
 }

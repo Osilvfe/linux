@@ -11,6 +11,8 @@
 #ifndef __AW88261_H__
 #define __AW88261_H__
 
+#include <linux/workqueue.h>
+
 #define AW88261_ID_REG			(0x00)
 #define AW88261_SYSST_REG		(0x01)
 #define AW88261_SYSINT_REG		(0x02)
@@ -263,7 +265,7 @@
 	(~(((1<<AW88261_VOL_BITS_LEN)-1) << AW88261_VOL_START_BIT))
 
 #define AW88261_CTL_MAX_VOL		(AW88261_MUTE_VOL / 2)
-#define AW88261_CTL_DEFAULT_VOL		(AW88261_CTL_MAX_VOL / 2)
+#define AW88261_CTL_DEFAULT_VOL		(0)
 
 #define AW88261_I2STXEN_START_BIT	(6)
 #define AW88261_I2STXEN_BITS_LEN	(1)
@@ -523,7 +525,6 @@
 #define AW88261_VCAL_FACTOR		(1<<13)
 
 #define AW88261_START_RETRIES		(5)
-#define AW88261_START_WORK_DELAY_MS	(0)
 
 /* NOTE: 192000 has a reg value donwstream but not listed in datasheet */
 #define AW88261_RATES (SNDRV_PCM_RATE_8000_48000 | \
@@ -538,6 +539,7 @@
 #define AW88261_ACF_FILE		"aw88261_acf.bin"
 #define AW88261_DEV_SYSST_CHECK_MAX	(10)
 #define AW88261_SOFT_RESET_VALUE	(0x55aa)
+#define AW88261_INIT_CHECK_VALUE	(0x1d40)
 #define AW88261_REG_TO_DB		(0x3f)
 #define AW88261_INIT_PROFILE		(0)
 
@@ -565,6 +567,7 @@ enum {
 	AW88261_500_US = 500,
 	AW88261_1000_US = 1000,
 	AW88261_2000_US = 2000,
+	AW88261_3000_US = 3000,
 };
 
 enum {
