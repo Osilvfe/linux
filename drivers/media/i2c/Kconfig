@@ -110,6 +110,16 @@ config VIDEO_GC2145
 	  To compile this driver as a module, choose M here: the
 	  module will be called gc2145.
 
+config VIDEO_GT9772
+	tristate "Giantec GT9772 lens actuator support"
+	select V4L2_CCI_I2C
+	help
+	  Enable the Giantec GT9772 voice-coil lens actuator used by the
+	  OnePlus Pad Pro (Caihong) rear camera.
+
+	  This driver can be built as a module. If so, the module will be
+	  called gt9772.
+
 config VIDEO_HI556
 	tristate "Hynix Hi-556 sensor support"
 	help
@@ -825,6 +835,26 @@ config VIDEO_S5KJN1
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called s5kjn1.
+
+config VIDEO_SC1320CS
+	tristate "SmartSens SC1320CS sensor support"
+	select V4L2_CCI_I2C
+	help
+	  Enable the SmartSens SC1320CS camera sensor used by the OnePlus
+	  Pad Pro (Caihong) rear camera.
+
+	  This driver can be built as a module. If so, the module will be
+	  called sc1320cs.
+
+config VIDEO_SC820CS
+	tristate "SmartSens SC820CS sensor support"
+	select V4L2_CCI_I2C
+	help
+	  Enable the SmartSens SC820CS camera sensor used by the OnePlus
+	  Pad Pro (Caihong) front camera.
+
+	  This driver can be built as a module. If so, the module will be
+	  called sc820cs.
 
 config VIDEO_T4KA3
 	tristate "Toshiba T4KA3 sensor support"
