@@ -292,7 +292,7 @@ static void oneplus_pogo_queue_touchpad_restore(struct oneplus_pogo *pogo)
 {
 	/* RX already holds the mutex: transmit only after leaving that path. */
 	pogo->touchpad_restore_left = POGO_TOUCHPAD_RESTORE_TRIES;
-	mod_delayed_work(system_wq, &pogo->touchpad_work,
+	mod_delayed_work(system_dfl_wq, &pogo->touchpad_work,
 			 msecs_to_jiffies(POGO_TOUCHPAD_RESTORE_DELAY_MS));
 }
 
@@ -319,7 +319,7 @@ static void oneplus_pogo_touchpad_work(struct work_struct *work)
 		dev_dbg_ratelimited(&pogo->serdev->dev,
 				    "failed to restore touchpad state: %d\n", ret);
 	if (pogo->touchpad_restore_left)
-		mod_delayed_work(system_wq, &pogo->touchpad_work,
+		mod_delayed_work(system_dfl_wq, &pogo->touchpad_work,
 				 msecs_to_jiffies(POGO_TOUCHPAD_RESTORE_DELAY_MS));
 	mutex_unlock(&pogo->lock);
 }
@@ -391,7 +391,7 @@ static int oneplus_pogo_input_event(struct input_dev *input,
 		return -EINVAL;
 
 	WRITE_ONCE(pogo->capslock_led, value != 0);
-	schedule_work(&pogo->led_work);
+	queue_work(system_dfl_wq, &pogo->led_work);
 
 	return 0;
 }
@@ -622,15 +622,13 @@ static void oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 
 	command = frame[3];
 	payload_len = frame[4];
-	if (pogo->frame_len != payload_len + 12) {
+	if (pogo->frame_len != payload_len + 12)
 		return;
-	}
 
 	received_crc = get_unaligned_be16(frame + 5 + payload_len);
 	expected_crc = oneplus_pogo_crc(pogo->crc_init, frame, payload_len + 5);
-	if (received_crc != expected_crc) {
+	if (received_crc != expected_crc)
 		return;
-	}
 
 	if (frame[7 + payload_len] != POGO_END ||
 	    frame[8 + payload_len] != POGO_TAIL ||
@@ -681,7 +679,6 @@ static void oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 				    "unhandled command 0x%02x\n", command);
 		break;
 	}
-
 }
 
 static void oneplus_pogo_reset_receiver(struct oneplus_pogo *pogo)
@@ -991,7 +988,8 @@ static int oneplus_pogo_probe(struct serdev_device *serdev)
 		 wake_before_power > 0 ? "attached" : "not detected",
 		 pogo->wake_gpio && gpiod_get_value_cansleep(pogo->wake_gpio) ?
 		 "attached" : "not detected");
-	schedule_delayed_work(&pogo->setup_work, msecs_to_jiffies(500));
+	queue_delayed_work(system_dfl_wq, &pogo->setup_work,
+			   msecs_to_jiffies(500));
 
 	return 0;
 
