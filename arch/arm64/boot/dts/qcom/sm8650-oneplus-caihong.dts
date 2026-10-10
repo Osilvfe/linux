@@ -780,18 +780,6 @@
 		reg = <0x11>;
 	};
 
-	/* Registry-confirmed I2C2 sensor addresses for controlled AP probing. */
-	mmc5603@30 {
-		compatible = "memsic,mmc5603";
-		reg = <0x30>;
-		status = "okay";
-	};
-
-	tcs3701@39 {
-		compatible = "ams,tcs3701";
-		reg = <0x39>;
-		status = "okay";
-	};
 };
 
 /*
