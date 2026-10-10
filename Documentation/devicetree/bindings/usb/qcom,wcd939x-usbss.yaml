@@ -35,6 +35,13 @@ properties:
   vdd-supply:
     description: USBSS VDD power supply
 
+  qcom,vooc-dpdm-switch:
+    description:
+      Allow the Caihong VOOC charge path to temporarily route DP2/DN2 to the
+      fast-charge PHY. The route is disabled by default and is restored after
+      every transaction.
+    type: boolean
+
   mode-switch: true
   orientation-switch: true
 
