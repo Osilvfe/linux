@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
 /*
  * Caihong/OnePlus private charger-firmware policy.
  *
@@ -103,6 +104,9 @@ static bool qcom_battmgr_oneplus_has_fixed_5v(struct qcom_battmgr *battmgr)
 	u32 pdo_count;
 	int i;
 
+	if (data_size < 2 * sizeof(__le32))
+		return 0;
+
 	pdo_count = min_t(u32, data_size / sizeof(__le32) - 2,
 			  BATTMGR_ONEPLUS_PPS_PDO_MAX);
 	for (i = 0; i < pdo_count; i++) {
@@ -122,6 +126,9 @@ static bool qcom_battmgr_oneplus_has_pps(struct qcom_battmgr *battmgr,
 	u32 data_size = le32_to_cpu(battmgr->oneplus_pps.data_size);
 	u32 pdo_count;
 	int i;
+
+	if (data_size < 2 * sizeof(__le32))
+		return false;
 
 	pdo_count = min_t(u32, data_size / sizeof(__le32) - 2,
 			  BATTMGR_ONEPLUS_PPS_PDO_MAX);
@@ -146,6 +153,39 @@ static bool qcom_battmgr_oneplus_has_pps(struct qcom_battmgr *battmgr,
 	return false;
 }
 
+static u32 qcom_battmgr_oneplus_pps_current_limit(
+	struct qcom_battmgr *battmgr, u32 voltage_mv, u32 policy_max_ma)
+{
+	u32 data_size = le32_to_cpu(battmgr->oneplus_pps.data_size);
+	u32 selected_ma = 0;
+	u32 pdo_count;
+	int i;
+
+	if (data_size < 2 * sizeof(__le32))
+		return 0;
+
+	pdo_count = min_t(u32, data_size / sizeof(__le32) - 2,
+			  BATTMGR_ONEPLUS_PPS_PDO_MAX);
+	for (i = 0; i < pdo_count; i++) {
+		u32 pdo = le32_to_cpu(battmgr->oneplus_pps.data[i + 2]);
+		u32 min_mv;
+		u32 max_mv;
+		u32 max_ma;
+
+		if ((pdo >> 30) != 3 || ((pdo >> 28) & 0x3) != 0)
+			continue;
+
+		min_mv = ((pdo >> 8) & 0xff) * 100;
+		max_mv = ((pdo >> 17) & 0xff) * 100;
+		max_ma = (pdo & 0x7f) * 50;
+		if (voltage_mv >= min_mv && voltage_mv <= max_mv)
+			selected_ma = max(selected_ma,
+					  min(max_ma, policy_max_ma));
+	}
+
+	return selected_ma;
+}
+
 static bool qcom_battmgr_oneplus_has_pps_range(struct qcom_battmgr *battmgr,
 					       u32 min_voltage_mv,
 					       u32 max_voltage_mv,
@@ -154,6 +194,9 @@ static bool qcom_battmgr_oneplus_has_pps_range(struct qcom_battmgr *battmgr,
 	u32 data_size = le32_to_cpu(battmgr->oneplus_pps.data_size);
 	u32 pdo_count;
 	int i;
+
+	if (data_size < 2 * sizeof(__le32))
+		return false;
 
 	pdo_count = min_t(u32, data_size / sizeof(__le32) - 2,
 			  BATTMGR_ONEPLUS_PPS_PDO_MAX);
@@ -198,6 +241,974 @@ static int qcom_battmgr_oneplus_property_set_locked(struct qcom_battmgr *battmgr
 
 	return ret;
 }
+
+/*
+ * Project 23926 enables the vendor UI-SOC smoother with a three-percent
+ * reserve.  Keep the firmware SOC untouched for charging policy decisions;
+ * this value is only the target shown through POWER_SUPPLY_PROP_CAPACITY.
+ */
+static u32 qcom_battmgr_oneplus_smooth_soc(u32 raw_soc)
+{
+	u32 smooth_soc = raw_soc;
+
+	if (raw_soc >= 74)
+		smooth_soc += BATTMGR_ONEPLUS_UI_SOC_RESERVE;
+	else if (raw_soc >= 53)
+		smooth_soc += 2;
+	else if (raw_soc >= 29)
+		smooth_soc += 1;
+
+	return min(smooth_soc, 100U);
+}
+
+/*
+ * Product charging policy must use the gauge value, while userspace sees the
+ * smoothed UI value through POWER_SUPPLY_PROP_CAPACITY.  Keep this narrow API
+ * on the Caihong boundary so an external charge-pump driver does not have to
+ * infer raw SOC from the displayed percentage.
+ */
+int qcom_battmgr_caihong_get_raw_capacity(struct power_supply *psy)
+{
+	struct qcom_battmgr *battmgr;
+	u32 raw_soc;
+
+	if (!psy)
+		return -EINVAL;
+
+	battmgr = power_supply_get_drvdata(psy);
+	if (!battmgr || psy != battmgr->bat_psy)
+		return -EINVAL;
+	if (!battmgr->oneplus_ui_soc_smoothing)
+		return -EOPNOTSUPP;
+
+	raw_soc = READ_ONCE(battmgr->status.percent);
+	if (raw_soc > 100)
+		return -ENODATA;
+
+	return raw_soc;
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_caihong_get_raw_capacity);
+
+static unsigned int qcom_battmgr_oneplus_soc_down_seconds(u32 ui_soc)
+{
+	if (ui_soc < 60)
+		return 40;
+	if (ui_soc < 95)
+		return 60;
+	if (ui_soc < 100)
+		return 150;
+
+	return 300;
+}
+
+static bool qcom_battmgr_oneplus_charge_pump_running(void)
+{
+	static const char * const names[] = {
+		BATTMGR_ONEPLUS_PRIMARY_CP_NAME,
+		BATTMGR_ONEPLUS_SECONDARY_CP_NAME,
+	};
+	union power_supply_propval val;
+	struct power_supply *psy;
+	int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		psy = power_supply_get_by_name(names[i]);
+		if (!psy)
+			continue;
+
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS,
+						&val);
+		power_supply_put(psy);
+		if (!ret && val.intval == POWER_SUPPLY_STATUS_CHARGING)
+			return true;
+	}
+
+	return false;
+}
+
+static void qcom_battmgr_oneplus_ui_soc_backup_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(
+		to_delayed_work(work), struct qcom_battmgr,
+		oneplus_ui_soc_backup_work);
+	u32 ui_soc;
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	if (!battmgr->oneplus_ui_soc_smoothing ||
+	    !battmgr->oneplus_ui_soc_initialized || !battmgr->service_up) {
+		mutex_unlock(&battmgr->lock);
+		return;
+	}
+
+	ui_soc = battmgr->oneplus_ui_soc;
+	ret = qcom_battmgr_oneplus_property_set_locked(
+		battmgr, BATTMGR_BAT_PROPERTY_SET,
+		BATTMGR_ONEPLUS_BATT_RTC_SOC, ui_soc);
+	if (!ret)
+		battmgr->oneplus_ui_soc_rtc = ui_soc;
+	battmgr->oneplus_ui_soc_rtc_rc = ret;
+	mutex_unlock(&battmgr->lock);
+
+	if (ret)
+		dev_warn_ratelimited(battmgr->dev,
+			"failed to back up UI SOC %u: %d\n", ui_soc, ret);
+}
+
+static u32 qcom_battmgr_oneplus_get_ui_soc(struct qcom_battmgr *battmgr)
+{
+	unsigned long interval;
+	u32 raw_soc = battmgr->status.percent;
+	u32 target;
+	u32 previous;
+	u32 ui_soc;
+	bool backup;
+	bool charging;
+	bool restored = false;
+	int ret;
+
+	if (!battmgr->oneplus_ui_soc_smoothing || raw_soc > 100)
+		return raw_soc;
+
+	target = qcom_battmgr_oneplus_smooth_soc(raw_soc);
+	if (!battmgr->oneplus_ui_soc_initialized) {
+		mutex_lock(&battmgr->lock);
+		if (!battmgr->oneplus_ui_soc_initialized) {
+			battmgr->oneplus_ui_soc_rtc = U32_MAX;
+			ret = qcom_battmgr_request_property(
+				battmgr, BATTMGR_BAT_PROPERTY_GET,
+				BATTMGR_ONEPLUS_BATT_RTC_SOC, 0);
+			battmgr->oneplus_ui_soc_rtc_rc = ret;
+			if (!ret && battmgr->oneplus_ui_soc_rtc > 0 &&
+			    battmgr->oneplus_ui_soc_rtc <= 100 &&
+			    abs((int)battmgr->oneplus_ui_soc_rtc -
+				(int)raw_soc) <
+				BATTMGR_ONEPLUS_UI_SOC_BOOT_GAP_MAX) {
+				battmgr->oneplus_ui_soc =
+					battmgr->oneplus_ui_soc_rtc;
+				restored = true;
+			} else {
+				battmgr->oneplus_ui_soc = max(target, 1U);
+			}
+			battmgr->oneplus_ui_soc_target = target;
+			battmgr->oneplus_ui_soc_updated_at = jiffies;
+			battmgr->oneplus_ui_soc_initialized = true;
+			dev_info(battmgr->dev,
+				 "Caihong UI SOC: raw=%u target=%u rtc=%u ui=%u restored=%u rc=%d\n",
+				 raw_soc, target, battmgr->oneplus_ui_soc_rtc,
+				 battmgr->oneplus_ui_soc, restored, ret);
+		}
+		ui_soc = battmgr->oneplus_ui_soc;
+		backup = ui_soc != battmgr->oneplus_ui_soc_rtc;
+		mutex_unlock(&battmgr->lock);
+
+		if (backup)
+			mod_delayed_work(system_dfl_wq,
+					 &battmgr->oneplus_ui_soc_backup_work, 0);
+		return ui_soc;
+	}
+
+	mutex_lock(&battmgr->lock);
+	previous = battmgr->oneplus_ui_soc;
+	battmgr->oneplus_ui_soc_target = target;
+	charging = READ_ONCE(battmgr->oneplus_dual_running) ||
+		qcom_battmgr_oneplus_charge_pump_running() ||
+		battmgr->status.status == POWER_SUPPLY_STATUS_CHARGING ||
+		battmgr->status.status == POWER_SUPPLY_STATUS_FULL;
+
+	if (charging && battmgr->oneplus_ui_soc < target)
+		interval = BATTMGR_ONEPLUS_UI_SOC_UP_SECONDS * HZ;
+	else if (!charging && battmgr->oneplus_ui_soc > target)
+		interval = qcom_battmgr_oneplus_soc_down_seconds(
+			battmgr->oneplus_ui_soc) * HZ;
+	else
+		interval = 0;
+
+	if (interval && time_is_before_jiffies(
+			battmgr->oneplus_ui_soc_updated_at + interval)) {
+		if (battmgr->oneplus_ui_soc < target)
+			battmgr->oneplus_ui_soc++;
+		else
+			battmgr->oneplus_ui_soc--;
+		battmgr->oneplus_ui_soc_updated_at = jiffies;
+	}
+
+	ui_soc = battmgr->oneplus_ui_soc;
+	backup = ui_soc != previous;
+	mutex_unlock(&battmgr->lock);
+
+	if (backup)
+		mod_delayed_work(system_dfl_wq,
+				 &battmgr->oneplus_ui_soc_backup_work, 0);
+
+	return ui_soc;
+}
+
+static int qcom_battmgr_oneplus_battery_status(
+	struct qcom_battmgr *battmgr, int firmware_status)
+{
+	u32 display_soc = READ_ONCE(battmgr->status.percent);
+
+	if (READ_ONCE(battmgr->oneplus_ui_soc_smoothing) &&
+	    READ_ONCE(battmgr->oneplus_ui_soc_initialized))
+		display_soc = READ_ONCE(battmgr->oneplus_ui_soc);
+
+	if (READ_ONCE(battmgr->oneplus_ffc_full) &&
+	    READ_ONCE(battmgr->usb.online))
+		return POWER_SUPPLY_STATUS_FULL;
+
+	/*
+	 * After a completed charge, project-23926 firmware loses its FULL flag
+	 * across an AP reboot and reports NOT_CHARGING while the adapter remains
+	 * online. Match the status to the smoothed capacity exported to userspace;
+	 * a real recharge still reports CHARGING and is left untouched.
+	 */
+	if (battmgr->oneplus_report_full_at_100 &&
+	    firmware_status == POWER_SUPPLY_STATUS_NOT_CHARGING &&
+	    READ_ONCE(battmgr->usb.online) &&
+	    READ_ONCE(battmgr->status.voltage_now) >
+			BATTMGR_ONEPLUS_RECHARGE_UV &&
+	    READ_ONCE(battmgr->status.current_now) <=
+			BATTMGR_ONEPLUS_FULL_IDLE_DISCHARGE_UA &&
+	    display_soc >= 100)
+		return POWER_SUPPLY_STATUS_FULL;
+
+	if (READ_ONCE(battmgr->oneplus_dual_running) ||
+	    qcom_battmgr_oneplus_charge_pump_running())
+		return POWER_SUPPLY_STATUS_CHARGING;
+
+	return firmware_status;
+}
+
+/*
+ * The project-23926 firmware reports health=OVERHEAT while wired charging is
+ * active, even with a normal battery temperature.  The stock stack derives
+ * health from battery presence, over-voltage and its temperature region
+ * instead of exposing that transient firmware value.
+ */
+static int qcom_battmgr_oneplus_battery_health(
+	struct qcom_battmgr *battmgr, int firmware_health)
+{
+	if (!battmgr->oneplus_ui_soc_smoothing ||
+	    firmware_health != POWER_SUPPLY_HEALTH_OVERHEAT)
+		return firmware_health;
+
+	if (battmgr->status.temperature >=
+			BATTMGR_ONEPLUS_POLICY_TEMP_MIN_DECIC &&
+	    battmgr->status.temperature <=
+			BATTMGR_ONEPLUS_POLICY_TEMP_MAX_DECIC)
+		return POWER_SUPPLY_HEALTH_GOOD;
+
+	return firmware_health;
+}
+
+/*
+ * The Caihong ADSP gauge uses the Android convention (negative while the
+ * battery is charging).  Linux power_supply uses the opposite convention:
+ * positive current charges the battery and negative current discharges it.
+ * Convert only the value exported through CURRENT_NOW; charging policy and
+ * FFC continue to consume the unmodified firmware sample in status.current_now.
+ */
+static int qcom_battmgr_oneplus_battery_current(
+	struct qcom_battmgr *battmgr, int firmware_current)
+{
+	if (!battmgr->oneplus_battery_current_inverted ||
+	    firmware_current == INT_MIN)
+		return firmware_current;
+
+	return -firmware_current;
+}
+
+static int qcom_battmgr_oneplus_ffc_refresh_locked(
+	struct qcom_battmgr *battmgr)
+{
+	static const u8 bat_props[] = {
+		BATT_STATUS,
+		BATT_CAPACITY,
+		BATT_VOLT_NOW,
+		BATT_CURR_NOW,
+		BATT_TEMP,
+	};
+	int ret;
+	int i;
+
+	ret = qcom_battmgr_request_property(battmgr,
+		BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(bat_props); i++) {
+		ret = qcom_battmgr_request_property(battmgr,
+			BATTMGR_BAT_PROPERTY_GET, bat_props[i], 0);
+		if (ret)
+			return ret;
+	}
+
+	battmgr->oneplus_ffc_vbat_uv = battmgr->status.voltage_now;
+	battmgr->oneplus_ffc_ibat_ua = battmgr->status.current_now;
+	battmgr->oneplus_ffc_temp_decic = battmgr->status.temperature;
+	battmgr->oneplus_ffc_raw_soc = battmgr->status.percent;
+	battmgr->oneplus_ffc_samples++;
+
+	return 0;
+}
+
+static int qcom_battmgr_oneplus_ffc_set_limits_locked(
+	struct qcom_battmgr *battmgr, u32 fv_mv, u32 fcc_ua)
+{
+	int ret;
+
+	ret = qcom_battmgr_oneplus_property_set_locked(battmgr,
+		BATTMGR_BAT_PROPERTY_SET, BATT_VOLT_MAX, fv_mv);
+	if (ret)
+		return ret;
+
+	return qcom_battmgr_oneplus_property_set_locked(battmgr,
+		BATTMGR_BAT_PROPERTY_SET, BATT_CHG_CTRL_LIM, fcc_ua);
+}
+
+static int qcom_battmgr_oneplus_ffc_restore_normal_locked(
+	struct qcom_battmgr *battmgr)
+{
+	u32 fcc_ua = BATTMGR_ONEPLUS_NORMAL_FCC_UA;
+	int ret;
+	int fcc_ret;
+
+	if (battmgr->oneplus_ffc_saved_fcc_valid)
+		fcc_ua = battmgr->oneplus_ffc_saved_fcc_ua;
+
+	ret = qcom_battmgr_oneplus_property_set_locked(battmgr,
+		BATTMGR_BAT_PROPERTY_SET, BATT_VOLT_MAX,
+		BATTMGR_ONEPLUS_NORMAL_FV_MV);
+	fcc_ret = qcom_battmgr_oneplus_property_set_locked(battmgr,
+		BATTMGR_BAT_PROPERTY_SET, BATT_CHG_CTRL_LIM, fcc_ua);
+
+	return ret ? ret : fcc_ret;
+}
+
+static int qcom_battmgr_oneplus_ffc_set_full_locked(
+	struct qcom_battmgr *battmgr, bool full)
+{
+	int ret;
+
+	ret = qcom_battmgr_oneplus_property_set_locked(battmgr,
+		BATTMGR_BAT_PROPERTY_SET, BATT_CHG_CTRL_EN, full ? 0 : 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_battmgr_oneplus_property_set_locked(battmgr,
+		BATTMGR_BAT_PROPERTY_SET, BATTMGR_ONEPLUS_BATT_SET_FULL,
+		full);
+	if (ret) {
+		if (full)
+			qcom_battmgr_oneplus_property_set_locked(battmgr,
+				BATTMGR_BAT_PROPERTY_SET, BATT_CHG_CTRL_EN, 1);
+		return ret;
+	}
+
+	battmgr->oneplus_ffc_full = full;
+	return 0;
+}
+
+static void qcom_battmgr_oneplus_ffc_reset_locked(
+	struct qcom_battmgr *battmgr, enum qcom_battmgr_oneplus_ffc_state state,
+	int result)
+{
+	battmgr->oneplus_ffc_requested = false;
+	battmgr->oneplus_ffc_state = state;
+	battmgr->oneplus_ffc_step = 0;
+	battmgr->oneplus_ffc_fv_count = 0;
+	battmgr->oneplus_ffc_fcc_count = 0;
+	battmgr->oneplus_ffc_sw_full_count = 0;
+	battmgr->oneplus_ffc_hw_full_count = 0;
+	battmgr->oneplus_ffc_last_rc = result;
+}
+
+static int qcom_battmgr_oneplus_ffc_start_locked(
+	struct qcom_battmgr *battmgr)
+{
+	u32 fcc_ua;
+	int ret;
+
+	/* Preserve the firmware-selected normal-path FCC for the CV handoff. */
+	battmgr->oneplus_ffc_property_value = 0;
+	ret = qcom_battmgr_request_property(battmgr,
+		BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM, 0);
+	if (!ret) {
+		fcc_ua = battmgr->oneplus_ffc_property_value;
+		if (fcc_ua >= BATTMGR_ONEPLUS_SW_FULL_ITERM_UA &&
+		    fcc_ua <= 10000000) {
+			battmgr->oneplus_ffc_saved_fcc_ua = fcc_ua;
+			battmgr->oneplus_ffc_saved_fcc_valid = true;
+		}
+	}
+
+	ret = qcom_battmgr_oneplus_ffc_set_limits_locked(battmgr,
+		BATTMGR_ONEPLUS_FFC_FV_MV,
+		BATTMGR_ONEPLUS_FFC_STEP0_FCC_UA);
+	if (ret)
+		return ret;
+
+	battmgr->oneplus_ffc_state = BATTMGR_ONEPLUS_FFC_STEP0;
+	battmgr->oneplus_ffc_step = 0;
+	battmgr->oneplus_ffc_fv_count = 0;
+	battmgr->oneplus_ffc_fcc_count = 0;
+	battmgr->oneplus_ffc_sessions++;
+
+	dev_info(battmgr->dev,
+		 "Caihong FFC started: raw_soc=%u vbat=%u temp=%d fcc=%u\n",
+		 battmgr->oneplus_ffc_raw_soc, battmgr->oneplus_ffc_vbat_uv,
+		 battmgr->oneplus_ffc_temp_decic,
+		 BATTMGR_ONEPLUS_FFC_STEP0_FCC_UA);
+
+	return 0;
+}
+
+static void qcom_battmgr_oneplus_ffc_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(
+		to_delayed_work(work), struct qcom_battmgr, oneplus_ffc_work);
+	u32 cutoff_ua;
+	u32 next_fcc_ua;
+	u32 sw_full_counts = BATTMGR_ONEPLUS_SW_FULL_COUNTS;
+	u32 delay_ms = BATTMGR_ONEPLUS_FFC_CHECK_MS;
+	bool boot_full;
+	bool cp_running;
+	bool reschedule = false;
+	int full_ret;
+	int restore_ret;
+	int ret;
+
+	if (!READ_ONCE(battmgr->oneplus_ffc_policy) ||
+	    !READ_ONCE(battmgr->service_up))
+		return;
+
+	cp_running = qcom_battmgr_oneplus_charge_pump_running();
+
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_oneplus_ffc_refresh_locked(battmgr);
+	if (ret) {
+		battmgr->oneplus_ffc_last_rc = ret;
+		reschedule = battmgr->oneplus_ffc_requested ||
+			battmgr->oneplus_ffc_full;
+		goto out_unlock;
+	}
+
+	if (!battmgr->usb.online) {
+		if (battmgr->oneplus_ffc_full) {
+			ret = qcom_battmgr_oneplus_ffc_set_full_locked(
+				battmgr, false);
+			if (ret) {
+				battmgr->oneplus_ffc_last_rc = ret;
+				reschedule = true;
+				goto out_changed;
+			}
+		}
+		qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+			BATTMGR_ONEPLUS_FFC_IDLE, 0);
+		battmgr->oneplus_ffc_saved_fcc_valid = false;
+		goto out_changed;
+	}
+
+	if (battmgr->oneplus_ffc_boot_reconcile) {
+		battmgr->oneplus_ffc_charge_enabled_valid = false;
+		ret = qcom_battmgr_request_property(battmgr,
+			BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_EN, 0);
+		if (ret || !battmgr->oneplus_ffc_charge_enabled_valid) {
+			battmgr->oneplus_ffc_last_rc = ret ? ret : -ENODATA;
+			reschedule = true;
+			goto out_changed;
+		}
+		battmgr->oneplus_ffc_firmware_full_valid = false;
+		full_ret = qcom_battmgr_request_property(battmgr,
+			BATTMGR_BAT_PROPERTY_GET,
+			BATTMGR_ONEPLUS_BATT_SET_FULL, 0);
+		boot_full = !battmgr->oneplus_ffc_charge_enabled ||
+			(!full_ret &&
+			 battmgr->oneplus_ffc_firmware_full_valid &&
+			 battmgr->oneplus_ffc_firmware_full) ||
+			(battmgr->oneplus_ffc_raw_soc >= 90 &&
+			 battmgr->oneplus_ffc_temp_decic >=
+				BATTMGR_ONEPLUS_FFC_TEMP_MIN_DECIC &&
+			 battmgr->oneplus_ffc_temp_decic <=
+				BATTMGR_ONEPLUS_FFC_TEMP_MAX_DECIC &&
+			 (battmgr->status.status ==
+				POWER_SUPPLY_STATUS_NOT_CHARGING ||
+			  (battmgr->oneplus_ffc_vbat_uv <=
+				BATTMGR_ONEPLUS_RECHARGE_UV &&
+			   battmgr->oneplus_ffc_ibat_ua >
+				BATTMGR_ONEPLUS_FULL_IDLE_DISCHARGE_UA)));
+
+		battmgr->oneplus_ffc_boot_reconcile = false;
+		if (boot_full) {
+			if (battmgr->oneplus_ffc_vbat_uv <=
+					BATTMGR_ONEPLUS_RECHARGE_UV) {
+				ret = qcom_battmgr_oneplus_ffc_set_full_locked(
+					battmgr, false);
+				if (!ret)
+					ret = qcom_battmgr_oneplus_ffc_restore_normal_locked(
+						battmgr);
+				qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+					ret ? BATTMGR_ONEPLUS_FFC_ERROR :
+					BATTMGR_ONEPLUS_FFC_CV, ret);
+				battmgr->oneplus_ffc_requested = !ret;
+				reschedule = !ret;
+				dev_info(battmgr->dev,
+					 "Caihong boot recharge %s at vbat=%u: %d\n",
+					 ret ? "failed" : "started",
+					 battmgr->oneplus_ffc_vbat_uv, ret);
+			} else {
+				battmgr->oneplus_ffc_full = true;
+				qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+					BATTMGR_ONEPLUS_FFC_FULL, 0);
+				reschedule = true;
+				dev_info(battmgr->dev,
+					 "Caihong boot full state restored at vbat=%u\n",
+					 battmgr->oneplus_ffc_vbat_uv);
+			}
+			goto out_changed;
+		}
+	}
+
+	if (battmgr->oneplus_ffc_full) {
+		if (battmgr->oneplus_ffc_vbat_uv <=
+				BATTMGR_ONEPLUS_RECHARGE_UV) {
+			ret = qcom_battmgr_oneplus_ffc_set_full_locked(
+				battmgr, false);
+			if (!ret)
+				ret = qcom_battmgr_oneplus_ffc_restore_normal_locked(
+					battmgr);
+			qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+				ret ? BATTMGR_ONEPLUS_FFC_ERROR :
+				BATTMGR_ONEPLUS_FFC_CV, ret);
+			battmgr->oneplus_ffc_requested = !ret;
+			dev_info(battmgr->dev,
+				 "Caihong recharge %s at vbat=%u: %d\n",
+				 ret ? "failed" : "started",
+				 battmgr->oneplus_ffc_vbat_uv, ret);
+		}
+		reschedule = true;
+		goto out_changed;
+	}
+
+	if (!battmgr->oneplus_ffc_requested)
+		goto out_unlock;
+
+	if (cp_running) {
+		reschedule = true;
+		goto out_unlock;
+	}
+
+	if (battmgr->oneplus_ffc_temp_decic <
+			BATTMGR_ONEPLUS_FFC_TEMP_MIN_DECIC ||
+	    battmgr->oneplus_ffc_temp_decic >
+			BATTMGR_ONEPLUS_FFC_TEMP_MAX_DECIC) {
+		ret = -ERANGE;
+		goto abort_restore;
+	}
+
+	if (battmgr->oneplus_ffc_vbat_uv >= 4500000) {
+		dev_warn(battmgr->dev,
+			 "Caihong FFC hard-voltage guard at %u uV\n",
+			 battmgr->oneplus_ffc_vbat_uv);
+		ret = qcom_battmgr_oneplus_ffc_restore_normal_locked(battmgr);
+		qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+			ret ? BATTMGR_ONEPLUS_FFC_ERROR :
+			BATTMGR_ONEPLUS_FFC_CV, ret);
+		battmgr->oneplus_ffc_requested = !ret;
+		reschedule = !ret;
+		goto out_changed;
+	}
+
+	switch (battmgr->oneplus_ffc_state) {
+	case BATTMGR_ONEPLUS_FFC_WAIT:
+		/* Stock skips FFC when the raw gauge is already full above 4.435 V. */
+		if (battmgr->oneplus_ffc_raw_soc >= 100 &&
+		    battmgr->oneplus_ffc_vbat_uv >=
+				BATTMGR_ONEPLUS_FULL_PRE_FFC_UV) {
+			ret = qcom_battmgr_oneplus_ffc_restore_normal_locked(
+				battmgr);
+			if (!ret)
+				ret = qcom_battmgr_oneplus_ffc_set_full_locked(
+					battmgr, true);
+			qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+				ret ? BATTMGR_ONEPLUS_FFC_ERROR :
+				BATTMGR_ONEPLUS_FFC_FULL, ret);
+			dev_info(battmgr->dev,
+				 "Caihong pre-FFC full decision: raw_soc=%u vbat=%u rc=%d\n",
+				 battmgr->oneplus_ffc_raw_soc,
+				 battmgr->oneplus_ffc_vbat_uv, ret);
+			reschedule = !ret;
+			goto out_changed;
+		}
+		ret = qcom_battmgr_oneplus_ffc_start_locked(battmgr);
+		if (ret)
+			goto abort_restore;
+		reschedule = true;
+		goto out_changed;
+	case BATTMGR_ONEPLUS_FFC_STEP0:
+		cutoff_ua = BATTMGR_ONEPLUS_FFC_STEP0_CUTOFF_UA;
+		next_fcc_ua = BATTMGR_ONEPLUS_FFC_STEP1_FCC_UA;
+		break;
+	case BATTMGR_ONEPLUS_FFC_STEP1:
+		cutoff_ua = BATTMGR_ONEPLUS_FFC_STEP1_CUTOFF_UA;
+		next_fcc_ua = 0;
+		break;
+	case BATTMGR_ONEPLUS_FFC_CV:
+		if (battmgr->oneplus_ffc_vbat_uv >
+				BATTMGR_ONEPLUS_HW_FULL_FV_UV)
+			battmgr->oneplus_ffc_hw_full_count++;
+		else
+			battmgr->oneplus_ffc_hw_full_count = 0;
+
+		if (battmgr->oneplus_ffc_vbat_uv <=
+				BATTMGR_ONEPLUS_SW_FULL_FV_UV) {
+			battmgr->oneplus_ffc_sw_full_count = 0;
+		} else if (battmgr->oneplus_ffc_ibat_ua < 0) {
+			if (abs(battmgr->oneplus_ffc_ibat_ua) <=
+					BATTMGR_ONEPLUS_SW_FULL_ITERM_UA)
+				battmgr->oneplus_ffc_sw_full_count++;
+			else
+				battmgr->oneplus_ffc_sw_full_count = 0;
+		} else {
+			battmgr->oneplus_ffc_sw_full_count++;
+			sw_full_counts = BATTMGR_ONEPLUS_SW_FULL_IDLE_COUNTS;
+		}
+
+		if (battmgr->oneplus_ffc_hw_full_count >=
+				BATTMGR_ONEPLUS_HW_FULL_COUNTS ||
+		    battmgr->oneplus_ffc_sw_full_count >=
+				sw_full_counts) {
+			bool hw_full = battmgr->oneplus_ffc_hw_full_count >=
+				BATTMGR_ONEPLUS_HW_FULL_COUNTS;
+
+			ret = qcom_battmgr_oneplus_ffc_set_full_locked(
+				battmgr, true);
+			qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+				ret ? BATTMGR_ONEPLUS_FFC_ERROR :
+				BATTMGR_ONEPLUS_FFC_FULL, ret);
+			dev_info(battmgr->dev,
+				 "Caihong charge complete (%s): raw_soc=%u vbat=%u ibat=%d rc=%d\n",
+				 hw_full ? "hw-fv" : "sw-iterm",
+				 battmgr->oneplus_ffc_raw_soc,
+				 battmgr->oneplus_ffc_vbat_uv,
+				 battmgr->oneplus_ffc_ibat_ua, ret);
+			reschedule = !ret;
+			goto out_changed;
+		}
+		reschedule = true;
+		goto out_unlock;
+	default:
+		ret = -EINVAL;
+		goto abort_restore;
+	}
+
+	if (battmgr->oneplus_ffc_vbat_uv >=
+			BATTMGR_ONEPLUS_FFC_CUTOFF_MV * 1000)
+		battmgr->oneplus_ffc_fv_count++;
+	if (battmgr->oneplus_ffc_ibat_ua < 0 &&
+	    abs(battmgr->oneplus_ffc_ibat_ua) < cutoff_ua)
+		battmgr->oneplus_ffc_fcc_count++;
+	else
+		battmgr->oneplus_ffc_fcc_count = 0;
+
+	if (battmgr->oneplus_ffc_fv_count <
+			BATTMGR_ONEPLUS_FFC_VOLT_COUNTS &&
+	    battmgr->oneplus_ffc_fcc_count <
+			BATTMGR_ONEPLUS_FFC_CURRENT_COUNTS) {
+		reschedule = true;
+		goto out_unlock;
+	}
+
+	if (next_fcc_ua) {
+		ret = qcom_battmgr_oneplus_ffc_set_limits_locked(battmgr,
+			BATTMGR_ONEPLUS_FFC_FV_MV, next_fcc_ua);
+		if (ret)
+			goto abort_restore;
+		battmgr->oneplus_ffc_state = BATTMGR_ONEPLUS_FFC_STEP1;
+		battmgr->oneplus_ffc_step = 1;
+		battmgr->oneplus_ffc_fv_count = 0;
+		battmgr->oneplus_ffc_fcc_count = 0;
+		dev_info(battmgr->dev,
+			 "Caihong FFC advanced to step 1: vbat=%u ibat=%d\n",
+			 battmgr->oneplus_ffc_vbat_uv,
+			 battmgr->oneplus_ffc_ibat_ua);
+	} else {
+		ret = qcom_battmgr_oneplus_ffc_restore_normal_locked(battmgr);
+		if (ret)
+			goto abort_restore;
+		battmgr->oneplus_ffc_state = BATTMGR_ONEPLUS_FFC_CV;
+		battmgr->oneplus_ffc_step = 2;
+		battmgr->oneplus_ffc_fv_count = 0;
+		battmgr->oneplus_ffc_fcc_count = 0;
+		battmgr->oneplus_ffc_sw_full_count = 0;
+		battmgr->oneplus_ffc_hw_full_count = 0;
+		dev_info(battmgr->dev,
+			 "Caihong FFC complete; entering 4455-mV CV: vbat=%u ibat=%d\n",
+			 battmgr->oneplus_ffc_vbat_uv,
+			 battmgr->oneplus_ffc_ibat_ua);
+	}
+	reschedule = true;
+	goto out_changed;
+
+abort_restore:
+	restore_ret = qcom_battmgr_oneplus_ffc_restore_normal_locked(battmgr);
+	if (!ret)
+		ret = restore_ret;
+	qcom_battmgr_oneplus_ffc_reset_locked(battmgr,
+		BATTMGR_ONEPLUS_FFC_ERROR, ret);
+	dev_warn(battmgr->dev,
+		 "Caihong FFC aborted: rc=%d restore=%d raw_soc=%u vbat=%u temp=%d\n",
+		 ret, restore_ret, battmgr->oneplus_ffc_raw_soc,
+		 battmgr->oneplus_ffc_vbat_uv,
+		 battmgr->oneplus_ffc_temp_decic);
+
+out_changed:
+	power_supply_changed(battmgr->bat_psy);
+out_unlock:
+	mutex_unlock(&battmgr->lock);
+
+	if (reschedule)
+		mod_delayed_work(system_long_wq, &battmgr->oneplus_ffc_work,
+			msecs_to_jiffies(delay_ms));
+}
+
+int qcom_battmgr_caihong_notify_fastchg_complete(struct power_supply *psy)
+{
+	struct qcom_battmgr *battmgr;
+
+	if (!psy)
+		return -EINVAL;
+
+	battmgr = power_supply_get_drvdata(psy);
+	if (!battmgr || psy != battmgr->bat_psy)
+		return -EINVAL;
+	if (!battmgr->oneplus_ffc_policy)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&battmgr->lock);
+	if (!battmgr->oneplus_ffc_full) {
+		battmgr->oneplus_ffc_requested = true;
+		battmgr->oneplus_ffc_state = BATTMGR_ONEPLUS_FFC_WAIT;
+		battmgr->oneplus_ffc_step = 0;
+		battmgr->oneplus_ffc_fv_count = 0;
+		battmgr->oneplus_ffc_fcc_count = 0;
+		battmgr->oneplus_ffc_sw_full_count = 0;
+		battmgr->oneplus_ffc_hw_full_count = 0;
+		battmgr->oneplus_ffc_last_rc = 0;
+	}
+	mutex_unlock(&battmgr->lock);
+
+	mod_delayed_work(system_long_wq, &battmgr->oneplus_ffc_work,
+		msecs_to_jiffies(BATTMGR_ONEPLUS_FFC_START_DELAY_MS));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_caihong_notify_fastchg_complete);
+
+static ssize_t oneplus_ffc_status_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf,
+		"enabled=%u requested=%u full=%u state=%u step=%u sessions=%u "
+		"samples=%u raw_soc=%u vbat_uv=%u ibat_ua=%d temp_decic=%d "
+		"fv_count=%u fcc_count=%u full_count=%u hw_full_count=%u "
+		"saved_fcc_ua=%u last_rc=%d\n",
+		READ_ONCE(battmgr->oneplus_ffc_policy),
+		READ_ONCE(battmgr->oneplus_ffc_requested),
+		READ_ONCE(battmgr->oneplus_ffc_full),
+		READ_ONCE(battmgr->oneplus_ffc_state),
+		READ_ONCE(battmgr->oneplus_ffc_step),
+		READ_ONCE(battmgr->oneplus_ffc_sessions),
+		READ_ONCE(battmgr->oneplus_ffc_samples),
+		READ_ONCE(battmgr->oneplus_ffc_raw_soc),
+		READ_ONCE(battmgr->oneplus_ffc_vbat_uv),
+		READ_ONCE(battmgr->oneplus_ffc_ibat_ua),
+		READ_ONCE(battmgr->oneplus_ffc_temp_decic),
+		READ_ONCE(battmgr->oneplus_ffc_fv_count),
+		READ_ONCE(battmgr->oneplus_ffc_fcc_count),
+		READ_ONCE(battmgr->oneplus_ffc_sw_full_count),
+		READ_ONCE(battmgr->oneplus_ffc_hw_full_count),
+		READ_ONCE(battmgr->oneplus_ffc_saved_fcc_ua),
+		READ_ONCE(battmgr->oneplus_ffc_last_rc));
+}
+static DEVICE_ATTR_RO(oneplus_ffc_status);
+
+static struct attribute *qcom_battmgr_oneplus_ffc_attrs[] = {
+	&dev_attr_oneplus_ffc_status.attr,
+	NULL,
+};
+
+static const struct attribute_group qcom_battmgr_oneplus_ffc_group = {
+	.attrs = qcom_battmgr_oneplus_ffc_attrs,
+};
+
+static int qcom_battmgr_caihong_update_battery_property(
+	struct qcom_battmgr *battmgr, enum power_supply_property psp)
+{
+	s64 derived_uw;
+	int current_ua;
+	int ret;
+
+	if (!battmgr->oneplus_power_now_from_vi ||
+	    psp != POWER_SUPPLY_PROP_POWER_NOW)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&battmgr->lock);
+
+	/* Keep the firmware value for comparison, but do not expose it directly. */
+	ret = qcom_battmgr_request_property(battmgr,
+		BATTMGR_BAT_PROPERTY_GET, BATT_POWER_NOW, 0);
+	if (ret)
+		goto out_unlock;
+	battmgr->oneplus_power_raw_uw = battmgr->status.power_now;
+
+	ret = qcom_battmgr_request_property(battmgr,
+		BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, 0);
+	if (ret)
+		goto out_unlock;
+
+	ret = qcom_battmgr_request_property(battmgr,
+		BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, 0);
+	if (ret)
+		goto out_unlock;
+
+	current_ua = qcom_battmgr_oneplus_battery_current(
+		battmgr, battmgr->status.current_now);
+	derived_uw = div_s64((s64)battmgr->status.voltage_now * current_ua,
+			       1000000);
+	if (derived_uw > INT_MAX || derived_uw < INT_MIN) {
+		ret = -ERANGE;
+		goto out_unlock;
+	}
+
+	battmgr->oneplus_power_voltage_uv = battmgr->status.voltage_now;
+	battmgr->oneplus_power_current_ua = current_ua;
+	battmgr->oneplus_power_derived_uw = derived_uw;
+	battmgr->status.power_now = derived_uw;
+	battmgr->oneplus_power_samples++;
+
+out_unlock:
+	battmgr->oneplus_power_last_rc = ret;
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
+static void qcom_battmgr_oneplus_otg_init_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(
+		work, struct qcom_battmgr, oneplus_otg_init_work);
+	int typec_rc;
+	int ap_rc;
+
+	mutex_lock(&battmgr->lock);
+	if (!battmgr->oneplus_otg_control || !battmgr->service_up) {
+		mutex_unlock(&battmgr->lock);
+		return;
+	}
+
+	battmgr->oneplus_otg_init_attempts++;
+	typec_rc = qcom_battmgr_oneplus_property_set_locked(
+		battmgr, BATTMGR_USB_PROPERTY_SET,
+		BATTMGR_ONEPLUS_USB_TYPEC_MODE,
+		BATTMGR_ONEPLUS_TYPEC_ROLE_DRP);
+	ap_rc = qcom_battmgr_oneplus_property_set_locked(
+		battmgr, BATTMGR_USB_PROPERTY_SET,
+		BATTMGR_ONEPLUS_USB_OTG_AP_ENABLE, 1);
+	battmgr->oneplus_otg_typec_mode_rc = typec_rc;
+	battmgr->oneplus_otg_ap_enable_rc = ap_rc;
+	battmgr->oneplus_otg_initialized = !typec_rc && !ap_rc;
+	mutex_unlock(&battmgr->lock);
+
+	dev_info(battmgr->dev,
+		 "Caihong OTG firmware init: typec_drp=%d otg_ap_enable=%d\n",
+		 typec_rc, ap_rc);
+}
+
+static void qcom_battmgr_oneplus_otg_event_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(
+		to_delayed_work(work), struct qcom_battmgr,
+		oneplus_otg_event_work);
+	bool enable;
+	int ret;
+
+	enable = READ_ONCE(battmgr->oneplus_otg_vbus_requested);
+
+	mutex_lock(&battmgr->lock);
+	if (!battmgr->oneplus_otg_control || !battmgr->service_up) {
+		mutex_unlock(&battmgr->lock);
+		return;
+	}
+
+	ret = qcom_battmgr_oneplus_property_set_locked(
+		battmgr, BATTMGR_USB_PROPERTY_SET,
+		BATTMGR_ONEPLUS_USB_OTG_VBUS_ENABLE, enable);
+	battmgr->oneplus_otg_vbus_rc = ret;
+	mutex_unlock(&battmgr->lock);
+
+	dev_info(battmgr->dev, "Caihong OTG VBUS %s: %d\n",
+		 enable ? "enable" : "disable", ret);
+}
+
+static ssize_t oneplus_otg_diagnostics_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf,
+		"revision=otg-ap-init-v1 enabled=%u service_up=%u initialized=%u "
+		"init_attempts=%u typec_mode_rc=%d otg_ap_enable_rc=%d "
+		"vbus_requested=%u vbus_rc=%d last_notification=%#x "
+		"otg_enable=%u otg_disable=%u typec_state=%u cid=%u\n",
+		READ_ONCE(battmgr->oneplus_otg_control),
+		READ_ONCE(battmgr->service_up),
+		READ_ONCE(battmgr->oneplus_otg_initialized),
+		READ_ONCE(battmgr->oneplus_otg_init_attempts),
+		READ_ONCE(battmgr->oneplus_otg_typec_mode_rc),
+		READ_ONCE(battmgr->oneplus_otg_ap_enable_rc),
+		READ_ONCE(battmgr->oneplus_otg_vbus_requested),
+		READ_ONCE(battmgr->oneplus_otg_vbus_rc),
+		READ_ONCE(battmgr->oneplus_otg_last_notification),
+		READ_ONCE(battmgr->oneplus_otg_enable_events),
+		READ_ONCE(battmgr->oneplus_otg_disable_events),
+		READ_ONCE(battmgr->oneplus_otg_typec_events),
+		READ_ONCE(battmgr->oneplus_otg_cid_events));
+}
+static DEVICE_ATTR_RO(oneplus_otg_diagnostics);
+
+static ssize_t oneplus_power_diagnostics_show(struct device *dev,
+					       struct device_attribute *attr,
+					       char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf,
+		"source=voltage-times-current enabled=%u samples=%u last_rc=%d "
+		"raw_power_uw=%d derived_power_uw=%d voltage_uv=%u current_ua=%d\n",
+		READ_ONCE(battmgr->oneplus_power_now_from_vi),
+		READ_ONCE(battmgr->oneplus_power_samples),
+		READ_ONCE(battmgr->oneplus_power_last_rc),
+		READ_ONCE(battmgr->oneplus_power_raw_uw),
+		READ_ONCE(battmgr->oneplus_power_derived_uw),
+		READ_ONCE(battmgr->oneplus_power_voltage_uv),
+		READ_ONCE(battmgr->oneplus_power_current_ua));
+}
+static DEVICE_ATTR_RO(oneplus_power_diagnostics);
+
+static struct attribute *qcom_battmgr_oneplus_otg_attrs[] = {
+	&dev_attr_oneplus_otg_diagnostics.attr,
+	&dev_attr_oneplus_power_diagnostics.attr,
+	NULL,
+};
+
+static const struct attribute_group qcom_battmgr_oneplus_otg_group = {
+	.attrs = qcom_battmgr_oneplus_otg_attrs,
+};
 
 static int qcom_battmgr_oneplus_restore_buck_locked(
 	struct qcom_battmgr *battmgr)
@@ -252,7 +1263,7 @@ static int __maybe_unused qcom_battmgr_oneplus_suspend_buck_locked(
 }
 
 static int qcom_battmgr_oneplus_set_pps_locked(struct qcom_battmgr *battmgr,
-					       u32 voltage_mv, u32 current_ma)
+						       u32 voltage_mv, u32 current_ma)
 {
 	int ret;
 
@@ -266,6 +1277,49 @@ static int qcom_battmgr_oneplus_set_pps_locked(struct qcom_battmgr *battmgr,
 	return qcom_battmgr_oneplus_property_set_locked(
 		battmgr, BATTMGR_USB_PROPERTY_SET,
 		BATTMGR_ONEPLUS_USB_SET_PPS_CURR, current_ma);
+}
+
+/*
+ * Expose the same firmware ICL request used by the PPS entry/exit path
+ * through the generic USB power-supply API. The USB descriptor historically
+ * exposed this value as read-only, which left the standalone VOOC PHY unable
+ * to perform the vendor WIRED_CHARGE_SUSPEND handoff. Keep this write path
+ * gated by the Caihong PPS firmware extension so other battmgr variants do
+ * not gain an unvalidated control.
+ */
+static int qcom_battmgr_usb_set_property(struct power_supply *psy,
+					 enum power_supply_property psp,
+					 const union power_supply_propval *val)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+	u32 request;
+	int ret;
+
+	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+	    !battmgr->oneplus_pps_read_buffer)
+		return -EINVAL;
+	if (!battmgr->service_up)
+		return -ENOTCONN;
+
+	/* The vendor USB HAL uses a negative ICL to remove its suspend vote. */
+	request = val->intval < 0 ? U32_MAX : (u32)val->intval;
+
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_oneplus_property_set_locked(
+		battmgr, BATTMGR_USB_PROPERTY_SET, USB_INPUT_CURR_LIMIT,
+		request);
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
+static int qcom_battmgr_usb_property_is_writeable(
+		struct power_supply *psy, enum power_supply_property psp)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+
+	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT &&
+	       battmgr->oneplus_pps_read_buffer;
 }
 
 static int qcom_battmgr_oneplus_read_cp_adc(struct power_supply *cp_psy,
@@ -1430,7 +2484,8 @@ static ssize_t oneplus_pps_run_2to1_5m_show(struct device *dev,
 		return sysfs_emit(buf, "not_run\n");
 
 	return sysfs_emit(buf,
-		"revision=stage4av-kernel-handoff-5m rc=%d running=%u ramp_rc=%d cp_run_ms=%u cp_run_rc=%d cp_cleanup_rc=%d source_restore_rc=%d\n",
+		"revision=%s rc=%d running=%u ramp_rc=%d cp_run_ms=%u cp_run_rc=%d cp_cleanup_rc=%d source_restore_rc=%d\n",
+		BATTMGR_ONEPLUS_POLICY_REVISION,
 		result, running, ramp_rc, BATTMGR_ONEPLUS_CP_RUN_5M_MS,
 		cp_run_rc, cp_cleanup_rc, source_restore_rc);
 }
@@ -1773,6 +2828,8 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 	u32 secondary_boost_pre_ibus_ua;
 	u32 primary_boost_post_ibus_ua;
 	u32 secondary_boost_post_ibus_ua;
+	u32 boost_pps_ma;
+	u32 boost_step_limit;
 	u32 boost_attempts;
 	u32 boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
 	u32 boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
@@ -1925,6 +2982,8 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 		battmgr->oneplus_dual_primary_boost_post_ibus_ua;
 	secondary_boost_post_ibus_ua =
 		battmgr->oneplus_dual_secondary_boost_post_ibus_ua;
+	boost_pps_ma = battmgr->oneplus_dual_boost_pps_ma;
+	boost_step_limit = battmgr->oneplus_dual_boost_step_limit;
 	boost_attempts = battmgr->oneplus_dual_boost_attempts;
 	memcpy(boost_request_mv, battmgr->oneplus_dual_boost_request_mv,
 	       sizeof(boost_request_mv));
@@ -2027,7 +3086,7 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 			(s64)monitor_primary_output_uv * 2 : 0;
 	post_stop_relax_uv = (s64)monitor_vbat_uv - post_stop_vbat_uv;
 	boost_low_handoff =
-		boost_attempts == BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS &&
+		boost_step_limit && boost_attempts == boost_step_limit &&
 		primary_boost_post_ibus_ua >=
 			BATTMGR_ONEPLUS_CP_DUAL_BOOST_HANDOFF_PUMP_MIN_UA &&
 		secondary_boost_post_ibus_ua >=
@@ -2042,9 +3101,9 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 		return sysfs_emit(buf, "not_run\n");
 
 	len = sysfs_emit(buf,
-		"revision=%s state=%s mode=%s running=%u rc=%d current_ma=%u boost_ma=%u boost_ms=%u boost_step_mv=%u boost_steps=%u boost_target_ua=%u primary_run_ms=%u secondary_run_ms=%u primary_settle_ms=%u idle_settle_ms=%u precondition_5v_rc=%d ramp_rc=%d\n"
+		"revision=%s state=%s mode=%s running=%u rc=%d current_ma=%u boost_ma=%u boost_max_ma=%u boost_max_mv=%u source_max_mv=%u boost_ms=%u boost_step_mv=%u boost_steps=%u boost_steps_max=%u boost_target_ua=%u primary_run_ms=%u secondary_run_ms=%u primary_settle_ms=%u idle_settle_ms=%u precondition_5v_rc=%d ramp_rc=%d\n"
 		"ramp_diag=stage:%s/vbat_uv:%u/vbat_attempts:%u/vbat_cache:%u/primary_vin_uv:%u/primary_output_uv:%u/primary_adc_attempts:%u/primary_prepare_rc:%d/secondary_vin_uv:%u/secondary_output_uv:%u/secondary_adc_attempts:%u/secondary_prepare_rc:%d/pump_target_mv:%u/source_request_mv:%u/feedback_attempts:%u/feedback_stable_samples:%u\n"
-		"entry_derate=rc:%d/from_mv:%u/to_mv:%u/step_mv:%u/settle_ms:%u\n"
+		"entry_center=rc:%d/from_mv:%u/to_mv:%u/step_mv:%u/settle_ms:%u\n"
 		"handoff=primary_entry_rc:%d/primary_entry_ibus_ua:%u/source_step_rc:%d/source_from_mv:%u/source_to_mv:%u/loaded_check_rc:%d/secondary_vbus_uv:%u/secondary_output_uv:%u/secondary_target_uv:%u/secondary_target_rc:%d\n"
 		"boost=primary_pre_rc:%d/primary_pre_ibus_ua:%u/secondary_pre_rc:%d/secondary_pre_ibus_ua:%u/source_rc:%d/primary_post_rc:%d/primary_post_ibus_ua:%u/secondary_post_rc:%d/secondary_post_ibus_ua:%u/reduce_rc:%d/handoff_low:%u/handoff_min_ua:%u/handoff_pump_min_ua:%u\n"
 		"overlap=stop_mode:%s/primary_pre_rc:%d/primary_pre_ibus_ua:%u/primary_post_rc:%d/primary_post_ibus_ua:%u/secondary_post_rc:%d/secondary_post_ibus_ua:%u/primary_run_rc:%d/secondary_run_rc:%d/primary_cancel_rc:%d/secondary_cancel_rc:%d\n"
@@ -2054,9 +3113,12 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 		running ? "active" : (result ? "failed" : "complete"),
 		continuous_run ? "continuous" : "bounded",
 		running, result, BATTMGR_ONEPLUS_CP_DUAL_PPS_MA,
-		BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA,
+		boost_pps_ma, BATTMGR_ONEPLUS_CP_DUAL_VENDOR_PPS_MAX_MA,
+		BATTMGR_ONEPLUS_CP_DUAL_VENDOR_PPS_MAX_MV,
+		BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV,
 		BATTMGR_ONEPLUS_CP_DUAL_BOOST_MS,
 		BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEP_MV,
+		boost_step_limit,
 		BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS,
 		BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA,
 		continuous_run ? 0 : BATTMGR_ONEPLUS_CP_DUAL_PRIMARY_RUN_MS,
@@ -2073,7 +3135,7 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 		ramp_pump_target_mv, ramp_source_request_mv,
 		ramp_feedback_attempts, ramp_feedback_stable_samples,
 		entry_derate_rc, entry_derate_from_mv, entry_derate_to_mv,
-		BATTMGR_ONEPLUS_CP_DUAL_ENTRY_DERATE_MV,
+		BATTMGR_ONEPLUS_CP_DUAL_ENTRY_ADJUST_STEP_MV,
 		BATTMGR_ONEPLUS_CP_DUAL_ENTRY_SETTLE_MS,
 		primary_entry_rc, primary_entry_ibus_ua, source_step_rc,
 		source_from_mv, source_to_mv, secondary_loaded_check_rc,
@@ -2098,12 +3160,13 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 		final_primary_off_rc, final_secondary_off_rc,
 		primary_cleanup_rc, secondary_cleanup_rc, source_restore_rc);
 	len += sysfs_emit_at(buf, len,
-		"hold=rc:%d/duration_ms:%u/sample_ms:%u/samples:%u/records:%u/adjustments:%u/up:%u/down:%u/up_pending:%u/up_required:%u/up_step_mv:%u/down_step_mv:%u/emergency:%u/emergency_recovered:%u/emergency_streak:%u/emergency_streak_max:%u/emergency_streak_limit:%u/full_confirmed:%u/full_checks:%u/full_vnow_uv:%u/full_ibat_max_ua:%u/full_capacity_min:%u/full_required:%u/vnow_cv_active:%u/vnow_cv_steps:%u/vnow_cv_enter_uv:%u/vnow_cv_release_uv:%u/vnow_cv_step_mv:%u/output_taper:%u/output_taper_steps:%u/soft_ibus_ua:%u/emergency_max_ua:%u/emergency_step_mv:%u/max_mv:%u/output_limited:%u\n",
+		"hold=rc:%d/duration_ms:%u/sample_ms:%u/samples:%u/records:%u/adjustments:%u/up:%u/down:%u/up_pending:%u/up_required:%u/low_enter_ua:%u/up_step_mv:%u/down_step_mv:%u/emergency:%u/emergency_recovered:%u/emergency_streak:%u/emergency_streak_max:%u/emergency_streak_limit:%u/full_confirmed:%u/full_checks:%u/full_vnow_uv:%u/full_ibat_max_ua:%u/full_capacity_min:%u/full_required:%u/vnow_cv_active:%u/vnow_cv_steps:%u/vnow_cv_enter_uv:%u/vnow_cv_release_uv:%u/vnow_cv_step_mv:%u/output_taper:%u/output_taper_steps:%u/soft_ibus_ua:%u/emergency_max_ua:%u/emergency_step_mv:%u/max_mv:%u/output_limited:%u\n",
 		hold_rc, continuous_run ? 0 : BATTMGR_ONEPLUS_CP_DUAL_HOLD_MS,
 		BATTMGR_ONEPLUS_CP_DUAL_HOLD_SAMPLE_MS, hold_samples,
 		hold_records, hold_adjustments, hold_adjustments_up,
 		hold_adjustments_down, hold_low_ibus_checks,
 		BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_CONFIRM_SAMPLES,
+		BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_UA,
 		BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_STEP_MV,
 		BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEP_MV,
 		hold_emergency_adjustments,
@@ -2406,6 +3469,8 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	u32 secondary_boost_pre_ibus_ua = 0;
 	u32 primary_boost_post_ibus_ua = 0;
 	u32 secondary_boost_post_ibus_ua = 0;
+	u32 boost_pps_ma = 0;
+	u32 boost_step_limit = 0;
 	u32 boost_attempts = 0;
 	u32 boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS] = { 0 };
 	u32 boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS] = { 0 };
@@ -2458,6 +3523,11 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	u32 source_boost_mv = 0;
 	u32 entry_derate_from_mv = 0;
 	u32 entry_derate_to_mv = 0;
+	u32 entry_target_uv = 0;
+	u32 entry_vin_uv = 0;
+	u32 entry_desired_uv = 0;
+	u32 entry_delta_uv = 0;
+	u32 entry_adjust_mv = 0;
 	u32 secondary_loaded_vbus_uv = 0;
 	u32 secondary_loaded_output_uv = 0;
 	u32 secondary_loaded_target_uv = 0;
@@ -2539,6 +3609,8 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	battmgr->oneplus_dual_secondary_boost_pre_ibus_ua = 0;
 	battmgr->oneplus_dual_primary_boost_post_ibus_ua = 0;
 	battmgr->oneplus_dual_secondary_boost_post_ibus_ua = 0;
+	battmgr->oneplus_dual_boost_pps_ma = 0;
+	battmgr->oneplus_dual_boost_step_limit = 0;
 	battmgr->oneplus_dual_boost_attempts = 0;
 	memset(battmgr->oneplus_dual_boost_request_mv, 0,
 	       sizeof(battmgr->oneplus_dual_boost_request_mv));
@@ -2665,34 +3737,59 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	}
 
 	/*
-	 * The shared ramp deliberately proves the upper part of the vendor start
-	 * window while both pumps are off.  At a gauge target boundary that can
-	 * leave the first pump alone close to the independent 1.2-A ceiling.  Apply
-	 * one vendor-sized downward control step before enabling it, then settle at
-	 * that still-valid target-window voltage.  The later boost retains the same
-	 * step count, so this can only lower the experiment's maximum request.
+	 * Center the live ramp result in the vendor's target-through-target+200-mV
+	 * start window. A fixed request adjustment is not stable across target
+	 * boundaries: this adapter needed a higher request at 8.25 V, while the
+	 * same adjustment could overshoot after the next 100-mV target step. The
+	 * ramp has already proved the live VBUS; move its measured headroom toward
+	 * 100 mV in native 20-mV PPS steps. The physical driver still rechecks the
+	 * original unmodified window immediately before CHG_EN.
 	 */
 	mutex_lock(&battmgr->lock);
+	entry_derate_rc = 0;
 	entry_derate_from_mv = battmgr->oneplus_pps_source_request_mv;
-	if (entry_derate_from_mv <
-	    BATTMGR_ONEPLUS_TEST_PPS_MV +
-		BATTMGR_ONEPLUS_CP_DUAL_ENTRY_DERATE_MV) {
+	entry_derate_to_mv = entry_derate_from_mv;
+	entry_target_uv = battmgr->oneplus_pps_pump_target_mv * 1000;
+	entry_vin_uv = battmgr->oneplus_pps_cp_vin_uv;
+	if (!entry_derate_from_mv || !entry_target_uv || !entry_vin_uv ||
+	    entry_vin_uv < entry_target_uv ||
+	    entry_vin_uv > entry_target_uv +
+			   BATTMGR_ONEPLUS_CP_2TO1_START_BAND_UV) {
 		entry_derate_rc = -ERANGE;
 	} else {
-		entry_derate_to_mv = entry_derate_from_mv -
-			BATTMGR_ONEPLUS_CP_DUAL_ENTRY_DERATE_MV;
-		if (!qcom_battmgr_oneplus_has_pps(
-		    battmgr, entry_derate_to_mv,
-		    BATTMGR_ONEPLUS_CP_DUAL_PPS_MA)) {
-			entry_derate_rc = -EOPNOTSUPP;
+		entry_desired_uv = entry_target_uv +
+			BATTMGR_ONEPLUS_CP_DUAL_ENTRY_HEADROOM_UV;
+		entry_delta_uv = entry_vin_uv < entry_desired_uv ?
+			entry_desired_uv - entry_vin_uv :
+			entry_vin_uv - entry_desired_uv;
+		entry_adjust_mv = DIV_ROUND_CLOSEST(entry_delta_uv,
+			BATTMGR_ONEPLUS_CP_DUAL_ENTRY_ADJUST_STEP_MV * 1000) *
+			BATTMGR_ONEPLUS_CP_DUAL_ENTRY_ADJUST_STEP_MV;
+		if (entry_vin_uv < entry_desired_uv) {
+			if (entry_derate_from_mv >
+			    BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV -
+						 entry_adjust_mv)
+				entry_derate_rc = -ERANGE;
+			else
+				entry_derate_to_mv += entry_adjust_mv;
+		} else if (entry_derate_from_mv < entry_adjust_mv) {
+			entry_derate_rc = -ERANGE;
 		} else {
-			entry_derate_rc = qcom_battmgr_oneplus_set_pps_locked(
-				battmgr, entry_derate_to_mv,
-				BATTMGR_ONEPLUS_CP_DUAL_PPS_MA);
-			if (!entry_derate_rc)
-				battmgr->oneplus_pps_source_request_mv =
-					entry_derate_to_mv;
+			entry_derate_to_mv -= entry_adjust_mv;
 		}
+	}
+	if (!entry_derate_rc &&
+	    !qcom_battmgr_oneplus_has_pps(
+		battmgr, entry_derate_to_mv,
+		BATTMGR_ONEPLUS_CP_DUAL_PPS_MA)) {
+		entry_derate_rc = -EOPNOTSUPP;
+	} else if (!entry_derate_rc) {
+		entry_derate_rc = qcom_battmgr_oneplus_set_pps_locked(
+			battmgr, entry_derate_to_mv,
+			BATTMGR_ONEPLUS_CP_DUAL_PPS_MA);
+		if (!entry_derate_rc)
+			battmgr->oneplus_pps_source_request_mv =
+				entry_derate_to_mv;
 	}
 	mutex_unlock(&battmgr->lock);
 	if (entry_derate_rc) {
@@ -2857,20 +3954,38 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 
 	if (!source_to_mv ||
 	    source_to_mv > BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV -
-			   BATTMGR_ONEPLUS_CP_DUAL_BOOST_MAX_MV) {
+			   BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEP_MV) {
 		ret = -ERANGE;
+		goto cancel_dual;
+	}
+	boost_step_limit = min_t(u32, BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS,
+		(BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV - source_to_mv) /
+			BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEP_MV);
+	mutex_lock(&battmgr->lock);
+	boost_pps_ma = qcom_battmgr_oneplus_pps_current_limit(
+		battmgr, source_to_mv,
+		BATTMGR_ONEPLUS_CP_DUAL_VENDOR_PPS_MAX_MA);
+	battmgr->oneplus_dual_boost_pps_ma = boost_pps_ma;
+	mutex_unlock(&battmgr->lock);
+	if (boost_pps_ma < BATTMGR_ONEPLUS_CP_DUAL_PPS_MA) {
+		ret = -EOPNOTSUPP;
 		goto cancel_dual;
 	}
 
 	/*
 	 * Follow the vendor third-party PPS policy shape: adjust source voltage in
 	 * 40-mV increments against aggregate CP IBUS. Keep the fast acquisition
-	 * bounded to ten samples and retain an independent 1.2-A ceiling on each
-	 * pump. If both pumps remain balanced and finish narrowly below the target
-	 * window, let the slower hold controller complete acquisition instead of
+	 * bounded to ten samples, or fewer as the 9.4-V physical ceiling approaches,
+	 * and retain an independent 1.45-A ceiling on each
+	 * pump. Select the highest advertised APDO current up to the vendor's 5-A
+	 * limit; that contract is only a source ceiling, while the voltage loop
+	 * below controls the two pumps to 2 A aggregate and leaves headroom for the
+	 * parallel buck path. If both pumps remain balanced and finish narrowly
+	 * below the target window, let the slower hold controller complete
+	 * acquisition instead of
 	 * treating the fixed ten-step boundary as an electrical failure.
 	 */
-	for (i = 0; i < BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS; i++) {
+	for (i = 0; i < boost_step_limit; i++) {
 		if (READ_ONCE(battmgr->oneplus_dual_stop_requested)) {
 			ret = -ECANCELED;
 			break;
@@ -2880,12 +3995,12 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		mutex_lock(&battmgr->lock);
 		if (!qcom_battmgr_oneplus_has_pps(
 		    battmgr, source_boost_mv,
-		    BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA))
+		    boost_pps_ma))
 			source_boost_rc = -EOPNOTSUPP;
 		else
 			source_boost_rc = qcom_battmgr_oneplus_set_pps_locked(
 				battmgr, source_boost_mv,
-				BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA);
+				boost_pps_ma);
 		mutex_unlock(&battmgr->lock);
 		if (source_boost_rc) {
 			ret = source_boost_rc;
@@ -2937,23 +4052,25 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	 * 3.75 mA above the independent 1.2-A stop.  Match both arms of the vendor
 	 * third-party current loop, but avoid using its full 40-mV target-voltage
 	 * step as an instantaneous low-current correction.  After a sustained low
-	 * indication, raise only 20 mV; lower 40 mV above the aggregate deadband.
-	 * A 1.05-A per-pump soft edge requests the downward
-	 * step before either physical worker reaches its unchanged 1.2-A hard stop.
-	 * If the coordinator nevertheless confirms 1.20--1.25 A while the pump is
+	 * indication below the low-side hysteresis, raise only 20 mV; lower 40 mV
+	 * above the aggregate deadband. The wider low side avoids repeating a
+	 * measured 1.9-to-2.3-A discontinuity at this adapter's 9-V operating point.
+	 * A 1.35-A per-pump soft edge requests the downward step before either
+	 * physical worker reaches its 1.45-A normal stop. If the coordinator
+	 * nevertheless confirms 1.45--1.65 A while the pump is
 	 * still active, issue the vendor over-current branch's immediate 100-mV
 	 * reduction.  Permit at most three consecutive reductions while every
 	 * over-current sample remains inside that narrow recovery envelope; this
 	 * matches the vendor policy's bounded multi-sample response without
-	 * weakening the physical ceiling.  The 1.25-A edge is rounded only to the
+	 * weakening the physical ceiling.  The 1.65-A edge is rounded only to the
 	 * next representable 1.875-mA ADC code; that code remains an emergency
 	 * reduction, while the following code is immediately fatal.
 	 * Vendor-current physical runs use the same quantized terminal comparison
 	 * so they do not turn one pump off before this branch can reduce the source;
 	 * the coordinator still reacts at 1.2 A, and anything outside the narrow
 	 * recovery envelope remains fatal.  The bounded run also checks each pump's
-	 * role-correct local output every 500 ms.  Primary VBAT retains the
-	 * 4.30/4.35-V cell limits.  Secondary VOUT is upstream of the measured path
+		 * role-correct local output every 500 ms.  Primary VBAT retains the
+		 * 4.40/4.45-V cell limits.  Secondary VOUT is upstream of the measured path
 	 * drop, so it uses 4.45/4.50-V limits plus an independent 150/200-mV delta
 	 * check against primary VBAT.  A soft crossing latches voltage-taper mode,
 	 * lowers PPS by 100 mV and no longer permits the normal low-current arm to
@@ -2975,8 +4092,9 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		 * The vendor third-party loop's independent voltage target uses 40-mV
 		 * steps as battery voltage rises, while its low-current branch holds.
 		 * Our constrained experiment keeps the validated current target but uses
-		 * a finer low-current step.  Retain the advertised-APDO check on every
-		 * write and the existing 9.4-V cap.
+		 * a finer low-current step. Retain the advertised-APDO check on every
+		 * write and the physical 9.4-V cap; the vendor strategy capability remains
+		 * 11 V / 5 A and is reported separately.
 		 */
 		hold_max_request_mv = BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV;
 		for (i = 0;
@@ -3050,14 +4168,14 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				mutex_lock(&battmgr->lock);
 				if (!qcom_battmgr_oneplus_has_pps(
 				    battmgr, hold_next_request_mv,
-				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA))
+				    boost_pps_ma))
 					hold_rc = -EOPNOTSUPP;
 				else
 					hold_rc =
 						qcom_battmgr_oneplus_set_pps_locked(
 							battmgr,
 							hold_next_request_mv,
-							BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA);
+							boost_pps_ma);
 				mutex_unlock(&battmgr->lock);
 				if (hold_rc) {
 					ret = hold_rc;
@@ -3210,14 +4328,14 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				mutex_lock(&battmgr->lock);
 				if (!qcom_battmgr_oneplus_has_pps(
 				    battmgr, hold_next_request_mv,
-				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA))
+				    boost_pps_ma))
 					hold_rc = -EOPNOTSUPP;
 				else
 					hold_rc =
 						qcom_battmgr_oneplus_set_pps_locked(
 							battmgr,
 							hold_next_request_mv,
-							BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA);
+							boost_pps_ma);
 				mutex_unlock(&battmgr->lock);
 				if (hold_rc) {
 					ret = hold_rc;
@@ -3245,14 +4363,14 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				mutex_lock(&battmgr->lock);
 				if (!qcom_battmgr_oneplus_has_pps(
 				    battmgr, hold_next_request_mv,
-				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA))
+				    boost_pps_ma))
 					hold_rc = -EOPNOTSUPP;
 				else
 					hold_rc =
 						qcom_battmgr_oneplus_set_pps_locked(
 							battmgr,
 							hold_next_request_mv,
-							BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA);
+							boost_pps_ma);
 				mutex_unlock(&battmgr->lock);
 				if (hold_rc) {
 					ret = hold_rc;
@@ -3287,14 +4405,14 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				mutex_lock(&battmgr->lock);
 				if (!qcom_battmgr_oneplus_has_pps(
 				    battmgr, hold_next_request_mv,
-				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA))
+				    boost_pps_ma))
 					hold_rc = -EOPNOTSUPP;
 				else
 					hold_rc =
 						qcom_battmgr_oneplus_set_pps_locked(
 							battmgr,
 							hold_next_request_mv,
-							BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA);
+							boost_pps_ma);
 				mutex_unlock(&battmgr->lock);
 				if (hold_rc) {
 					ret = hold_rc;
@@ -3308,8 +4426,7 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 			if (!hold_output_taper_active &&
 			    !hold_vnow_cv_active &&
 			    aggregate_hold_ibus_ua <
-			    BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA -
-			    BATTMGR_ONEPLUS_CP_DUAL_BOOST_DEADBAND_UA) {
+			    BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_UA) {
 				hold_low_ibus_checks++;
 				if ((!continuous &&
 				     i + 1 == BATTMGR_ONEPLUS_CP_DUAL_HOLD_SAMPLES) ||
@@ -3317,26 +4434,24 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				    BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_CONFIRM_SAMPLES)
 					goto record_hold_sample;
 				hold_low_ibus_checks = 0;
-				if (hold_active_request_mv > hold_max_request_mv -
-					BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_STEP_MV) {
-					hold_rc = -ERANGE;
-					ret = hold_rc;
+				if (hold_active_request_mv >= hold_max_request_mv)
 					goto record_hold_sample;
-				}
 
-				hold_next_request_mv = hold_active_request_mv +
-					BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_STEP_MV;
+				hold_next_request_mv = min(
+					hold_active_request_mv +
+						BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_STEP_MV,
+					hold_max_request_mv);
 				mutex_lock(&battmgr->lock);
 				if (!qcom_battmgr_oneplus_has_pps(
 				    battmgr, hold_next_request_mv,
-				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA))
+				    boost_pps_ma))
 					hold_rc = -EOPNOTSUPP;
 				else
 					hold_rc =
 						qcom_battmgr_oneplus_set_pps_locked(
 							battmgr,
 							hold_next_request_mv,
-							BATTMGR_ONEPLUS_CP_DUAL_BOOST_PPS_MA);
+							boost_pps_ma);
 				mutex_unlock(&battmgr->lock);
 				if (hold_rc) {
 					ret = hold_rc;
@@ -3615,6 +4730,7 @@ cleanup_cp:
 		primary_boost_post_ibus_ua;
 	battmgr->oneplus_dual_secondary_boost_post_ibus_ua =
 		secondary_boost_post_ibus_ua;
+	battmgr->oneplus_dual_boost_step_limit = boost_step_limit;
 	battmgr->oneplus_dual_boost_attempts = boost_attempts;
 	memcpy(battmgr->oneplus_dual_boost_request_mv, boost_request_mv,
 	       sizeof(boost_request_mv));
@@ -4249,7 +5365,8 @@ out_unlock:
 static int qcom_battmgr_oneplus_dual_auto_connected_locked(
 	struct qcom_battmgr *battmgr, bool *connected)
 {
-	struct power_supply *cp_psy;
+	struct power_supply *primary_psy;
+	struct power_supply *secondary_psy;
 	union power_supply_propval val;
 	bool cp_connected = false;
 	bool usb_online = false;
@@ -4262,19 +5379,29 @@ static int qcom_battmgr_oneplus_dual_auto_connected_locked(
 	if (!usb_ret)
 		usb_online = battmgr->usb.online;
 
-	cp_psy = power_supply_get_by_name(BATTMGR_ONEPLUS_PRIMARY_CP_NAME);
-	if (cp_psy) {
-		cp_ret = power_supply_get_property(cp_psy,
-			POWER_SUPPLY_PROP_PRESENT, &val);
-		if (!cp_ret && val.intval) {
-			cp_ret = power_supply_get_property(cp_psy,
-				POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
-			if (!cp_ret && val.intval >=
-					BATTMGR_ONEPLUS_DUAL_AUTO_VBUS_MIN_UV)
-				cp_connected = true;
-		}
-		power_supply_put(cp_psy);
+	primary_psy = power_supply_get_by_name(
+		BATTMGR_ONEPLUS_PRIMARY_CP_NAME);
+	secondary_psy = power_supply_get_by_name(
+		BATTMGR_ONEPLUS_SECONDARY_CP_NAME);
+	if (!primary_psy || !secondary_psy) {
+		if (secondary_psy)
+			power_supply_put(secondary_psy);
+		if (primary_psy)
+			power_supply_put(primary_psy);
+		return -EAGAIN;
 	}
+
+	cp_ret = power_supply_get_property(primary_psy,
+		POWER_SUPPLY_PROP_PRESENT, &val);
+	if (!cp_ret && val.intval) {
+		cp_ret = power_supply_get_property(primary_psy,
+			POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+		if (!cp_ret && val.intval >=
+				BATTMGR_ONEPLUS_DUAL_AUTO_VBUS_MIN_UV)
+			cp_connected = true;
+	}
+	power_supply_put(secondary_psy);
+	power_supply_put(primary_psy);
 
 	if (usb_ret && cp_ret)
 		return usb_ret;
@@ -4593,8 +5720,8 @@ static ssize_t qcom_battmgr_oneplus_dual_auto_store(
 		if (!battmgr->oneplus_dual_auto_enabled) {
 			battmgr->oneplus_dual_auto_enabled = true;
 			battmgr->oneplus_dual_auto_continuous = continuous;
-			battmgr->oneplus_dual_auto_armed = false;
-			battmgr->oneplus_dual_auto_connected = true;
+			battmgr->oneplus_dual_auto_armed = true;
+			battmgr->oneplus_dual_auto_connected = false;
 			battmgr->oneplus_dual_auto_cancel_requested = false;
 			battmgr->oneplus_dual_auto_full_stop = false;
 			battmgr->oneplus_dual_auto_attempts = 0;
@@ -5128,6 +6255,29 @@ static void qcom_battmgr_caihong_cache_vbat(struct qcom_battmgr *battmgr,
 	WRITE_ONCE(battmgr->oneplus_pps_vbat_cache_at, jiffies);
 }
 
+static bool qcom_battmgr_caihong_battery_property_received(
+	struct qcom_battmgr *battmgr, u32 property, u32 value)
+{
+	switch (property) {
+	case BATT_CHG_CTRL_EN:
+		battmgr->oneplus_ffc_charge_enabled = value;
+		battmgr->oneplus_ffc_charge_enabled_valid = true;
+		return true;
+	case BATTMGR_ONEPLUS_BATT_SET_FULL:
+		battmgr->oneplus_ffc_firmware_full = value;
+		battmgr->oneplus_ffc_firmware_full_valid = true;
+		return true;
+	case BATT_CHG_CTRL_LIM:
+		battmgr->oneplus_ffc_property_value = value;
+		return true;
+	case BATTMGR_ONEPLUS_BATT_RTC_SOC:
+		battmgr->oneplus_ui_soc_rtc = value;
+		return true;
+	default:
+		return false;
+	}
+}
+
 static void qcom_battmgr_caihong_pps_callback(struct qcom_battmgr *battmgr,
 					       const void *data, size_t len)
 {
@@ -5164,6 +6314,7 @@ static bool qcom_battmgr_caihong_handle_response(struct qcom_battmgr *battmgr,
 {
 	const struct qcom_battmgr_message *resp = data;
 	u32 opcode = le32_to_cpu(resp->hdr.opcode);
+	u32 notification;
 	u32 property;
 	u32 result;
 	size_t payload_len;
@@ -5171,6 +6322,43 @@ static bool qcom_battmgr_caihong_handle_response(struct qcom_battmgr *battmgr,
 	if (opcode == BATTMGR_ONEPLUS_PPS_READ_BUFFER &&
 	    battmgr->oneplus_pps_read_buffer) {
 		qcom_battmgr_caihong_pps_callback(battmgr, data, len);
+		return true;
+	}
+
+	if (opcode == BATTMGR_NOTIFICATION && battmgr->oneplus_otg_control) {
+		payload_len = len - sizeof(struct pmic_glink_hdr);
+		if (payload_len != sizeof(resp->notification))
+			return false;
+
+		notification = le32_to_cpu(resp->notification) & 0xff;
+		switch (notification) {
+		case BATTMGR_ONEPLUS_NOTIFY_OTG_ENABLE:
+			battmgr->oneplus_otg_enable_events++;
+			WRITE_ONCE(battmgr->oneplus_otg_vbus_requested, true);
+			mod_delayed_work(system_wq,
+					 &battmgr->oneplus_otg_event_work, 0);
+			break;
+		case BATTMGR_ONEPLUS_NOTIFY_OTG_DISABLE:
+			battmgr->oneplus_otg_disable_events++;
+			WRITE_ONCE(battmgr->oneplus_otg_vbus_requested, false);
+			mod_delayed_work(system_wq,
+					 &battmgr->oneplus_otg_event_work, 0);
+			break;
+		case BATTMGR_ONEPLUS_NOTIFY_TYPEC_STATE:
+			battmgr->oneplus_otg_typec_events++;
+			break;
+		case BATTMGR_ONEPLUS_NOTIFY_CID_DETECT:
+			battmgr->oneplus_otg_cid_events++;
+			break;
+		default:
+			return false;
+		}
+
+		battmgr->oneplus_otg_last_notification = notification;
+		dev_info(battmgr->dev,
+			 "Caihong charger firmware notification: %#x\n",
+			 notification);
+		power_supply_changed(battmgr->usb_psy);
 		return true;
 	}
 
@@ -5213,9 +6401,22 @@ out_complete:
 	return true;
 }
 
+static void qcom_battmgr_caihong_notifications_ready(
+	struct qcom_battmgr *battmgr)
+{
+	if (battmgr->oneplus_otg_control)
+		schedule_work(&battmgr->oneplus_otg_init_work);
+}
+
 static void qcom_battmgr_caihong_service_event(struct qcom_battmgr *battmgr,
 						bool service_up)
 {
+	if (service_up && READ_ONCE(battmgr->oneplus_ffc_policy) &&
+	    (READ_ONCE(battmgr->oneplus_ffc_boot_reconcile) ||
+	     READ_ONCE(battmgr->oneplus_ffc_requested) ||
+	     READ_ONCE(battmgr->oneplus_ffc_full)))
+		mod_delayed_work(system_long_wq, &battmgr->oneplus_ffc_work, 0);
+
 	if (READ_ONCE(battmgr->oneplus_dual_auto_enabled))
 		mod_delayed_work(system_long_wq,
 				 &battmgr->oneplus_dual_auto_watch_work, 0);
@@ -5245,7 +6446,19 @@ static int qcom_battmgr_caihong_init(struct qcom_battmgr *battmgr)
 			  qcom_battmgr_oneplus_policy_monitor_worker);
 	INIT_DELAYED_WORK(&battmgr->oneplus_policy_auto_work,
 			  qcom_battmgr_oneplus_policy_auto_worker);
+	INIT_WORK(&battmgr->oneplus_otg_init_work,
+		  qcom_battmgr_oneplus_otg_init_worker);
+	INIT_DELAYED_WORK(&battmgr->oneplus_otg_event_work,
+			  qcom_battmgr_oneplus_otg_event_worker);
+	INIT_DELAYED_WORK(&battmgr->oneplus_ui_soc_backup_work,
+			  qcom_battmgr_oneplus_ui_soc_backup_worker);
+	INIT_DELAYED_WORK(&battmgr->oneplus_ffc_work,
+			  qcom_battmgr_oneplus_ffc_worker);
 	init_completion(&battmgr->oneplus_pps_ack);
+	battmgr->oneplus_otg_typec_mode_rc = -EINPROGRESS;
+	battmgr->oneplus_otg_ap_enable_rc = -EINPROGRESS;
+	battmgr->oneplus_otg_vbus_rc = -EINPROGRESS;
+	battmgr->oneplus_power_last_rc = -EINPROGRESS;
 
 	battmgr->oneplus_pps_read_buffer =
 		device_property_read_bool(dev->parent, "oneplus,pps-read-buffer");
@@ -5270,11 +6483,35 @@ static int qcom_battmgr_caihong_init(struct qcom_battmgr *battmgr)
 	battmgr->oneplus_policy_auto_start =
 		device_property_read_bool(dev->parent, "oneplus,pps-policy-auto-start");
 	battmgr->oneplus_policy_auto_armed = battmgr->oneplus_policy_auto_start;
+	battmgr->oneplus_otg_control =
+		device_property_read_bool(dev->parent,
+					  "oneplus,otg-ap-control");
+	battmgr->oneplus_battery_current_inverted =
+		device_property_read_bool(dev->parent,
+					  "oneplus,battery-current-inverted");
+	battmgr->oneplus_report_full_at_100 =
+		device_property_read_bool(dev->parent,
+					  "oneplus,report-full-at-100");
+	battmgr->oneplus_power_now_from_vi =
+		device_property_read_bool(dev->parent,
+					  "oneplus,power-now-from-vi");
+	battmgr->oneplus_ui_soc_smoothing =
+		device_property_read_bool(dev->parent,
+					  "oneplus,ui-soc-smoothing");
+	battmgr->oneplus_ffc_policy =
+		device_property_read_bool(dev->parent, "oneplus,ffc-policy");
+	battmgr->oneplus_ffc_boot_reconcile = battmgr->oneplus_ffc_policy;
+	battmgr->oneplus_ffc_state = BATTMGR_ONEPLUS_FFC_IDLE;
+	battmgr->oneplus_ffc_last_rc = -EINPROGRESS;
+	battmgr->oneplus_ui_soc_rtc = U32_MAX;
+	battmgr->oneplus_ui_soc_rtc_rc = -EINPROGRESS;
 
-	/* The validated dual-pump policy is a plug-driven continuous service. */
-	battmgr->oneplus_dual_auto_enabled = battmgr->oneplus_pps_dual_500ms;
-	battmgr->oneplus_dual_auto_continuous = battmgr->oneplus_pps_dual_500ms;
-	battmgr->oneplus_dual_auto_armed = battmgr->oneplus_pps_dual_500ms;
+	battmgr->oneplus_dual_auto_enabled =
+		device_property_read_bool(dev->parent,
+					  "oneplus,pps-auto-start");
+	battmgr->oneplus_dual_auto_continuous =
+		battmgr->oneplus_dual_auto_enabled;
+	battmgr->oneplus_dual_auto_armed = battmgr->oneplus_dual_auto_enabled;
 	battmgr->oneplus_dual_auto_connected = false;
 	battmgr->oneplus_dual_auto_last_rc = -EINPROGRESS;
 
@@ -5362,6 +6599,13 @@ static int qcom_battmgr_caihong_register(struct qcom_battmgr *battmgr)
 	CAIHONG_ADD_GROUP(battmgr->oneplus_pps_policy_2to1_1a,
 			  &qcom_battmgr_oneplus_pps_policy_group,
 			  "OnePlus 2:1 policy");
+	CAIHONG_ADD_GROUP(battmgr->oneplus_otg_control ||
+			  battmgr->oneplus_power_now_from_vi,
+			  &qcom_battmgr_oneplus_otg_group,
+			  "OnePlus USB/power diagnostics");
+	CAIHONG_ADD_GROUP(battmgr->oneplus_ffc_policy,
+			  &qcom_battmgr_oneplus_ffc_group,
+			  "OnePlus FFC policy");
 
 #undef CAIHONG_ADD_GROUP
 
@@ -5373,6 +6617,9 @@ static int qcom_battmgr_caihong_register(struct qcom_battmgr *battmgr)
 	if (battmgr->oneplus_dual_auto_enabled)
 		queue_delayed_work(system_long_wq,
 				   &battmgr->oneplus_dual_auto_watch_work, 0);
+	if (battmgr->oneplus_ffc_policy)
+		mod_delayed_work(system_long_wq, &battmgr->oneplus_ffc_work,
+			msecs_to_jiffies(BATTMGR_ONEPLUS_POLICY_AUTO_CHECK_MS));
 
 	return 0;
 }
@@ -5381,6 +6628,13 @@ static void qcom_battmgr_caihong_remove(struct qcom_battmgr *battmgr)
 {
 	bool dual_auto_run;
 	bool cancel_cp = false;
+
+	WRITE_ONCE(battmgr->oneplus_otg_control, false);
+	cancel_work_sync(&battmgr->oneplus_otg_init_work);
+	cancel_delayed_work_sync(&battmgr->oneplus_otg_event_work);
+	cancel_delayed_work_sync(&battmgr->oneplus_ui_soc_backup_work);
+	WRITE_ONCE(battmgr->oneplus_ffc_policy, false);
+	cancel_delayed_work_sync(&battmgr->oneplus_ffc_work);
 
 	WRITE_ONCE(battmgr->oneplus_dual_auto_enabled, false);
 	cancel_delayed_work_sync(&battmgr->oneplus_dual_auto_watch_work);

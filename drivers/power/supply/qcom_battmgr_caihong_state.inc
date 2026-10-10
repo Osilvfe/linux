@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright (c) 2026 Osilvfe <osilvfe@gmail.com> */
 /*
  * Private state for the Caihong/OnePlus charger-firmware policy.
  *
@@ -111,6 +112,8 @@
 	u32 oneplus_dual_secondary_boost_pre_ibus_ua;
 	u32 oneplus_dual_primary_boost_post_ibus_ua;
 	u32 oneplus_dual_secondary_boost_post_ibus_ua;
+	u32 oneplus_dual_boost_pps_ma;
+	u32 oneplus_dual_boost_step_limit;
 	u32 oneplus_dual_boost_attempts;
 	u32 oneplus_dual_boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
 	u32 oneplus_dual_boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
@@ -222,3 +225,59 @@
 	bool oneplus_ext_pending;
 	u32 oneplus_ext_opcode;
 	u32 oneplus_ext_property;
+	struct work_struct oneplus_otg_init_work;
+	struct delayed_work oneplus_otg_event_work;
+	bool oneplus_otg_control;
+	bool oneplus_otg_initialized;
+	bool oneplus_otg_vbus_requested;
+	u32 oneplus_otg_init_attempts;
+	u32 oneplus_otg_enable_events;
+	u32 oneplus_otg_disable_events;
+	u32 oneplus_otg_typec_events;
+	u32 oneplus_otg_cid_events;
+	u32 oneplus_otg_last_notification;
+	int oneplus_otg_typec_mode_rc;
+	int oneplus_otg_ap_enable_rc;
+	int oneplus_otg_vbus_rc;
+	bool oneplus_battery_current_inverted;
+	bool oneplus_report_full_at_100;
+	bool oneplus_power_now_from_vi;
+	u32 oneplus_power_voltage_uv;
+	int oneplus_power_current_ua;
+	int oneplus_power_raw_uw;
+	int oneplus_power_derived_uw;
+	u32 oneplus_power_samples;
+	int oneplus_power_last_rc;
+	struct delayed_work oneplus_ui_soc_backup_work;
+	bool oneplus_ui_soc_smoothing;
+	bool oneplus_ui_soc_initialized;
+	u32 oneplus_ui_soc;
+	u32 oneplus_ui_soc_target;
+	u32 oneplus_ui_soc_rtc;
+	unsigned long oneplus_ui_soc_updated_at;
+	int oneplus_ui_soc_rtc_rc;
+	struct delayed_work oneplus_ffc_work;
+	bool oneplus_ffc_policy;
+	bool oneplus_ffc_boot_reconcile;
+	bool oneplus_ffc_charge_enabled;
+	bool oneplus_ffc_charge_enabled_valid;
+	bool oneplus_ffc_firmware_full;
+	bool oneplus_ffc_firmware_full_valid;
+	bool oneplus_ffc_requested;
+	bool oneplus_ffc_full;
+	bool oneplus_ffc_saved_fcc_valid;
+	enum qcom_battmgr_oneplus_ffc_state oneplus_ffc_state;
+	u32 oneplus_ffc_step;
+	u32 oneplus_ffc_fv_count;
+	u32 oneplus_ffc_fcc_count;
+	u32 oneplus_ffc_sw_full_count;
+	u32 oneplus_ffc_hw_full_count;
+	u32 oneplus_ffc_sessions;
+	u32 oneplus_ffc_samples;
+	u32 oneplus_ffc_saved_fcc_ua;
+	u32 oneplus_ffc_property_value;
+	u32 oneplus_ffc_vbat_uv;
+	u32 oneplus_ffc_raw_soc;
+	int oneplus_ffc_ibat_ua;
+	int oneplus_ffc_temp_decic;
+	int oneplus_ffc_last_rc;

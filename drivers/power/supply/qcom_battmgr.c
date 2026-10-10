@@ -10,6 +10,7 @@
 #include <linux/nvmem-consumer.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
+#include <linux/power/qcom_battmgr_caihong.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
@@ -104,7 +105,9 @@ enum qcom_battmgr_variant {
 #define CHARGE_CTRL_END_THR_MAX		100
 #define CHARGE_CTRL_DELTA_SOC		5
 
+#if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_CAIHONG)
 #include "qcom_battmgr_caihong.h"
+#endif
 
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
@@ -324,7 +327,9 @@ struct qcom_battmgr {
 
 	int error;
 	struct completion ack;
+#if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_CAIHONG)
 #include "qcom_battmgr_caihong_state.inc"
+#endif
 
 	bool service_up;
 
@@ -343,7 +348,7 @@ struct qcom_battmgr {
 	struct mutex lock;
 };
 
-#include "qcom_battmgr_caihong_policy.inc"
+#include "qcom_battmgr_caihong_hooks.inc"
 
 static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 {
@@ -462,6 +467,10 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 	unsigned int prop;
 	int ret;
 
+	ret = qcom_battmgr_caihong_update_battery_property(battmgr, psp);
+	if (ret != -EOPNOTSUPP)
+		return ret;
+
 	if (psp >= ARRAY_SIZE(sm8350_bat_prop_map))
 		return -EINVAL;
 
@@ -534,13 +543,15 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = battmgr->status.status;
+		val->intval = qcom_battmgr_oneplus_battery_status(
+			battmgr, battmgr->status.status);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
 		break;
 	case POWER_SUPPLY_PROP_HEALTH:
-		val->intval = battmgr->status.health;
+		val->intval = qcom_battmgr_oneplus_battery_health(
+			battmgr, battmgr->status.health);
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = battmgr->info.present;
@@ -564,7 +575,8 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		val->intval = battmgr->status.voltage_ocv;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		val->intval = battmgr->status.current_now;
+		val->intval = qcom_battmgr_oneplus_battery_current(
+			battmgr, battmgr->status.current_now);
 		break;
 	case POWER_SUPPLY_PROP_POWER_NOW:
 		val->intval = battmgr->status.power_now;
@@ -615,7 +627,7 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		if (battmgr->status.percent == (unsigned int)-1)
 			return -ENODATA;
-		val->intval = battmgr->status.percent;
+		val->intval = qcom_battmgr_oneplus_get_ui_soc(battmgr);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		val->intval = battmgr->status.temperature;
@@ -1085,6 +1097,10 @@ static const struct power_supply_desc sm8350_usb_psy_desc = {
 	.properties = sm8350_usb_props,
 	.num_properties = ARRAY_SIZE(sm8350_usb_props),
 	.get_property = qcom_battmgr_usb_get_property,
+#if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_CAIHONG)
+	.set_property = qcom_battmgr_usb_set_property,
+	.property_is_writeable = qcom_battmgr_usb_property_is_writeable,
+#endif
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
 		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
@@ -1487,7 +1503,11 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->info.charge_ctrl_end = le32_to_cpu(resp->intval.value);
 			break;
 		default:
-			dev_warn(battmgr->dev, "unknown property %#x\n", property);
+			if (!qcom_battmgr_caihong_battery_property_received(
+				    battmgr, property,
+				    le32_to_cpu(resp->intval.value)))
+				dev_warn(battmgr->dev,
+					 "unknown property %#x\n", property);
 			break;
 		}
 		break;
@@ -1615,6 +1635,8 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
 		return;
 	}
+
+	qcom_battmgr_caihong_notifications_ready(battmgr);
 
 	/* The supplies are registered before the remote service is up, so their
 	 * initial synthetic uevents can fail with -EAGAIN. Refresh them once the
