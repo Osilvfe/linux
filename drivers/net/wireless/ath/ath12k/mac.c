@@ -14793,10 +14793,12 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 	int ret, i, j;
 	u32 ht_cap = U32_MAX, antennas_rx = 0, antennas_tx = 0;
 	bool is_6ghz = false, is_raw_mode = false, is_monitor_disable = false;
+	u8 local_mac_addr[ETH_ALEN] = {};
 	u8 *mac_addr = NULL;
 	u8 mbssid_max_interfaces = 0;
 
 	wiphy->max_ap_assoc_sta = 0;
+	device_get_mac_address(ab->dev, local_mac_addr);
 
 	for_each_ar(ah, ar, i) {
 		u32 ht_cap_info = 0;
@@ -14805,7 +14807,10 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 		if (ar->ab->pdevs_macaddr_valid) {
 			ether_addr_copy(ar->mac_addr, pdev->mac_addr);
 		} else {
-			ether_addr_copy(ar->mac_addr, ar->ab->mac_addr);
+			if (is_zero_ether_addr(local_mac_addr))
+				ether_addr_copy(ar->mac_addr, ar->ab->mac_addr);
+			else
+				ether_addr_copy(ar->mac_addr, local_mac_addr);
 			ar->mac_addr[4] += ar->pdev_idx;
 		}
 
