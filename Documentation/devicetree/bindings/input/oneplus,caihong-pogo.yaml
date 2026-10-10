@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/oneplus,caihong-pogo.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OnePlus Caihong pogo keyboard and touchpad
+
+maintainers:
+  - Osilvfe <osilvfe@gmail.com>
+
+properties:
+  compatible:
+    const: oneplus,caihong-pogo
+
+  current-speed:
+    description: UART baud rate used by the accessory protocol.
+
+  power-gpios:
+    maxItems: 1
+
+  wake-gpios:
+    maxItems: 1
+
+  tx-enable-gpios:
+    maxItems: 1
+
+  touchpad-size-x:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  touchpad-size-y:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  touchpad-resolution-x:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  touchpad-resolution-y:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  oneplus,crc-ibm-init:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 65535
+    description: Initial value for the accessory CRC-16/IBM calculation.
+
+required:
+  - compatible
+  - current-speed
+
+additionalProperties: false
+...

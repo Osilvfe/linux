@@ -465,6 +465,18 @@ config KEYBOARD_NSPIRE
 	  To compile this driver as a module, choose M here: the
 	  module will be called nspire-keypad.
 
+config KEYBOARD_ONEPLUS_POGO
+	tristate "OnePlus Caihong pogo keyboard and touchpad"
+	depends on SERIAL_DEV_BUS
+	depends on GPIOLIB
+	depends on REGULATOR
+	help
+	  Enable support for the keyboard and multitouch trackpad in the
+	  OnePlus Pad Pro (Caihong) pogo accessory.
+
+	  This driver can be built as a module. If so, the module will be
+	  called oneplus_pogo.
+
 config KEYBOARD_TEGRA
 	tristate "NVIDIA Tegra internal matrix keyboard controller support"
 	depends on (ARCH_TEGRA && OF) || COMPILE_TEST
