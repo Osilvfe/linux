@@ -227,6 +227,30 @@ config BATTERY_QCOM_BATTMGR_CAIHONG
 
 	  Leave this disabled for other Qualcomm platforms.
 
+config CHARGER_SC8547_CAIHONG
+	tristate "Southchip SC8547 charge pump for OnePlus Caihong"
+	depends on I2C
+	depends on BATTERY_QCOM_BATTMGR_CAIHONG
+	select REGMAP_I2C
+	help
+	  Enable the paired SC8547/SC8547A charge pumps and SVOOC protocol
+	  used by the OnePlus Pad Pro (Caihong).
+
+	  This driver can be built as a module. If so, the module will be
+	  called sc8547_cp.
+
+config CHARGER_CAIHONG_PEN
+	tristate "CPS8601 pen charger for OnePlus Caihong"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on QCOM_PMIC_GLINK
+	help
+	  Enable the CPS8601 wireless pen charger on the OnePlus Pad Pro
+	  (Caihong). The driver is normally loaded on demand while a pen is
+	  attached.
+
+	  This driver can be built as a module. If so, the module will be
+	  called caihong_pen_power.
+
 config BATTERY_OLPC
 	tristate "One Laptop Per Child battery"
 	depends on OLPC_EC
