@@ -1022,6 +1022,7 @@ static int q6apm_dai_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct q6apm_dai_data *pdata;
+	struct q6apm *apm;
 	struct of_phandle_args args;
 	int rc;
 
@@ -1034,6 +1035,15 @@ static int q6apm_dai_probe(struct platform_device *pdev)
 		pdata->sid = -1;
 	else
 		pdata->sid = args.args[0] & SID_MASK_DEFAULT;
+
+	apm = dev_get_drvdata(dev->parent);
+	if (!apm)
+		return -EPROBE_DEFER;
+
+	mutex_lock(&apm->cmd_lock);
+	apm->caihong_calibration_dma_dev = dev;
+	apm->caihong_calibration_sid = pdata->sid;
+	mutex_unlock(&apm->cmd_lock);
 
 	dev_set_drvdata(dev, pdata);
 

@@ -318,6 +318,15 @@ void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels)
 		ch_map[1] =  PCM_CHANNEL_FR;
 		ch_map[2] =  PCM_CHANNEL_LS;
 		ch_map[3] =  PCM_CHANNEL_RS;
+	} else if (num_channels == 8) {
+		ch_map[0] = PCM_CHANNEL_FL;
+		ch_map[1] = PCM_CHANNEL_FR;
+		ch_map[2] = PCM_CHANNEL_FC;
+		ch_map[3] = PCM_CHANNEL_LS;
+		ch_map[4] = PCM_CHANNEL_RS;
+		ch_map[5] = PCM_CHANNEL_CS;
+		ch_map[6] = PCM_CHANNEL_LB;
+		ch_map[7] = PCM_CHANNEL_RB;
 	}
 }
 EXPORT_SYMBOL_GPL(audioreach_set_default_channel_mapping);
@@ -860,7 +869,7 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
 	uint32_t num_channels = cfg->num_channels;
 	int payload_size = APM_MFC_CFG_PSIZE(media_format, num_channels) +
 				APM_MODULE_PARAM_DATA_SIZE;
-	int i, j;
+	int i, j, rc;
 	void *p;
 
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_SET_CFG, 0);
@@ -887,7 +896,68 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
 		media_format->channel_mapping[j++] = cfg->channel_map[i];
 	}
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	if (rc || !module->mfc_stereo_to_8)
+		return rc;
+
+	if (num_channels != 8)
+		return -EINVAL;
+
+	{
+		const u16 num_input_channels = 2;
+		const u32 channel_data_count = num_channels + num_input_channels +
+					       num_channels * num_input_channels;
+		const u32 param_size = sizeof(struct param_id_chmixer_coeff) +
+			sizeof(struct chmixer_coeff_table) +
+			channel_data_count * sizeof(u16);
+		const u32 packet_size = ALIGN(APM_MODULE_PARAM_DATA_SIZE + param_size, 8);
+		struct param_id_chmixer_coeff *coeff;
+		struct chmixer_coeff_table *table;
+		u16 *input_map, *coefficients;
+		struct gpr_pkt *coeff_pkt __free(kfree) =
+			audioreach_alloc_apm_cmd_pkt(packet_size, APM_CMD_SET_CFG, 0);
+
+		if (IS_ERR(coeff_pkt))
+			return PTR_ERR(coeff_pkt);
+
+		p = (void *)coeff_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+		param_data = p;
+		param_data->module_instance_id = module->instance_id;
+		param_data->error_code = 0;
+		param_data->param_id = PARAM_ID_CHMIXER_COEFF;
+		param_data->param_size = param_size;
+
+		coeff = p + APM_MODULE_PARAM_DATA_SIZE;
+		coeff->num_coeff_tables = 1;
+		table = (void *)(coeff + 1);
+		table->num_output_channels = num_channels;
+		table->num_input_channels = num_input_channels;
+
+		for (i = 0; i < num_channels; i++)
+			table->channel_data[i] = cfg->channel_map[i];
+
+		input_map = table->channel_data + num_channels;
+		input_map[0] = PCM_CHANNEL_FL;
+		input_map[1] = PCM_CHANNEL_FR;
+
+		coefficients = input_map + num_input_channels;
+		for (i = 0; i < num_channels; i++)
+			coefficients[i * num_input_channels + (i & 1)] =
+				CHMIXER_COEFF_UNITY;
+
+		rc = q6apm_send_cmd_sync(graph->apm, coeff_pkt, 0);
+	}
+
+	if (rc)
+		dev_err(graph->dev,
+			"MFC stereo-to-8 channel mixer failed: iid %#x: %d\n",
+			module->instance_id, rc);
+	else
+		dev_dbg(graph->dev,
+			 "MFC stereo-to-8 channel mixer configured: iid %#x\n",
+			 module->instance_id);
+
+	return rc;
 }
 
 static int audioreach_set_compr_media_format(struct media_format *media_fmt_hdr,

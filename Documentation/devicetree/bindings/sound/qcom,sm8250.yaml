@@ -17,6 +17,10 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: oneplus,caihong-sndcard
+          - const: qcom,sm8650-sndcard
+          - const: qcom,sm8450-sndcard
+      - items:
           - enum:
               - lenovo,yoga-c630-sndcard
               - qcom,db845c-sndcard

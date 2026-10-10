@@ -3,6 +3,7 @@
 
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
@@ -72,6 +73,8 @@ struct qcom_snd_soc_common {
 	bool mi2s_bclk_enable;
 	bool wcd_jack;
 	int (*snd_prepare)(struct snd_pcm_substream *substream);
+	int (*tdm_hw_params)(struct snd_pcm_substream *substream,
+			      struct snd_pcm_hw_params *params);
 };
 
 struct sc8280xp_snd_data {
@@ -172,6 +175,63 @@ static int sc8280xp_tdm_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+#define CAIHONG_TDM_SLOTS	8
+#define CAIHONG_TDM_SLOT_WIDTH	32
+#define CAIHONG_TDM_RX_MASK	GENMASK(CAIHONG_TDM_SLOTS - 1, 0)
+#define CAIHONG_TDM_BCLK_RATE	(48000 * CAIHONG_TDM_SLOTS * CAIHONG_TDM_SLOT_WIDTH)
+
+static int sc8280xp_caihong_tdm_hw_params(struct snd_pcm_substream *substream,
+					 struct snd_pcm_hw_params *params)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_dai *codec_dai;
+	u32 channel;
+	int ret;
+	int i;
+
+	if (params_rate(params) != 48000 ||
+	    params_format(params) != SNDRV_PCM_FORMAT_S32_LE ||
+	    params_channels(params) != CAIHONG_TDM_SLOTS)
+		return -EINVAL;
+
+	ret = snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_BP_FP);
+	if (ret && ret != -ENOTSUPP)
+		return ret;
+
+	ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, CAIHONG_TDM_RX_MASK,
+				       CAIHONG_TDM_SLOTS, CAIHONG_TDM_SLOT_WIDTH);
+	if (ret)
+		return ret;
+
+	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+		ret = of_property_read_u32(codec_dai->component->dev->of_node,
+					   "awinic,audio-channel", &channel);
+		if (ret || channel >= CAIHONG_TDM_SLOTS)
+			return ret ?: -EINVAL;
+
+		ret = snd_soc_dai_set_fmt(codec_dai,
+					  SND_SOC_DAIFMT_DSP_B |
+					  SND_SOC_DAIFMT_IB_NF |
+					  SND_SOC_DAIFMT_BP_FP);
+		if (ret && ret != -ENOTSUPP)
+			return ret;
+
+		ret = snd_soc_dai_set_tdm_slot(codec_dai, BIT(channel),
+					       BIT(channel), CAIHONG_TDM_SLOTS,
+					       CAIHONG_TDM_SLOT_WIDTH);
+		if (ret)
+			return ret;
+	}
+
+	ret = snd_soc_dai_set_sysclk(cpu_dai, LPAIF_MI2S_BCLK,
+				     CAIHONG_TDM_BCLK_RATE, SND_SOC_CLOCK_OUT);
+	if (ret && ret != -ENOTSUPP)
+		return ret;
+
+	return 0;
+}
+
 static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
@@ -218,6 +278,7 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 				     struct snd_pcm_hw_params *params)
 {
+	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct snd_interval *rate = hw_param_interval(params,
 					SNDRV_PCM_HW_PARAM_RATE);
@@ -230,6 +291,14 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	channels->min = 2;
 	channels->max = 2;
 	switch (cpu_dai->id) {
+	case SECONDARY_TDM_RX_0:
+		if (data->priv->tdm_hw_params == sc8280xp_caihong_tdm_hw_params) {
+			snd_mask_reset(fmt, SNDRV_PCM_FORMAT_S16_LE);
+			snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
+			channels->min = CAIHONG_TDM_SLOTS;
+			channels->max = CAIHONG_TDM_SLOTS;
+		}
+		break;
 	case TX_CODEC_DMA_TX_0:
 	case TX_CODEC_DMA_TX_1:
 	case TX_CODEC_DMA_TX_2:
@@ -296,6 +365,8 @@ static int sc8280xp_snd_hw_params(struct snd_pcm_substream *substream,
 		}
 		break;
 	case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
+		if (data->priv->tdm_hw_params)
+			return data->priv->tdm_hw_params(substream, params);
 		return sc8280xp_tdm_hw_params(substream, params);
 	default:
 		break;
@@ -551,6 +622,19 @@ static const struct qcom_snd_soc_common sm8650_priv_data = {
 			 SND_SOC_DAIFMT_I2S,
 };
 
+static const struct qcom_snd_soc_common caihong_priv_data = {
+	.driver_name = "sm8650",
+	.dapm_widgets = sc8280xp_dapm_widgets,
+	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
+	.wcd_jack = true,
+	.mi2s_mclk_enable = true,
+	.mi2s_bclk_enable = true,
+	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
+			 SND_SOC_DAIFMT_NB_NF |
+			 SND_SOC_DAIFMT_I2S,
+	.tdm_hw_params = sc8280xp_caihong_tdm_hw_params,
+};
+
 static const struct qcom_snd_soc_common sm8750_priv_data = {
 	.driver_name = "sm8750",
 	.dapm_widgets = sc8280xp_dapm_widgets,
@@ -560,6 +644,7 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
 
 static const struct of_device_id snd_sc8280xp_dt_match[] = {
 	{ .compatible = "ayaneo,pocket-s2-sndcard", .data = &ayaneo_ps2_priv_data },
+	{ .compatible = "oneplus,caihong-sndcard", .data = &caihong_priv_data },
 	{ .compatible = "qcom,eliza-sndcard", .data = &eliza_priv_data },
 	{ .compatible = "qcom,hawi-sndcard", .data = &hawi_priv_data },
 	{ .compatible = "qcom,kaanapali-sndcard", .data = &kaanapali_priv_data },

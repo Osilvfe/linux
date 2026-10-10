@@ -3,12 +3,15 @@
 
 #include <dt-bindings/soc/qcom,gpr.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/sched.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/apr.h>
 #include <linux/wait.h>
@@ -29,6 +32,215 @@ struct apm_graph_mgmt_cmd {
 
 static struct q6apm *g_apm;
 
+#define CAIHONG_AW_CALIBRATION_FIRMWARE \
+		"awinic/caihong-aw88261-speaker-cal.bin"
+#define CAIHONG_AW_INBAND_SIZE_THRESHOLD	256
+#define CAIHONG_AW_OOB_BUFFER_SIZE		SZ_8K
+
+static int q6apm_map_caihong_aw_calibration(struct q6apm_graph *graph)
+{
+	struct q6apm *apm = graph->apm;
+	struct apm_shared_map_region_payload *region;
+	struct apm_cmd_shared_mem_map_regions *cmd;
+	const int payload_size = sizeof(*cmd) + sizeof(*region);
+	struct gpr_pkt *pkt __free(kfree);
+	void *p;
+	int ret;
+
+	if (apm->caihong_calibration_mem_map_handle)
+		return 0;
+
+	if (!apm->caihong_calibration_dma_dev) {
+		dev_err(graph->dev,
+			"Caihong Awinic calibration has no Audio SMMU DMA device\n");
+		return -ENODEV;
+	}
+
+	if (!apm->caihong_calibration_buf) {
+		apm->caihong_calibration_buf = dmam_alloc_coherent(
+			apm->caihong_calibration_dma_dev,
+			CAIHONG_AW_OOB_BUFFER_SIZE,
+			&apm->caihong_calibration_dma_addr, GFP_KERNEL);
+		if (!apm->caihong_calibration_buf)
+			return -ENOMEM;
+
+		apm->caihong_calibration_dsp_addr =
+			apm->caihong_calibration_dma_addr;
+		if (apm->caihong_calibration_sid >= 0)
+			apm->caihong_calibration_dsp_addr |=
+				(u64)apm->caihong_calibration_sid << 32;
+
+		dev_dbg(graph->dev,
+			 "Caihong Awinic calibration DMA: dev=%s iova=%pad dsp=%pap sid=%lld\n",
+			 dev_name(apm->caihong_calibration_dma_dev),
+			 &apm->caihong_calibration_dma_addr,
+			 &apm->caihong_calibration_dsp_addr,
+			 apm->caihong_calibration_sid);
+	}
+
+	pkt = audioreach_alloc_apm_cmd_pkt(
+		payload_size, APM_CMD_SHARED_MEM_MAP_REGIONS,
+		APM_MMAP_TOKEN_MAP_TYPE_CALIBRATION);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	p = (u8 *)pkt + GPR_HDR_SIZE;
+	cmd = p;
+	cmd->mem_pool_id = APM_MEMORY_MAP_SHMEM8_4K_POOL;
+	cmd->num_regions = 1;
+	cmd->property_flag = 0;
+
+	region = p + sizeof(*cmd);
+	region->shm_addr_lsw =
+		lower_32_bits(apm->caihong_calibration_dsp_addr);
+	region->shm_addr_msw =
+		upper_32_bits(apm->caihong_calibration_dsp_addr);
+	region->mem_size_bytes = CAIHONG_AW_OOB_BUFFER_SIZE;
+
+	ret = q6apm_send_cmd_sync(apm, pkt,
+				  APM_CMD_RSP_SHARED_MEM_MAP_REGIONS);
+	if (!ret)
+		dev_dbg(graph->dev,
+			 "Caihong Awinic calibration OOB mapped: handle %#x size %u\n",
+			 apm->caihong_calibration_mem_map_handle,
+			 CAIHONG_AW_OOB_BUFFER_SIZE);
+
+	return ret;
+}
+
+static int q6apm_send_caihong_aw_calibration_record(
+		struct q6apm_graph *graph, const void *data, size_t size)
+{
+	struct q6apm *apm = graph->apm;
+	struct apm_cmd_header *cmd_header;
+	struct gpr_pkt *pkt;
+	void *payload;
+	int ret;
+
+	if (size > CAIHONG_AW_INBAND_SIZE_THRESHOLD) {
+		if (size > CAIHONG_AW_OOB_BUFFER_SIZE)
+			return -E2BIG;
+
+		ret = q6apm_map_caihong_aw_calibration(graph);
+		if (ret)
+			return ret;
+
+		memcpy(apm->caihong_calibration_buf, data, size);
+		dma_wmb();
+
+		pkt = audioreach_alloc_apm_cmd_pkt(0, APM_CMD_SET_CFG, 0);
+		if (IS_ERR(pkt))
+			return PTR_ERR(pkt);
+
+		cmd_header = (void *)pkt + GPR_HDR_SIZE;
+		cmd_header->payload_address_lsw =
+			lower_32_bits(apm->caihong_calibration_dsp_addr);
+		cmd_header->payload_address_msw =
+			upper_32_bits(apm->caihong_calibration_dsp_addr);
+		cmd_header->mem_map_handle =
+			apm->caihong_calibration_mem_map_handle;
+		cmd_header->payload_size = size;
+
+		dev_dbg(graph->dev,
+			 "Caihong Awinic calibration OOB send: size=%zu handle=%#x dsp=%pap\n",
+			 size, apm->caihong_calibration_mem_map_handle,
+			 &apm->caihong_calibration_dsp_addr);
+		ret = q6apm_send_cmd_sync(apm, pkt, 0);
+		kfree(pkt);
+
+		return ret;
+	}
+
+	pkt = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	payload = (u8 *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	memcpy(payload, data, size);
+	ret = q6apm_send_cmd_sync(apm, pkt, 0);
+	kfree(pkt);
+
+	return ret;
+}
+
+static int q6apm_graph_load_caihong_aw_calibration(struct q6apm_graph *graph)
+{
+	const struct firmware *fw;
+	size_t offset = 0;
+	unsigned int accepted = 0;
+	unsigned int failed = 0;
+	bool locked = false;
+	int ret;
+
+	ret = request_firmware(&fw, CAIHONG_AW_CALIBRATION_FIRMWARE,
+			       graph->dev);
+	if (ret) {
+		dev_err(graph->dev, "failed to load %s: %d\n",
+			CAIHONG_AW_CALIBRATION_FIRMWARE, ret);
+		return ret;
+	}
+
+	if (fw->size > INT_MAX) {
+		ret = -EFBIG;
+		goto out_release;
+	}
+
+	mutex_lock(&graph->apm->cmd_lock);
+	locked = true;
+
+	while (offset < fw->size) {
+		const struct apm_module_param_data *param;
+		size_t record_size;
+
+		if (fw->size - offset < sizeof(*param)) {
+			ret = -EINVAL;
+			goto out_invalid;
+		}
+
+		param = (const void *)(fw->data + offset);
+		if (param->param_size > fw->size - offset - sizeof(*param)) {
+			ret = -EINVAL;
+			goto out_invalid;
+		}
+
+		record_size = ALIGN(sizeof(*param) + param->param_size, 8);
+		if (record_size > fw->size - offset || param->error_code) {
+			ret = -EINVAL;
+			goto out_invalid;
+		}
+
+		ret = q6apm_send_caihong_aw_calibration_record(
+			graph, fw->data + offset, record_size);
+		if (ret) {
+			failed++;
+			dev_err(graph->dev,
+				"Caihong Awinic calibration rejected: iid %#x param %#x size %u: %d\n",
+				param->module_instance_id, param->param_id,
+				param->param_size, ret);
+		} else {
+			accepted++;
+		}
+
+		offset += record_size;
+	}
+
+	dev_dbg(graph->dev,
+		 "Caihong Awinic speaker calibration: %u accepted, %u rejected, %zu bytes\n",
+		 accepted, failed, fw->size);
+	ret = 0;
+
+	goto out_release;
+
+out_invalid:
+	dev_err(graph->dev, "invalid Caihong Awinic calibration at %#zx\n",
+		offset);
+out_release:
+	if (locked)
+		mutex_unlock(&graph->apm->cmd_lock);
+	release_firmware(fw);
+	return ret;
+}
+
 int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
 			uint32_t rsp_opcode)
 {
@@ -42,7 +254,7 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 {
 	struct audioreach_graph_info *info;
 	struct audioreach_graph *graph;
-	int id;
+	int id, ret;
 
 	mutex_lock(&apm->lock);
 	graph = idr_find(&apm->graph_idr, graph_id);
@@ -87,7 +299,15 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 
 	kref_init(&graph->refcount);
 
-	q6apm_send_cmd_sync(apm, graph->graph, 0);
+	ret = q6apm_send_cmd_sync(apm, graph->graph, 0);
+	if (ret) {
+		mutex_lock(&apm->lock);
+		idr_remove(&apm->graph_idr, graph_id);
+		mutex_unlock(&apm->lock);
+		kfree(graph->graph);
+		kfree(graph);
+		return ERR_PTR(ret);
+	}
 
 	return graph;
 }
@@ -162,8 +382,8 @@ bool q6apm_is_adsp_ready(void)
 EXPORT_SYMBOL_GPL(q6apm_is_adsp_ready);
 
 static struct audioreach_module *__q6apm_find_module_by_mid(struct q6apm *apm,
-						    struct audioreach_graph_info *info,
-						    uint32_t mid)
+							    struct audioreach_graph_info *info,
+							    uint32_t mid)
 {
 	struct audioreach_container *container;
 	struct audioreach_sub_graph *sgs;
@@ -446,11 +666,14 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 	struct audioreach_sub_graph *sgs;
 	struct audioreach_container *container;
 	struct audioreach_module *module;
+	bool load_caihong_aw_calibration = false;
 	int ret;
 
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
 			list_for_each_entry(module, &container->modules_list, node) {
+				load_caihong_aw_calibration |=
+					module->caihong_aw_calibration;
 				if ((module->module_id == MODULE_ID_WR_SHARED_MEM_EP) ||
 					(module->module_id == MODULE_ID_RD_SHARED_MEM_EP) ||
 					(module->module_id == MODULE_ID_SH_MEM_PULL_MODE) ||
@@ -458,11 +681,28 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 					continue;
 
 				ret = audioreach_set_media_format(graph, module, cfg);
-				if (ret)
+				if (ret) {
+					dev_err(graph->dev,
+						"media format failed: mid %#x iid %#x rate %u width %u channels %u map %*ph: %d\n",
+						module->module_id, module->instance_id,
+						cfg->sample_rate, cfg->bit_width,
+						cfg->num_channels, cfg->num_channels,
+						cfg->channel_map, ret);
 					return ret;
+				}
+				if (module->module_id == MODULE_ID_MFC &&
+				    cfg->num_channels == 8)
+					dev_dbg(graph->dev,
+						 "MFC format: iid=%#x rate=%u width=%u channels=%u map=%*ph\n",
+						 module->instance_id, cfg->sample_rate,
+						 cfg->bit_width, cfg->num_channels,
+						 cfg->num_channels, cfg->channel_map);
 			}
 		}
 	}
+
+	if (load_caihong_aw_calibration)
+		return q6apm_graph_load_caihong_aw_calibration(graph);
 
 	return 0;
 
@@ -869,6 +1109,7 @@ static int apm_probe(gpr_device_t *gdev)
 	dev_set_drvdata(dev, apm);
 
 	mutex_init(&apm->lock);
+	mutex_init(&apm->cmd_lock);
 	apm->dev = dev;
 	apm->gdev = gdev;
 	init_waitqueue_head(&apm->wait);
@@ -952,16 +1193,31 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 			wake_up(&apm->wait);
 			break;
 		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
-			apm->result.opcode = hdr->opcode;
-			apm->result.status = 0;
-			rsp = data->payload;
+			apm->result.opcode = result->opcode;
+			apm->result.status = result->status;
+			graph_id = hdr->token & APM_MMAP_TOKEN_GID_MASK;
+			is_pos_buf = hdr->token &
+				APM_MMAP_TOKEN_MAP_TYPE_POS_BUF;
 
-			info = idr_find(&apm->graph_info_idr, hdr->token);
-			if (info)
-				info->mem_map_handle = 0;
-			else
-				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
-					result->opcode);
+			if (!result->status &&
+			    (hdr->token & APM_MMAP_TOKEN_MAP_TYPE_CALIBRATION)) {
+				apm->caihong_calibration_mem_map_handle = 0;
+			} else if (!result->status) {
+				info = idr_find(&apm->graph_info_idr, graph_id);
+				if (info) {
+					if (is_pos_buf)
+						info->pos_buf_mem_map_handle = 0;
+					else
+						info->mem_map_handle = 0;
+				} else {
+					dev_err(dev,
+						"No graph %#x for shared memory unmap\n",
+						graph_id);
+				}
+			} else {
+				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n",
+					result->status, result->opcode);
+			}
 
 			wake_up(&apm->wait);
 			break;
@@ -976,8 +1232,10 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		graph_id = hdr->token & APM_MMAP_TOKEN_GID_MASK;
 		is_pos_buf = hdr->token & APM_MMAP_TOKEN_MAP_TYPE_POS_BUF;
 
-		info = idr_find(&apm->graph_info_idr, graph_id);
-		if (info) {
+		if (hdr->token & APM_MMAP_TOKEN_MAP_TYPE_CALIBRATION) {
+			apm->caihong_calibration_mem_map_handle =
+				rsp->mem_map_handle;
+		} else if ((info = idr_find(&apm->graph_info_idr, graph_id))) {
 			if (is_pos_buf)
 				info->pos_buf_mem_map_handle = rsp->mem_map_handle;
 			else

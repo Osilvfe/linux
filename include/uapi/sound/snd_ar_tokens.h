@@ -222,6 +222,13 @@ enum ar_event_types {
  *						AR_AUDIO_IF_CLK_NORMAL = 0,
  *						AR_AUDIO_IF_CLK_INVERTED = 1
  *
+ * %AR_TKN_U32_MODULE_MFC_STEREO_TO_8:	Configure an MFC with a stereo-to-eight
+ *						channel mixer coefficient table
+ *
+ * %AR_TKN_U32_MODULE_CAIHONG_AW_CALIBRATION:
+ *						Load the Caihong Awinic speaker
+ *						calibration after media formats are set
+ *
  * %AR_TKN_DAI_INDEX:				dai index
  *
  */
@@ -309,6 +316,8 @@ enum ar_event_types {
 #define AR_TKN_U16_MODULE_BIT_CLK_TYPE		274
 #define AR_TKN_U8_MODULE_INV_INT_BIT_CLK	275
 #define AR_TKN_U8_MODULE_INV_EXT_BIT_CLK	276
+#define AR_TKN_U32_MODULE_MFC_STEREO_TO_8	277
+#define AR_TKN_U32_MODULE_CAIHONG_AW_CALIBRATION 278
 
 #define AR_AUDIO_IF_SYNC_SRC_EXTERNAL		0
 #define AR_AUDIO_IF_SYNC_SRC_INTERNAL		1

@@ -69,6 +69,7 @@ struct q6apm_graph;
 #define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS	0x02001001
 #define APM_MMAP_TOKEN_GID_MASK			GENMASK(15, 0)
 #define APM_MMAP_TOKEN_MAP_TYPE_POS_BUF		BIT(16)
+#define APM_MMAP_TOKEN_MAP_TYPE_CALIBRATION	BIT(17)
 #define APM_MMAP_TOKEN_MAP_TYPE_SHIFT		16
 #define APM_CMD_RSP_GET_CFG			0x02001000
 #define APM_CMD_CLOSE_ALL			0x01001013
@@ -727,15 +728,27 @@ struct param_id_sal_limiter_enable {
 	uint32_t enable_lim;
 } __packed;
 
+#define PARAM_ID_CHMIXER_COEFF			0x0800101F
 #define PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT	0x08001024
 #define PARAM_ID_EARLY_EOS_DELAY		0x0800114C
 #define EARLY_EOS_DELAY_MS			150
+#define CHMIXER_COEFF_UNITY			0x4000
 
 struct param_id_mfc_media_format {
 	uint32_t sample_rate;
 	uint16_t bit_width;
 	uint16_t num_channels;
 	uint16_t channel_mapping[];
+} __packed;
+
+struct param_id_chmixer_coeff {
+	uint32_t num_coeff_tables;
+} __packed;
+
+struct chmixer_coeff_table {
+	uint16_t num_output_channels;
+	uint16_t num_input_channels;
+	uint16_t channel_data[];
 } __packed;
 
 struct param_id_gapless_early_eos_delay_t {
@@ -963,6 +976,8 @@ struct audioreach_module {
 	u16 bit_clk_type;
 	u8 inv_int_bit_clk;
 	u8 inv_ext_bit_clk;
+	bool mfc_stereo_to_8;
+	bool caihong_aw_calibration;
 
 	/* PCM module specific */
 	uint32_t interleave_type;

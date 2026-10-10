@@ -558,6 +558,12 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
 		case AR_TKN_U32_MODULE_DST_IN_PORT_ID7:
 			dst_mod_ip_port_id[7] = le32_to_cpu(mod_elem->value);
 			break;
+		case AR_TKN_U32_MODULE_CAIHONG_AW_CALIBRATION:
+			if (!mod)
+				return ERR_PTR(-EINVAL);
+			mod->caihong_aw_calibration =
+				!!le32_to_cpu(mod_elem->value);
+			break;
 		default:
 			break;
 
@@ -648,6 +654,9 @@ static int audioreach_widget_load_enc_dec_cnv(struct snd_soc_component *componen
 			break;
 		case AR_TKN_U32_MODULE_FMT_BIT_DEPTH:
 			mod->bit_depth = le32_to_cpu(mod_elem->value);
+			break;
+		case AR_TKN_U32_MODULE_MFC_STEREO_TO_8:
+			mod->mfc_stereo_to_8 = !!le32_to_cpu(mod_elem->value);
 			break;
 		default:
 			break;
