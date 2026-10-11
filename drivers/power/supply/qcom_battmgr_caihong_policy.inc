@@ -417,9 +417,10 @@ static u32 qcom_battmgr_oneplus_get_ui_soc(struct qcom_battmgr *battmgr)
 		battmgr->status.status == POWER_SUPPLY_STATUS_CHARGING ||
 		battmgr->status.status == POWER_SUPPLY_STATUS_FULL;
 
+	/* Let a stale shutdown SOC converge even when booted on external power. */
 	if (charging && battmgr->oneplus_ui_soc < target)
 		interval = BATTMGR_ONEPLUS_UI_SOC_UP_SECONDS * HZ;
-	else if (!charging && battmgr->oneplus_ui_soc > target)
+	else if (battmgr->oneplus_ui_soc > target)
 		interval = qcom_battmgr_oneplus_soc_down_seconds(
 			battmgr->oneplus_ui_soc) * HZ;
 	else
