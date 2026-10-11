@@ -7,6 +7,8 @@
  * it here makes the device policy boundary explicit without introducing a
  * second PMIC-Glink BATTMGR owner, which would race response completion.
  */
+	/* Keep product-policy state independent of the generic request lock. */
+	struct mutex oneplus_lock;
 	struct completion oneplus_pps_ack;
 	struct qcom_battmgr_oneplus_pps_response oneplus_pps;
 	int oneplus_pps_error;
