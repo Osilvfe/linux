@@ -26,6 +26,55 @@ static const size_t qcom_camera_icp_hfi_queue_sizes[] = {
 	[QCOM_CAMERA_ICP_HFI_DBG_QUEUE] = QCOM_CAMERA_ICP_HFI_DBG_QUEUE_SIZE,
 };
 
+static size_t hfi_allocation_size(size_t payload_size)
+{
+	return ALIGN(payload_size, PAGE_SIZE) + PAGE_SIZE;
+}
+
+int qcom_camera_icp_hfi_region_init(struct qcom_camera_icp_hfi *hfi,
+				    struct qcom_camera_icp_hfi_region *region)
+{
+	size_t allocation_size;
+	size_t heap_size = QCOM_CAMERA_ICP_HFI_SECONDARY_HEAP_SIZE;
+	size_t offset = 0;
+	int id;
+
+	if (!region || !region->base ||
+	    region->size < QCOM_CAMERA_ICP_HFI_REGION_SIZE ||
+	    region->iova > U32_MAX - QCOM_CAMERA_ICP_HFI_REGION_SIZE)
+		return -EINVAL;
+
+	region->secondary_heap = region->base;
+	region->secondary_heap_iova = region->iova;
+	allocation_size = hfi_allocation_size(heap_size);
+	region->secondary_heap_size = allocation_size;
+	offset += region->secondary_heap_size;
+	region->memory.table = (struct qcom_camera_icp_hfi_table *)
+		((u8 *)region->base + offset);
+	region->memory.table_iova = region->iova + offset;
+	allocation_size = hfi_allocation_size(sizeof(*hfi->table));
+	offset += allocation_size;
+
+	for (id = 0; id < QCOM_CAMERA_ICP_HFI_QUEUE_COUNT; id++) {
+		size_t queue_size = qcom_camera_icp_hfi_queue_sizes[id];
+
+		region->memory.queue[id] = (u8 *)region->base + offset;
+		region->memory.queue_iova[id] = region->iova + offset;
+		allocation_size = hfi_allocation_size(queue_size);
+		offset += allocation_size;
+	}
+
+	region->sfr = (u8 *)region->base + offset;
+	region->sfr_iova = region->iova + offset;
+	allocation_size = hfi_allocation_size(QCOM_CAMERA_ICP_HFI_SFR_SIZE);
+	offset += allocation_size;
+	if (offset > region->size)
+		return -E2BIG;
+
+	*(__le32 *)region->sfr = cpu_to_le32(QCOM_CAMERA_ICP_HFI_SFR_SIZE);
+	return qcom_camera_icp_hfi_init(hfi, &region->memory);
+}
+
 static void hfi_copy_to_queue(__le32 *queue, u32 queue_words, u32 index,
 			      const void *source, u32 words)
 {

@@ -13,6 +13,11 @@ struct qcom_camera_icp_hfi_test_context {
 	struct qcom_camera_icp_hfi_memory memory;
 };
 
+static void qcom_camera_icp_hfi_region_free(void *data)
+{
+	kvfree(data);
+}
+
 static int qcom_camera_icp_hfi_test_init(struct kunit *test)
 {
 	struct qcom_camera_icp_hfi_test_context *context;
@@ -51,6 +56,41 @@ static void qcom_camera_icp_hfi_layout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(table->header.queue_count), 3U);
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(table->queues[0].start_addr), 0xc0302000U);
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(table->queues[2].tx_watermark), 1024U);
+}
+
+static void qcom_camera_icp_hfi_region_layout_test(struct kunit *test)
+{
+	struct qcom_camera_icp_hfi_region region = {
+		.iova = 0xc0300000,
+		.size = QCOM_CAMERA_ICP_HFI_REGION_SIZE,
+	};
+	struct qcom_camera_icp_hfi hfi;
+	int ret;
+
+	region.base = kvzalloc(region.size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, region.base);
+	ret = kunit_add_action_or_reset(test, qcom_camera_icp_hfi_region_free,
+					region.base);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	ret = qcom_camera_icp_hfi_region_init(&hfi, &region);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, region.secondary_heap, region.base);
+	KUNIT_EXPECT_EQ(test, region.secondary_heap_iova,
+			(u64)0xc0300000);
+	KUNIT_EXPECT_EQ(test, region.secondary_heap_size, (size_t)0x101000);
+	KUNIT_EXPECT_EQ(test, region.memory.table_iova, (u64)0xc0401000);
+	KUNIT_EXPECT_PTR_EQ(test, region.memory.queue[0],
+			    (void *)((u8 *)region.base + 0x103000));
+	KUNIT_EXPECT_EQ(test, region.memory.queue_iova[0],
+			(u64)0xc0403000);
+	KUNIT_EXPECT_EQ(test, region.memory.queue_iova[1],
+			(u64)0xc0406000);
+	KUNIT_EXPECT_EQ(test, region.memory.queue_iova[2],
+			(u64)0xc0409000);
+	KUNIT_EXPECT_EQ(test, region.sfr_iova, (u64)0xc0423000);
+	KUNIT_EXPECT_EQ(test, le32_to_cpup(region.sfr),
+			QCOM_CAMERA_ICP_HFI_SFR_SIZE);
 }
 
 static void qcom_camera_icp_hfi_write_wrap_test(struct kunit *test)
@@ -133,6 +173,7 @@ static void qcom_camera_icp_hfi_bad_packet_test(struct kunit *test)
 
 static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_layout_test),
+	KUNIT_CASE(qcom_camera_icp_hfi_region_layout_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_write_wrap_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_queue_full_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_read_wrap_test),

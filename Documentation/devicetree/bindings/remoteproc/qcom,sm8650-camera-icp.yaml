@@ -67,8 +67,22 @@ properties:
     maxItems: 1
 
   memory-region:
-    maxItems: 1
-    description: Reserved memory used to load the authenticated ICP firmware
+    items:
+      - description: Reserved memory used to load the authenticated firmware
+      - description: Reserved QDSS IOVA range
+      - description: Reserved device-register IOVA range
+      - description: Reserved firmware-uncached IOVA range
+      - description: Global synchronization memory
+      - description: Reserved shared buffer IOVA range
+
+  memory-region-names:
+    items:
+      - const: firmware
+      - const: qdss-iova
+      - const: device-iova
+      - const: uncached-iova
+      - const: global-sync
+      - const: shared-iova
 
   firmware-name:
     maxItems: 1
@@ -87,6 +101,7 @@ required:
   - iommus
   - power-domains
   - memory-region
+  - memory-region-names
 
 additionalProperties: false
 
@@ -115,7 +130,14 @@ examples:
                  <&apps_smmu 0x1840 0>,
                  <&apps_smmu 0x1880 0>;
         power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
-        memory-region = <&camera_mem>;
+        memory-region = <&camera_mem>, <&camera_icp_qdss_iova>,
+                        <&camera_icp_device_iova>,
+                        <&camera_icp_uncached_iova>,
+                        <&global_sync_mem>,
+                        <&camera_icp_shared_iova>;
+        memory-region-names = "firmware", "qdss-iova", "device-iova",
+                              "uncached-iova", "global-sync",
+                              "shared-iova";
         firmware-name = "qcom/sm8650/CAMERA_ICP.mbn";
         dma-coherent;
     };

@@ -1769,6 +1769,22 @@
 			no-map;
 		};
 
+		camera_icp_qdss_iova: camera-icp-qdss-iova {
+			iommu-addresses = <&camera_icp 0 0xc0000000 0 0x100000>;
+		};
+
+		camera_icp_device_iova: camera-icp-device-iova {
+			iommu-addresses = <&camera_icp 0 0xc0100000 0 0x100000>;
+		};
+
+		camera_icp_uncached_iova: camera-icp-uncached-iova {
+			iommu-addresses = <&camera_icp 0 0xc0200000 0 0x500000>;
+		};
+
+		camera_icp_shared_iova: camera-icp-shared-iova {
+			iommu-addresses = <&camera_icp 0 0xc0700000 0 0x38e00000>;
+		};
+
 		tz_stat_mem: tz-stat@82700000 {
 			reg = <0 0x82700000 0 0x100000>;
 			no-map;
@@ -5368,7 +5384,15 @@
 				 <&apps_smmu 0x1840 0>,
 				 <&apps_smmu 0x1880 0>;
 			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
-			memory-region = <&camera_mem>;
+			memory-region = <&camera_mem>,
+					<&camera_icp_qdss_iova>,
+					<&camera_icp_device_iova>,
+					<&camera_icp_uncached_iova>,
+					<&global_sync_mem>,
+					<&camera_icp_shared_iova>;
+			memory-region-names = "firmware", "qdss-iova",
+					      "device-iova", "uncached-iova",
+					      "global-sync", "shared-iova";
 			firmware-name = "qcom/sm8650/CAMERA_ICP.mbn";
 			dma-coherent;
 

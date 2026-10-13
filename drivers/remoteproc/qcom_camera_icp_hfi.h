@@ -16,6 +16,7 @@
 #define QCOM_CAMERA_ICP_HFI_DBG_QUEUE_SIZE	(100 * SZ_1K)
 #define QCOM_CAMERA_ICP_HFI_SFR_SIZE		SZ_4K
 #define QCOM_CAMERA_ICP_HFI_SECONDARY_HEAP_SIZE	SZ_1M
+#define QCOM_CAMERA_ICP_HFI_REGION_SIZE		SZ_2M
 
 enum qcom_camera_icp_hfi_queue_id {
 	QCOM_CAMERA_ICP_HFI_CMD_QUEUE,
@@ -90,6 +91,20 @@ struct qcom_camera_icp_hfi_memory {
 	dma_addr_t queue_iova[QCOM_CAMERA_ICP_HFI_QUEUE_COUNT];
 };
 
+struct qcom_camera_icp_hfi_region {
+	void *base;
+	dma_addr_t iova;
+	size_t size;
+	struct qcom_camera_icp_hfi_memory memory;
+	void *sfr;
+	dma_addr_t sfr_iova;
+	void *secondary_heap;
+	dma_addr_t secondary_heap_iova;
+	size_t secondary_heap_size;
+};
+
+int qcom_camera_icp_hfi_region_init(struct qcom_camera_icp_hfi *hfi,
+				    struct qcom_camera_icp_hfi_region *region);
 int qcom_camera_icp_hfi_init(struct qcom_camera_icp_hfi *hfi,
 			     const struct qcom_camera_icp_hfi_memory *memory);
 int qcom_camera_icp_hfi_write(struct qcom_camera_icp_hfi *hfi,
