@@ -25,6 +25,17 @@
 #define CAMERA_ICP_NUM_CLOCKS	4
 #define CAMERA_ICP_NUM_PATHS	2
 
+#define CAMERA_ICP_IRQ_MASK	0x200
+#define CAMERA_ICP_IRQ_CLEAR	0x204
+#define CAMERA_ICP_IRQ_STATUS	0x20c
+#define CAMERA_ICP_IRQ_CMD	0x210
+#define CAMERA_ICP_HOST_IRQ	BIT(2)
+#define CAMERA_ICP_WDOG_BITE	BIT(4)
+#define CAMERA_ICP_IRQ_CLEAR_CMD	BIT(1)
+
+#define CAMERA_ICP_WDOG_CTRL	0x8
+#define CAMERA_ICP_WDOG_CLEAR	0xc
+
 struct qcom_camera_icp {
 	struct device *dev;
 	struct rproc *rproc;
@@ -32,6 +43,8 @@ struct qcom_camera_icp {
 	struct icc_bulk_data paths[CAMERA_ICP_NUM_PATHS];
 	u32 pas_id;
 	int watchdog_irq;
+	void __iomem *csr;
+	void __iomem *watchdog;
 
 	void __iomem *mem_region;
 	phys_addr_t mem_phys;
@@ -52,6 +65,7 @@ static int qcom_camera_icp_load(struct rproc *rproc,
 static int qcom_camera_icp_start(struct rproc *rproc)
 {
 	struct qcom_camera_icp *icp = rproc->priv;
+	u32 status;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(icp->dev);
@@ -70,6 +84,13 @@ static int qcom_camera_icp_start(struct rproc *rproc)
 	if (ret)
 		goto clear_interconnect_votes;
 
+	status = readl(icp->csr + CAMERA_ICP_IRQ_STATUS);
+	if (status) {
+		writel(status, icp->csr + CAMERA_ICP_IRQ_CLEAR);
+		writel(CAMERA_ICP_IRQ_CLEAR_CMD, icp->csr + CAMERA_ICP_IRQ_CMD);
+	}
+
+	writel(CAMERA_ICP_WDOG_BITE, icp->csr + CAMERA_ICP_IRQ_MASK);
 	enable_irq(icp->watchdog_irq);
 
 	ret = qcom_scm_pas_auth_and_reset(icp->pas_id);
@@ -82,6 +103,7 @@ static int qcom_camera_icp_start(struct rproc *rproc)
 	return 0;
 
 disable_watchdog:
+	writel(0, icp->csr + CAMERA_ICP_IRQ_MASK);
 	disable_irq(icp->watchdog_irq);
 	clk_bulk_disable_unprepare(ARRAY_SIZE(icp->clks), icp->clks);
 clear_interconnect_votes:
@@ -96,6 +118,7 @@ static int qcom_camera_icp_stop(struct rproc *rproc)
 	struct qcom_camera_icp *icp = rproc->priv;
 	int ret;
 
+	writel(0, icp->csr + CAMERA_ICP_IRQ_MASK);
 	disable_irq(icp->watchdog_irq);
 
 	ret = qcom_scm_pas_shutdown(icp->pas_id);
@@ -136,11 +159,27 @@ static const struct rproc_ops qcom_camera_icp_ops = {
 	.load = qcom_camera_icp_load,
 };
 
-static irqreturn_t qcom_camera_icp_watchdog(int irq, void *data)
+static irqreturn_t qcom_camera_icp_irq(int irq, void *data)
 {
 	struct rproc *rproc = data;
+	struct qcom_camera_icp *icp = rproc->priv;
+	u32 status;
 
-	rproc_report_crash(rproc, RPROC_WATCHDOG);
+	status = readl(icp->csr + CAMERA_ICP_IRQ_STATUS);
+	if (!status)
+		return IRQ_NONE;
+
+	writel(status, icp->csr + CAMERA_ICP_IRQ_CLEAR);
+	writel(CAMERA_ICP_IRQ_CLEAR_CMD, icp->csr + CAMERA_ICP_IRQ_CMD);
+
+	if (status & CAMERA_ICP_WDOG_BITE) {
+		writel(0, icp->watchdog + CAMERA_ICP_WDOG_CTRL);
+		writel(1, icp->watchdog + CAMERA_ICP_WDOG_CLEAR);
+		rproc_report_crash(rproc, RPROC_WATCHDOG);
+	} else if (status & CAMERA_ICP_HOST_IRQ) {
+		dev_dbg_ratelimited(icp->dev,
+				    "received HFI interrupt before transport setup\n");
+	}
 
 	return IRQ_HANDLED;
 }
@@ -204,6 +243,16 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	icp->csr = devm_platform_ioremap_resource_byname(pdev, "csr");
+	if (IS_ERR(icp->csr))
+		return dev_err_probe(dev, PTR_ERR(icp->csr),
+				     "failed to map CSR registers\n");
+
+	icp->watchdog = devm_platform_ioremap_resource_byname(pdev, "watchdog");
+	if (IS_ERR(icp->watchdog))
+		return dev_err_probe(dev, PTR_ERR(icp->watchdog),
+				     "failed to map watchdog registers\n");
+
 	icp->clks[0].id = "icp_ahb";
 	icp->clks[1].id = "icp_src";
 	icp->clks[2].id = "icp";
@@ -229,7 +278,7 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 		return irq;
 
 	icp->watchdog_irq = irq;
-	ret = devm_request_irq(dev, irq, qcom_camera_icp_watchdog,
+	ret = devm_request_irq(dev, irq, qcom_camera_icp_irq,
 			       IRQF_NO_AUTOEN,
 			       dev_name(dev), rproc);
 	if (ret)
