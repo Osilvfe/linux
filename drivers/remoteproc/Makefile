@@ -25,6 +25,9 @@ obj-$(CONFIG_PRU_REMOTEPROC)		+= pru_rproc.o
 obj-$(CONFIG_QCOM_PIL_INFO)		+= qcom_pil_info.o
 obj-$(CONFIG_QCOM_RPROC_COMMON)		+= qcom_common.o
 obj-$(CONFIG_QCOM_CAMERA_ICP)		+= qcom_camera_icp.o
+qcom_camera_icp-y			:= qcom_camera_icp_main.o \
+					   qcom_camera_icp_hfi.o
+qcom_camera_icp-$(CONFIG_QCOM_CAMERA_ICP_KUNIT_TEST) += qcom_camera_icp_hfi_test.o
 obj-$(CONFIG_QCOM_Q6V5_COMMON)		+= qcom_q6v5.o
 obj-$(CONFIG_QCOM_Q6V5_ADSP)		+= qcom_q6v5_adsp.o
 obj-$(CONFIG_QCOM_Q6V5_MSS)		+= qcom_q6v5_mss.o

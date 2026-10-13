@@ -192,6 +192,14 @@ config QCOM_CAMERA_ICP
 	  Peripheral Authentication Service. Firmware is never started
 	  automatically; userspace must explicitly start the remoteproc.
 
+config QCOM_CAMERA_ICP_KUNIT_TEST
+	bool "KUnit tests for Qualcomm Camera ICP HFI" if !KUNIT_ALL_TESTS
+	depends on QCOM_CAMERA_ICP && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test Camera ICP HFI queue setup, wraparound, full queue handling and
+	  malformed packet recovery. This is intended for development builds.
+
 config QCOM_Q6V5_COMMON
 	tristate
 	depends on ARCH_QCOM
