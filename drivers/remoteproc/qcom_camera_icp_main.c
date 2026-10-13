@@ -27,9 +27,33 @@
 
 #define CAMERA_ICP_FIRMWARE	"qcom/sm8650/CAMERA_ICP.mbn"
 #define CAMERA_ICP_PAS_ID	33
-#define CAMERA_ICP_RATE		240000000UL
-#define CAMERA_ICP_NUM_CLOCKS	4
+#define CAMERA_ICP_RATE		400000000UL
+#define CAMERA_ICP_SLOW_AHB_RATE	80000000UL
+#define CAMERA_ICP_FAST_AHB_RATE	300000000UL
+#define CAMERA_ICP_CAMNOC_RATE	300000000UL
 #define CAMERA_ICP_NUM_PATHS	2
+
+enum qcom_camera_icp_clock {
+	CAMERA_ICP_CLK_AHB,
+	CAMERA_ICP_CLK_SRC,
+	CAMERA_ICP_CLK_CORE,
+	CAMERA_ICP_CLK_QDSS,
+	CAMERA_ICP_CLK_GCC_AHB,
+	CAMERA_ICP_CLK_GCC_AXI_HF,
+	CAMERA_ICP_CLK_GCC_AXI_SF,
+	CAMERA_ICP_CLK_SLOW_AHB_SRC,
+	CAMERA_ICP_CLK_CPAS_AHB,
+	CAMERA_ICP_CLK_CPAS_CORE_AHB,
+	CAMERA_ICP_CLK_DRV_AHB,
+	CAMERA_ICP_CLK_FAST_AHB_SRC,
+	CAMERA_ICP_CLK_CPAS_FAST_AHB,
+	CAMERA_ICP_CLK_CAMNOC_AXI_RT_SRC,
+	CAMERA_ICP_CLK_CAMNOC_AXI_RT,
+	CAMERA_ICP_CLK_CAMNOC_AXI_NRT,
+	CAMERA_ICP_CLK_DRV_XO,
+	CAMERA_ICP_CLK_PLL0,
+	CAMERA_ICP_CLK_COUNT,
+};
 
 #define CAMERA_ICP_IRQ_MASK	0x200
 #define CAMERA_ICP_IRQ_CLEAR	0x204
@@ -125,7 +149,7 @@ struct qcom_camera_icp_hfi_mem_regions {
 struct qcom_camera_icp {
 	struct device *dev;
 	struct rproc *rproc;
-	struct clk_bulk_data clks[CAMERA_ICP_NUM_CLOCKS];
+	struct clk_bulk_data clks[CAMERA_ICP_CLK_COUNT];
 	struct icc_bulk_data paths[CAMERA_ICP_NUM_PATHS];
 	u32 pas_id;
 	int watchdog_irq;
@@ -454,7 +478,22 @@ static int qcom_camera_icp_start(struct rproc *rproc)
 	if (ret)
 		goto clear_interconnect_votes;
 
-	ret = clk_set_rate(icp->clks[1].clk, CAMERA_ICP_RATE);
+	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_SRC].clk, CAMERA_ICP_RATE);
+	if (ret)
+		goto clear_interconnect_votes;
+
+	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_SLOW_AHB_SRC].clk,
+			   CAMERA_ICP_SLOW_AHB_RATE);
+	if (ret)
+		goto clear_interconnect_votes;
+
+	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_FAST_AHB_SRC].clk,
+			   CAMERA_ICP_FAST_AHB_RATE);
+	if (ret)
+		goto clear_interconnect_votes;
+
+	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_CAMNOC_AXI_RT_SRC].clk,
+			   CAMERA_ICP_CAMNOC_RATE);
 	if (ret)
 		goto clear_interconnect_votes;
 
@@ -645,10 +684,24 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(icp->watchdog),
 				     "failed to map watchdog registers\n");
 
-	icp->clks[0].id = "icp_ahb";
-	icp->clks[1].id = "icp_src";
-	icp->clks[2].id = "icp";
-	icp->clks[3].id = "qdss";
+	icp->clks[CAMERA_ICP_CLK_AHB].id = "icp_ahb";
+	icp->clks[CAMERA_ICP_CLK_SRC].id = "icp_src";
+	icp->clks[CAMERA_ICP_CLK_CORE].id = "icp";
+	icp->clks[CAMERA_ICP_CLK_QDSS].id = "qdss";
+	icp->clks[CAMERA_ICP_CLK_GCC_AHB].id = "gcc_ahb";
+	icp->clks[CAMERA_ICP_CLK_GCC_AXI_HF].id = "gcc_axi_hf";
+	icp->clks[CAMERA_ICP_CLK_GCC_AXI_SF].id = "gcc_axi_sf";
+	icp->clks[CAMERA_ICP_CLK_SLOW_AHB_SRC].id = "slow_ahb_src";
+	icp->clks[CAMERA_ICP_CLK_CPAS_AHB].id = "cpas_ahb";
+	icp->clks[CAMERA_ICP_CLK_CPAS_CORE_AHB].id = "cpas_core_ahb";
+	icp->clks[CAMERA_ICP_CLK_DRV_AHB].id = "drv_ahb";
+	icp->clks[CAMERA_ICP_CLK_FAST_AHB_SRC].id = "fast_ahb_src";
+	icp->clks[CAMERA_ICP_CLK_CPAS_FAST_AHB].id = "cpas_fast_ahb";
+	icp->clks[CAMERA_ICP_CLK_CAMNOC_AXI_RT_SRC].id = "camnoc_axi_rt_src";
+	icp->clks[CAMERA_ICP_CLK_CAMNOC_AXI_RT].id = "camnoc_axi_rt";
+	icp->clks[CAMERA_ICP_CLK_CAMNOC_AXI_NRT].id = "camnoc_axi_nrt";
+	icp->clks[CAMERA_ICP_CLK_DRV_XO].id = "drv_xo";
+	icp->clks[CAMERA_ICP_CLK_PLL0].id = "pll0";
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(icp->clks), icp->clks);
 	if (ret)
 		return dev_err_probe(dev, ret,

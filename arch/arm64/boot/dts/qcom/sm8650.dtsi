@@ -5371,8 +5371,27 @@
 			clocks = <&camcc CAM_CC_ICP_AHB_CLK>,
 				 <&camcc CAM_CC_ICP_CLK_SRC>,
 				 <&camcc CAM_CC_ICP_CLK>,
-				 <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>;
-			clock-names = "icp_ahb", "icp_src", "icp", "qdss";
+				 <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>,
+				 <&gcc GCC_CAMERA_AHB_CLK>,
+				 <&gcc GCC_CAMERA_HF_AXI_CLK>,
+				 <&gcc GCC_CAMERA_SF_AXI_CLK>,
+				 <&camcc CAM_CC_SLOW_AHB_CLK_SRC>,
+				 <&camcc CAM_CC_CPAS_AHB_CLK>,
+				 <&camcc CAM_CC_CORE_AHB_CLK>,
+				 <&camcc CAM_CC_DRV_AHB_CLK>,
+				 <&camcc CAM_CC_FAST_AHB_CLK_SRC>,
+				 <&camcc CAM_CC_CPAS_FAST_AHB_CLK>,
+				 <&camcc CAM_CC_CAMNOC_AXI_RT_CLK_SRC>,
+				 <&camcc CAM_CC_CAMNOC_AXI_RT_CLK>,
+				 <&camcc CAM_CC_CAMNOC_AXI_NRT_CLK>,
+				 <&camcc CAM_CC_DRV_XO_CLK>,
+				 <&camcc CAM_CC_PLL0>;
+			clock-names = "icp_ahb", "icp_src", "icp", "qdss",
+				      "gcc_ahb", "gcc_axi_hf", "gcc_axi_sf",
+				      "slow_ahb_src", "cpas_ahb", "cpas_core_ahb",
+				      "drv_ahb", "fast_ahb_src", "cpas_fast_ahb",
+				      "camnoc_axi_rt_src", "camnoc_axi_rt",
+				      "camnoc_axi_nrt", "drv_xo", "pll0";
 			interconnects = <&gem_noc MASTER_APPSS_PROC 0
 					 &config_noc SLAVE_CAMERA_CFG 0>,
 					<&mmss_noc MASTER_CAMNOC_ICP 0
