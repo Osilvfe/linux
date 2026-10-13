@@ -13,6 +13,7 @@ Virtualization Support
    guest-halt-polling
    ne_overview
    acrn/index
+   gunyah/index
    coco/sev-guest
    coco/tdx-guest
    hyperv/index
