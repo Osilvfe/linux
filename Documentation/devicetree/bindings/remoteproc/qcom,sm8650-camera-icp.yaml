@@ -41,6 +41,20 @@ properties:
       - description: ICP source clock
       - description: ICP core clock
       - description: Camera debug XO clock
+      - description: GCC camera AHB clock
+      - description: GCC camera high-frequency AXI clock
+      - description: GCC camera system-frequency AXI clock
+      - description: Camera slow AHB source clock
+      - description: Camera CPAS AHB clock
+      - description: Camera CPAS core AHB clock
+      - description: Camera driver AHB clock
+      - description: Camera fast AHB source clock
+      - description: Camera CPAS fast AHB clock
+      - description: Camera NoC real-time AXI source clock
+      - description: Camera NoC real-time AXI clock
+      - description: Camera NoC non-real-time AXI clock
+      - description: Camera driver XO clock
+      - description: Camera PLL0
 
   clock-names:
     items:
@@ -48,6 +62,20 @@ properties:
       - const: icp_src
       - const: icp
       - const: qdss
+      - const: gcc_ahb
+      - const: gcc_axi_hf
+      - const: gcc_axi_sf
+      - const: slow_ahb_src
+      - const: cpas_ahb
+      - const: cpas_core_ahb
+      - const: drv_ahb
+      - const: fast_ahb_src
+      - const: cpas_fast_ahb
+      - const: camnoc_axi_rt_src
+      - const: camnoc_axi_rt
+      - const: camnoc_axi_nrt
+      - const: drv_xo
+      - const: pll0
 
   interconnects:
     maxItems: 2
@@ -108,6 +136,7 @@ additionalProperties: false
 examples:
   - |
     #include <dt-bindings/clock/qcom,sm8650-camcc.h>
+    #include <dt-bindings/clock/qcom,sm8650-gcc.h>
     #include <dt-bindings/interrupt-controller/arm-gic.h>
 
     remoteproc@ac01000 {
@@ -119,8 +148,27 @@ examples:
         clocks = <&camcc CAM_CC_ICP_AHB_CLK>,
                  <&camcc CAM_CC_ICP_CLK_SRC>,
                  <&camcc CAM_CC_ICP_CLK>,
-                 <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>;
-        clock-names = "icp_ahb", "icp_src", "icp", "qdss";
+                 <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>,
+                 <&gcc GCC_CAMERA_AHB_CLK>,
+                 <&gcc GCC_CAMERA_HF_AXI_CLK>,
+                 <&gcc GCC_CAMERA_SF_AXI_CLK>,
+                 <&camcc CAM_CC_SLOW_AHB_CLK_SRC>,
+                 <&camcc CAM_CC_CPAS_AHB_CLK>,
+                 <&camcc CAM_CC_CORE_AHB_CLK>,
+                 <&camcc CAM_CC_DRV_AHB_CLK>,
+                 <&camcc CAM_CC_FAST_AHB_CLK_SRC>,
+                 <&camcc CAM_CC_CPAS_FAST_AHB_CLK>,
+                 <&camcc CAM_CC_CAMNOC_AXI_RT_CLK_SRC>,
+                 <&camcc CAM_CC_CAMNOC_AXI_RT_CLK>,
+                 <&camcc CAM_CC_CAMNOC_AXI_NRT_CLK>,
+                 <&camcc CAM_CC_DRV_XO_CLK>,
+                 <&camcc CAM_CC_PLL0>;
+        clock-names = "icp_ahb", "icp_src", "icp", "qdss",
+                      "gcc_ahb", "gcc_axi_hf", "gcc_axi_sf",
+                      "slow_ahb_src", "cpas_ahb", "cpas_core_ahb",
+                      "drv_ahb", "fast_ahb_src", "cpas_fast_ahb",
+                      "camnoc_axi_rt_src", "camnoc_axi_rt",
+                      "camnoc_axi_nrt", "drv_xo", "pll0";
         interconnects = <&gem_noc 0 0 &config_noc 0 0>,
                         <&mmss_noc 1 0 &mc_virt 1 0>;
         interconnect-names = "ahb", "memory";
