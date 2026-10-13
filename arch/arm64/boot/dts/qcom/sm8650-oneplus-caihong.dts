@@ -817,6 +817,10 @@
 	};
 };
 
+&camera_icp {
+	status = "okay";
+};
+
 /* Caihong's downstream overlay drives the rear MCLK1 pin at 4 mA. */
 &cam1_default {
 	drive-strength = <4>;
