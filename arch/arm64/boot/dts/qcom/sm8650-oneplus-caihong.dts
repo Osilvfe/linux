@@ -818,6 +818,8 @@
 };
 
 &camera_icp {
+	/* LPDDR5X values from the downstream Caihong camera configuration. */
+	qcom,ubwc-configuration = <0x7083 0x1620f 0x7083 0x1620f>;
 	status = "okay";
 };
 

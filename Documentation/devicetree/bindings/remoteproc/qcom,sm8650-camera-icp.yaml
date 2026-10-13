@@ -149,6 +149,14 @@ properties:
     maxItems: 1
     description: Name of the MDT firmware metadata file
 
+  qcom,ubwc-configuration:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: |
+      Board-specific UBWC settings in BPS fetch, BPS write, IPE fetch,
+      IPE write order. Values depend on the installed DRAM type.
+    minItems: 4
+    maxItems: 4
+
 required:
   - compatible
   - reg

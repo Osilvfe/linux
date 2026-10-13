@@ -115,6 +115,7 @@ enum qcom_camera_icp_clock {
 #define CAMERA_ICP_HFI_MSG_SYS_PING_ACK		0x00020006
 #define CAMERA_ICP_HFI_PROP_SYS_MEM_REGIONS	0x0000000e
 #define CAMERA_ICP_HFI_PROP_SYS_SUPPORTED	0x00000004
+#define CAMERA_ICP_HFI_PROP_SYS_UBWC_CONFIG_EX	0x00000009
 #define CAMERA_ICP_HFI_MAX_MSG_WORDS		128
 #define CAMERA_ICP_HFI_MAX_HW_VERSIONS		6
 #define CAMERA_ICP_HFI_PING_TOKEN		0x434149484f4e4701ULL
@@ -382,6 +383,38 @@ static int qcom_camera_icp_send_memory_regions(struct qcom_camera_icp *icp)
 	return 0;
 }
 
+static int qcom_camera_icp_configure_ubwc(struct qcom_camera_icp *icp)
+{
+	u32 config[4];
+	__le32 command[10] = {
+		cpu_to_le32(sizeof(command)),
+		cpu_to_le32(CAMERA_ICP_HFI_CMD_SYS_SET_PROPERTY),
+		cpu_to_le32(1),
+		cpu_to_le32(CAMERA_ICP_HFI_PROP_SYS_UBWC_CONFIG_EX),
+	};
+	int ret;
+
+	if (!of_property_present(icp->dev->of_node, "qcom,ubwc-configuration"))
+		return 0;
+
+	ret = of_property_read_u32_array(icp->dev->of_node,
+					 "qcom,ubwc-configuration", config,
+					 ARRAY_SIZE(config));
+	if (ret)
+		return ret;
+
+	command[4] = cpu_to_le32(config[0]);
+	command[5] = cpu_to_le32(config[1]);
+	command[6] = cpu_to_le32(config[2]);
+	command[7] = cpu_to_le32(config[3]);
+	ret = qcom_camera_icp_hfi_write(&icp->hfi, command, sizeof(command));
+	if (ret)
+		return ret;
+
+	writel(1, icp->csr + CAMERA_ICP_HFI_HOST_TO_ICP);
+	return 0;
+}
+
 static int qcom_camera_icp_ping(struct qcom_camera_icp *icp)
 {
 	struct qcom_camera_icp_hfi_ping command = {};
@@ -509,6 +542,11 @@ static int qcom_camera_icp_start_hfi(struct qcom_camera_icp *icp)
 	ret = qcom_camera_icp_send_memory_regions(icp);
 	if (ret) {
 		dev_err(icp->dev, "failed to send HFI memory regions: %d\n", ret);
+		goto disable_hfi;
+	}
+	ret = qcom_camera_icp_configure_ubwc(icp);
+	if (ret) {
+		dev_err(icp->dev, "failed to configure BPS/IPE UBWC: %d\n", ret);
 		goto disable_hfi;
 	}
 
