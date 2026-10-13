@@ -55,6 +55,18 @@ properties:
       - description: Camera NoC non-real-time AXI clock
       - description: Camera driver XO clock
       - description: Camera PLL0
+      - description: BPS AHB clock
+      - description: BPS fast AHB clock
+      - description: BPS source clock
+      - description: BPS core clock
+      - description: CPAS BPS clock
+      - description: IPE NPS AHB clock
+      - description: IPE NPS fast AHB clock
+      - description: IPE PPS fast AHB clock
+      - description: IPE NPS source clock
+      - description: IPE NPS core clock
+      - description: IPE PPS core clock
+      - description: CPAS IPE NPS clock
 
   clock-names:
     items:
@@ -76,6 +88,18 @@ properties:
       - const: camnoc_axi_nrt
       - const: drv_xo
       - const: pll0
+      - const: bps_ahb
+      - const: bps_fast_ahb
+      - const: bps_src
+      - const: bps
+      - const: cpas_bps
+      - const: ipe_nps_ahb
+      - const: ipe_nps_fast_ahb
+      - const: ipe_pps_fast_ahb
+      - const: ipe_nps_src
+      - const: ipe_nps
+      - const: ipe_pps
+      - const: cpas_ipe_nps
 
   interconnects:
     maxItems: 2
@@ -92,7 +116,16 @@ properties:
   dma-coherent: true
 
   power-domains:
-    maxItems: 1
+    items:
+      - description: Titan top GDSC
+      - description: BPS GDSC
+      - description: IPE GDSC
+
+  power-domain-names:
+    items:
+      - const: top
+      - const: bps
+      - const: ipe
 
   memory-region:
     items:
@@ -128,6 +161,7 @@ required:
   - interconnect-names
   - iommus
   - power-domains
+  - power-domain-names
   - memory-region
   - memory-region-names
 
@@ -162,13 +196,30 @@ examples:
                  <&camcc CAM_CC_CAMNOC_AXI_RT_CLK>,
                  <&camcc CAM_CC_CAMNOC_AXI_NRT_CLK>,
                  <&camcc CAM_CC_DRV_XO_CLK>,
-                 <&camcc CAM_CC_PLL0>;
+                 <&camcc CAM_CC_PLL0>,
+                 <&camcc CAM_CC_BPS_AHB_CLK>,
+                 <&camcc CAM_CC_BPS_FAST_AHB_CLK>,
+                 <&camcc CAM_CC_BPS_CLK_SRC>,
+                 <&camcc CAM_CC_BPS_CLK>,
+                 <&camcc CAM_CC_CPAS_BPS_CLK>,
+                 <&camcc CAM_CC_IPE_NPS_AHB_CLK>,
+                 <&camcc CAM_CC_IPE_NPS_FAST_AHB_CLK>,
+                 <&camcc CAM_CC_IPE_PPS_FAST_AHB_CLK>,
+                 <&camcc CAM_CC_IPE_NPS_CLK_SRC>,
+                 <&camcc CAM_CC_IPE_NPS_CLK>,
+                 <&camcc CAM_CC_IPE_PPS_CLK>,
+                 <&camcc CAM_CC_CPAS_IPE_NPS_CLK>;
         clock-names = "icp_ahb", "icp_src", "icp", "qdss",
                       "gcc_ahb", "gcc_axi_hf", "gcc_axi_sf",
                       "slow_ahb_src", "cpas_ahb", "cpas_core_ahb",
                       "drv_ahb", "fast_ahb_src", "cpas_fast_ahb",
                       "camnoc_axi_rt_src", "camnoc_axi_rt",
-                      "camnoc_axi_nrt", "drv_xo", "pll0";
+                      "camnoc_axi_nrt", "drv_xo", "pll0",
+                      "bps_ahb", "bps_fast_ahb", "bps_src",
+                      "bps", "cpas_bps", "ipe_nps_ahb",
+                      "ipe_nps_fast_ahb", "ipe_pps_fast_ahb",
+                      "ipe_nps_src", "ipe_nps", "ipe_pps",
+                      "cpas_ipe_nps";
         interconnects = <&gem_noc 0 0 &config_noc 0 0>,
                         <&mmss_noc 1 0 &mc_virt 1 0>;
         interconnect-names = "ahb", "memory";
@@ -177,7 +228,10 @@ examples:
                  <&apps_smmu 0x1800 0>,
                  <&apps_smmu 0x1840 0>,
                  <&apps_smmu 0x1880 0>;
-        power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
+        power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
+                        <&camcc CAM_CC_BPS_GDSC>,
+                        <&camcc CAM_CC_IPE_0_GDSC>;
+        power-domain-names = "top", "bps", "ipe";
         memory-region = <&camera_mem>, <&camera_icp_qdss_iova>,
                         <&camera_icp_device_iova>,
                         <&camera_icp_uncached_iova>,

@@ -41,7 +41,7 @@ int qcom_camera_icp_hfi_region_init(struct qcom_camera_icp_hfi *hfi,
 
 	if (!region || !region->base ||
 	    region->size < QCOM_CAMERA_ICP_HFI_REGION_SIZE ||
-	    region->iova > U32_MAX - QCOM_CAMERA_ICP_HFI_REGION_SIZE)
+	    region->iova > U32_MAX - (QCOM_CAMERA_ICP_HFI_REGION_SIZE - 1))
 		return -EINVAL;
 
 	region->secondary_heap = region->base;

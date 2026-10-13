@@ -7,6 +7,7 @@
 
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/dma-mapping.h>
 #include <linux/elf.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/interconnect.h>
@@ -19,6 +20,7 @@
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/remoteproc.h>
 #include <linux/soc/qcom/mdt_loader.h>
@@ -31,6 +33,8 @@
 #define CAMERA_ICP_SLOW_AHB_RATE	80000000UL
 #define CAMERA_ICP_FAST_AHB_RATE	300000000UL
 #define CAMERA_ICP_CAMNOC_RATE	300000000UL
+#define CAMERA_ICP_BPS_RATE		200000000UL
+#define CAMERA_ICP_IPE_RATE		455000000UL
 #define CAMERA_ICP_NUM_PATHS	2
 
 enum qcom_camera_icp_clock {
@@ -52,6 +56,18 @@ enum qcom_camera_icp_clock {
 	CAMERA_ICP_CLK_CAMNOC_AXI_NRT,
 	CAMERA_ICP_CLK_DRV_XO,
 	CAMERA_ICP_CLK_PLL0,
+	CAMERA_ICP_CLK_BPS_AHB,
+	CAMERA_ICP_CLK_BPS_FAST_AHB,
+	CAMERA_ICP_CLK_BPS_SRC,
+	CAMERA_ICP_CLK_BPS,
+	CAMERA_ICP_CLK_CPAS_BPS,
+	CAMERA_ICP_CLK_IPE_NPS_AHB,
+	CAMERA_ICP_CLK_IPE_NPS_FAST_AHB,
+	CAMERA_ICP_CLK_IPE_PPS_FAST_AHB,
+	CAMERA_ICP_CLK_IPE_NPS_SRC,
+	CAMERA_ICP_CLK_IPE_NPS,
+	CAMERA_ICP_CLK_IPE_PPS,
+	CAMERA_ICP_CLK_CPAS_IPE_NPS,
 	CAMERA_ICP_CLK_COUNT,
 };
 
@@ -91,11 +107,17 @@ enum qcom_camera_icp_clock {
 #define CAMERA_ICP_HFI_INIT_SUCCESS	1
 #define CAMERA_ICP_HFI_INIT_TIMEOUT_US	1500000
 #define CAMERA_ICP_HFI_SYS_INIT_TIMEOUT	msecs_to_jiffies(5000)
+#define CAMERA_ICP_HFI_PING_TIMEOUT	msecs_to_jiffies(5000)
 #define CAMERA_ICP_HFI_CMD_SYS_INIT		0x00010001
 #define CAMERA_ICP_HFI_CMD_SYS_SET_PROPERTY	0x00010003
+#define CAMERA_ICP_HFI_CMD_SYS_PING		0x00010005
 #define CAMERA_ICP_HFI_MSG_SYS_INIT_DONE		0x00020001
+#define CAMERA_ICP_HFI_MSG_SYS_PING_ACK		0x00020006
 #define CAMERA_ICP_HFI_PROP_SYS_MEM_REGIONS	0x0000000e
+#define CAMERA_ICP_HFI_PROP_SYS_SUPPORTED	0x00000004
 #define CAMERA_ICP_HFI_MAX_MSG_WORDS		128
+#define CAMERA_ICP_HFI_MAX_HW_VERSIONS		6
+#define CAMERA_ICP_HFI_PING_TOKEN		0x434149484f4e4701ULL
 
 #define CAMERA_ICP_HFI_MEM_REGION_GLOBAL_SYNC	0
 #define CAMERA_ICP_HFI_MEM_REGION_SYNX_MUTEX	1
@@ -114,9 +136,6 @@ enum qcom_camera_icp_clock {
 #define CAMERA_ICP_IPC_MUTEX_PHYS	0x01f4b000
 #define CAMERA_ICP_GLOBAL_COUNTER_PHYS	0x0c220000
 #define CAMERA_ICP_GLOBAL_SYNC_IOVA	0xc0200000
-#define CAMERA_ICP_UNCACHED_IOVA		0xc0300000
-#define CAMERA_ICP_UNCACHED_SIZE		(4 * SZ_1M)
-#define CAMERA_ICP_HFI_IOVA		0xc0300000
 #define CAMERA_ICP_SHARED_IOVA		0xc0700000
 #define CAMERA_ICP_SHARED_SIZE		0x38e00000
 #define CAMERA_ICP_IO_IOVA		0xf9500000
@@ -146,11 +165,19 @@ struct qcom_camera_icp_hfi_mem_regions {
 		region[CAMERA_ICP_HFI_MEM_REGION_COUNT];
 } __packed;
 
+struct qcom_camera_icp_hfi_ping {
+	__le32 size;
+	__le32 packet_type;
+	__le32 user_data_low;
+	__le32 user_data_high;
+} __packed;
+
 struct qcom_camera_icp {
 	struct device *dev;
 	struct rproc *rproc;
 	struct clk_bulk_data clks[CAMERA_ICP_CLK_COUNT];
 	struct icc_bulk_data paths[CAMERA_ICP_NUM_PATHS];
+	struct dev_pm_domain_list *pds;
 	u32 pas_id;
 	int watchdog_irq;
 	void __iomem *csr;
@@ -161,8 +188,10 @@ struct qcom_camera_icp {
 	struct qcom_camera_icp_mapping mappings[CAMERA_ICP_MAX_MAPPINGS];
 	unsigned int mapping_count;
 	struct completion hfi_sys_init_done;
+	struct completion hfi_ping_done;
 	__le32 hfi_msg[CAMERA_ICP_HFI_MAX_MSG_WORDS];
 	u32 hfi_sys_init_error;
+	u64 hfi_ping_token;
 	bool hfi_ready;
 
 	void __iomem *mem_region;
@@ -203,7 +232,8 @@ static void qcom_camera_icp_unprepare_hfi(struct qcom_camera_icp *icp)
 	}
 
 	if (icp->hfi_region.base) {
-		free_pages_exact(icp->hfi_region.base, icp->hfi_region.size);
+		dma_free_coherent(icp->dev, icp->hfi_region.size,
+				  icp->hfi_region.base, icp->hfi_region.iova);
 		memset(&icp->hfi_region, 0, sizeof(icp->hfi_region));
 	}
 	memset(&icp->hfi, 0, sizeof(icp->hfi));
@@ -212,11 +242,8 @@ static void qcom_camera_icp_unprepare_hfi(struct qcom_camera_icp *icp)
 static int qcom_camera_icp_prepare_hfi(struct qcom_camera_icp *icp)
 {
 	struct resource global_sync;
-	phys_addr_t hfi_phys;
 	size_t hfi_size = QCOM_CAMERA_ICP_HFI_REGION_SIZE;
-	gfp_t gfp = GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN;
 	int rw_prot = IOMMU_READ | IOMMU_WRITE;
-	int cache_prot = rw_prot | IOMMU_CACHE;
 	int device_prot = rw_prot | IOMMU_MMIO;
 	int ret;
 
@@ -231,12 +258,18 @@ static int qcom_camera_icp_prepare_hfi(struct qcom_camera_icp *icp)
 		return dev_err_probe(icp->dev, ret,
 				     "failed to resolve global sync memory\n");
 
-	icp->hfi_region.base = alloc_pages_exact(hfi_size, gfp);
+	icp->hfi_region.base = dma_alloc_coherent(icp->dev, hfi_size,
+						  &icp->hfi_region.iova,
+						  GFP_KERNEL | GFP_DMA32);
 	if (!icp->hfi_region.base)
 		return -ENOMEM;
-	icp->hfi_region.iova = CAMERA_ICP_HFI_IOVA;
 	icp->hfi_region.size = QCOM_CAMERA_ICP_HFI_REGION_SIZE;
-	hfi_phys = virt_to_phys(icp->hfi_region.base);
+	if (icp->hfi_region.iova > U32_MAX - (hfi_size - 1)) {
+		dev_err(icp->dev, "HFI DMA address %pad exceeds 32-bit range\n",
+			&icp->hfi_region.iova);
+		ret = -ERANGE;
+		goto unprepare;
+	}
 
 	ret = qcom_camera_icp_map(icp, CAMERA_ICP_QDSS_IOVA,
 				  CAMERA_ICP_QDSS_PHYS, CAMERA_ICP_QDSS_SIZE,
@@ -263,11 +296,6 @@ static int qcom_camera_icp_prepare_hfi(struct qcom_camera_icp *icp)
 				  rw_prot);
 	if (ret)
 		goto unprepare;
-	ret = qcom_camera_icp_map(icp, CAMERA_ICP_HFI_IOVA, hfi_phys,
-				  QCOM_CAMERA_ICP_HFI_REGION_SIZE, cache_prot);
-	if (ret)
-		goto unprepare;
-
 	ret = qcom_camera_icp_hfi_region_init(&icp->hfi, &icp->hfi_region);
 	if (ret)
 		goto unprepare;
@@ -298,8 +326,8 @@ static void qcom_camera_icp_write_hfi_regions(struct qcom_camera_icp *icp)
 	writel(CAMERA_ICP_IO_SIZE, hfi + CAMERA_ICP_HFI_IO_SIZE);
 	writel(0, hfi + CAMERA_ICP_HFI_IO2_PTR);
 	writel(0, hfi + CAMERA_ICP_HFI_IO2_SIZE);
-	writel(CAMERA_ICP_UNCACHED_IOVA, hfi + CAMERA_ICP_HFI_UNCACHED_PTR);
-	writel(CAMERA_ICP_UNCACHED_SIZE, hfi + CAMERA_ICP_HFI_UNCACHED_SIZE);
+	writel(icp->hfi_region.iova, hfi + CAMERA_ICP_HFI_UNCACHED_PTR);
+	writel(icp->hfi_region.size, hfi + CAMERA_ICP_HFI_UNCACHED_SIZE);
 	writel(CAMERA_ICP_DEVICE_IOVA, hfi + CAMERA_ICP_HFI_DEVICE_PTR);
 	writel(CAMERA_ICP_DEVICE_SIZE, hfi + CAMERA_ICP_HFI_DEVICE_SIZE);
 }
@@ -318,7 +346,6 @@ static void qcom_camera_icp_set_hfi_mem_region(struct qcom_camera_icp_hfi_mem_re
 static int qcom_camera_icp_send_memory_regions(struct qcom_camera_icp *icp)
 {
 	struct qcom_camera_icp_hfi_mem_regions command = {};
-	void __iomem *hfi = icp->csr + CAMERA_ICP_HFI_INTERFACE;
 	int ret;
 
 	command.size = cpu_to_le32(sizeof(command));
@@ -351,7 +378,84 @@ static int qcom_camera_icp_send_memory_regions(struct qcom_camera_icp *icp)
 	if (ret)
 		return ret;
 
-	writel(1, hfi + CAMERA_ICP_HFI_HOST_TO_ICP);
+	writel(1, icp->csr + CAMERA_ICP_HFI_HOST_TO_ICP);
+	return 0;
+}
+
+static int qcom_camera_icp_ping(struct qcom_camera_icp *icp)
+{
+	struct qcom_camera_icp_hfi_ping command = {};
+	int ret;
+
+	command.size = cpu_to_le32(sizeof(command));
+	command.packet_type = cpu_to_le32(CAMERA_ICP_HFI_CMD_SYS_PING);
+	command.user_data_low = cpu_to_le32(lower_32_bits(CAMERA_ICP_HFI_PING_TOKEN));
+	command.user_data_high = cpu_to_le32(upper_32_bits(CAMERA_ICP_HFI_PING_TOKEN));
+
+	reinit_completion(&icp->hfi_ping_done);
+	WRITE_ONCE(icp->hfi_ping_token, CAMERA_ICP_HFI_PING_TOKEN);
+	ret = qcom_camera_icp_hfi_write(&icp->hfi, &command, sizeof(command));
+	if (ret)
+		return ret;
+
+	writel(1, icp->csr + CAMERA_ICP_HFI_HOST_TO_ICP);
+	if (!wait_for_completion_timeout(&icp->hfi_ping_done,
+					 CAMERA_ICP_HFI_PING_TIMEOUT)) {
+		struct qcom_camera_icp_hfi_queue_header *cmd_header;
+		struct qcom_camera_icp_hfi_queue_header *msg_header;
+		struct qcom_camera_icp_hfi_queue_header *dbg_header;
+		__le32 debug_packet[CAMERA_ICP_HFI_MAX_MSG_WORDS];
+		size_t debug_size;
+		const char *sfr;
+		size_t sfr_len;
+		int debug_ret;
+		int debug_count;
+
+		cmd_header = icp->hfi.queues[QCOM_CAMERA_ICP_HFI_CMD_QUEUE].header;
+		msg_header = icp->hfi.queues[QCOM_CAMERA_ICP_HFI_MSG_QUEUE].header;
+		dbg_header = icp->hfi.queues[QCOM_CAMERA_ICP_HFI_DBG_QUEUE].header;
+		dev_err(icp->dev,
+			"HFI ping timeout: cmd %u/%u msg %u/%u irq %#x\n",
+			le32_to_cpu(READ_ONCE(cmd_header->read_index)),
+			le32_to_cpu(READ_ONCE(cmd_header->write_index)),
+			le32_to_cpu(READ_ONCE(msg_header->read_index)),
+			le32_to_cpu(READ_ONCE(msg_header->write_index)),
+			readl(icp->csr + CAMERA_ICP_IRQ_STATUS));
+		dev_err(icp->dev,
+			"HFI queues: cmd rx_req %u tx_req %u rx_irq %u tx_irq %u drop %u; debug %u/%u drop %u\n",
+			le32_to_cpu(READ_ONCE(cmd_header->rx_request)),
+			le32_to_cpu(READ_ONCE(cmd_header->tx_request)),
+			le32_to_cpu(READ_ONCE(cmd_header->rx_irq_status)),
+			le32_to_cpu(READ_ONCE(cmd_header->tx_irq_status)),
+			le32_to_cpu(READ_ONCE(cmd_header->packet_drop_count)),
+			le32_to_cpu(READ_ONCE(dbg_header->read_index)),
+			le32_to_cpu(READ_ONCE(dbg_header->write_index)),
+			le32_to_cpu(READ_ONCE(dbg_header->packet_drop_count)));
+		sfr = (const char *)icp->hfi_region.sfr + sizeof(u32);
+		sfr_len = strnlen(sfr, QCOM_CAMERA_ICP_HFI_SFR_SIZE - sizeof(u32));
+		if (sfr_len)
+			dev_err(icp->dev, "Camera ICP SFR: %.*s\n",
+				(int)min(sfr_len, (size_t)256), sfr);
+		for (debug_count = 0; debug_count < 16; debug_count++) {
+			debug_ret = qcom_camera_icp_hfi_read(&icp->hfi,
+					QCOM_CAMERA_ICP_HFI_DBG_QUEUE,
+					debug_packet, sizeof(debug_packet),
+					&debug_size);
+			if (debug_ret)
+				break;
+			if (debug_size >= 6 * sizeof(u32))
+				dev_err(icp->dev, "Camera ICP debug: type %#x: %.*s\n",
+					le32_to_cpu(debug_packet[1]),
+					(int)min(debug_size - 6 * sizeof(u32),
+						 (size_t)256),
+					(const char *)&debug_packet[6]);
+		}
+		if (debug_ret && debug_ret != -ENODATA)
+			dev_err(icp->dev, "failed to drain HFI debug queue: %d\n",
+				debug_ret);
+		return -ETIMEDOUT;
+	}
+
 	return 0;
 }
 
@@ -408,6 +512,13 @@ static int qcom_camera_icp_start_hfi(struct qcom_camera_icp *icp)
 		goto disable_hfi;
 	}
 
+	ret = qcom_camera_icp_ping(icp);
+	if (ret) {
+		dev_err(icp->dev, "HFI ping failed: %d\n", ret);
+		goto disable_hfi;
+	}
+	dev_info(icp->dev, "Camera ICP HFI ping succeeded\n");
+
 	return 0;
 
 disable_hfi:
@@ -443,9 +554,42 @@ static void qcom_camera_icp_handle_hfi_irq(struct qcom_camera_icp *icp)
 
 		packet_type = le32_to_cpu(icp->hfi_msg[1]);
 		if (packet_type == CAMERA_ICP_HFI_MSG_SYS_INIT_DONE) {
+			u32 num_properties = packet_size >= 4 * sizeof(u32) ?
+				le32_to_cpu(icp->hfi_msg[3]) : 0;
+
 			icp->hfi_sys_init_error = packet_size >= 3 * sizeof(u32) ?
 				le32_to_cpu(icp->hfi_msg[2]) : U32_MAX;
+			if (!icp->hfi_sys_init_error && num_properties &&
+			    packet_size >= 8 * sizeof(u32) &&
+			    le32_to_cpu(icp->hfi_msg[4]) ==
+				    CAMERA_ICP_HFI_PROP_SYS_SUPPORTED) {
+				u32 num_hw = min(le32_to_cpu(icp->hfi_msg[7]),
+						 CAMERA_ICP_HFI_MAX_HW_VERSIONS);
+
+				if (packet_size >= (8 + num_hw) * sizeof(u32))
+					dev_info(icp->dev,
+						 "Camera ICP HFI API %#x device %#x, %u hardware blocks\n",
+						 le32_to_cpu(icp->hfi_msg[5]),
+						 le32_to_cpu(icp->hfi_msg[6]), num_hw);
+			}
 			complete(&icp->hfi_sys_init_done);
+		} else if (packet_type == CAMERA_ICP_HFI_MSG_SYS_PING_ACK) {
+			u64 token;
+
+			if (packet_size < sizeof(struct qcom_camera_icp_hfi_ping)) {
+				dev_warn(icp->dev, "short HFI ping response: %zu bytes\n",
+					 packet_size);
+				continue;
+			}
+			token = le32_to_cpu(icp->hfi_msg[2]);
+			token |= (u64)le32_to_cpu(icp->hfi_msg[3]) << 32;
+			if (token != READ_ONCE(icp->hfi_ping_token)) {
+				dev_warn(icp->dev,
+					 "unexpected HFI ping token: %#llx\n",
+					 (unsigned long long)token);
+				continue;
+			}
+			complete(&icp->hfi_ping_done);
 		} else {
 			dev_dbg_ratelimited(icp->dev,
 					    "received HFI message %#x (%zu bytes)\n",
@@ -494,6 +638,16 @@ static int qcom_camera_icp_start(struct rproc *rproc)
 
 	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_CAMNOC_AXI_RT_SRC].clk,
 			   CAMERA_ICP_CAMNOC_RATE);
+	if (ret)
+		goto clear_interconnect_votes;
+
+	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_BPS_SRC].clk,
+			   CAMERA_ICP_BPS_RATE);
+	if (ret)
+		goto clear_interconnect_votes;
+
+	ret = clk_set_rate(icp->clks[CAMERA_ICP_CLK_IPE_NPS_SRC].clk,
+			   CAMERA_ICP_IPE_RATE);
 	if (ret)
 		goto clear_interconnect_votes;
 
@@ -638,6 +792,11 @@ static int qcom_camera_icp_alloc_memory(struct qcom_camera_icp *icp)
 static int qcom_camera_icp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	static const char * const pd_names[] = { "top", "bps", "ipe" };
+	const struct dev_pm_domain_attach_data pd_data = {
+		.pd_names = pd_names,
+		.num_pd_names = ARRAY_SIZE(pd_names),
+	};
 	struct qcom_camera_icp *icp;
 	const char *firmware_name = CAMERA_ICP_FIRMWARE;
 	struct rproc *rproc;
@@ -651,6 +810,11 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EOPNOTSUPP,
 				     "PAS %u is not supported\n",
 				     CAMERA_ICP_PAS_ID);
+
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to set 32-bit DMA mask\n");
 
 	of_property_read_string(dev->of_node, "firmware-name", &firmware_name);
 
@@ -668,6 +832,7 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	icp->rproc = rproc;
 	icp->pas_id = CAMERA_ICP_PAS_ID;
 	init_completion(&icp->hfi_sys_init_done);
+	init_completion(&icp->hfi_ping_done);
 	platform_set_drvdata(pdev, icp);
 
 	ret = qcom_camera_icp_alloc_memory(icp);
@@ -702,6 +867,18 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	icp->clks[CAMERA_ICP_CLK_CAMNOC_AXI_NRT].id = "camnoc_axi_nrt";
 	icp->clks[CAMERA_ICP_CLK_DRV_XO].id = "drv_xo";
 	icp->clks[CAMERA_ICP_CLK_PLL0].id = "pll0";
+	icp->clks[CAMERA_ICP_CLK_BPS_AHB].id = "bps_ahb";
+	icp->clks[CAMERA_ICP_CLK_BPS_FAST_AHB].id = "bps_fast_ahb";
+	icp->clks[CAMERA_ICP_CLK_BPS_SRC].id = "bps_src";
+	icp->clks[CAMERA_ICP_CLK_BPS].id = "bps";
+	icp->clks[CAMERA_ICP_CLK_CPAS_BPS].id = "cpas_bps";
+	icp->clks[CAMERA_ICP_CLK_IPE_NPS_AHB].id = "ipe_nps_ahb";
+	icp->clks[CAMERA_ICP_CLK_IPE_NPS_FAST_AHB].id = "ipe_nps_fast_ahb";
+	icp->clks[CAMERA_ICP_CLK_IPE_PPS_FAST_AHB].id = "ipe_pps_fast_ahb";
+	icp->clks[CAMERA_ICP_CLK_IPE_NPS_SRC].id = "ipe_nps_src";
+	icp->clks[CAMERA_ICP_CLK_IPE_NPS].id = "ipe_nps";
+	icp->clks[CAMERA_ICP_CLK_IPE_PPS].id = "ipe_pps";
+	icp->clks[CAMERA_ICP_CLK_CPAS_IPE_NPS].id = "cpas_ipe_nps";
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(icp->clks), icp->clks);
 	if (ret)
 		return dev_err_probe(dev, ret,
@@ -717,6 +894,11 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to get interconnect paths\n");
+
+	ret = devm_pm_domain_attach_list(dev, &pd_data, &icp->pds);
+	if (ret < 0)
+		return dev_err_probe(dev, ret,
+				     "failed to attach camera power domains\n");
 
 	irq = platform_get_irq_byname(pdev, "watchdog");
 	if (irq < 0)
