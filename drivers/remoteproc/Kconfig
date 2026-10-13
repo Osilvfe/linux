@@ -179,6 +179,19 @@ config QCOM_RPROC_COMMON
 	tristate
 	select AUXILIARY_BUS
 
+config QCOM_CAMERA_ICP
+	tristate "Qualcomm Camera Image Control Processor support"
+	depends on OF && ARCH_QCOM
+	depends on INTERCONNECT
+	select QCOM_MDT_LOADER
+	select QCOM_SCM
+	help
+	  Say y or m here to enable the remoteproc loader for the Camera
+	  Image Control Processor found on recent Qualcomm platforms. The
+	  processor is authenticated and started through the Qualcomm
+	  Peripheral Authentication Service. Firmware is never started
+	  automatically; userspace must explicitly start the remoteproc.
+
 config QCOM_Q6V5_COMMON
 	tristate
 	depends on ARCH_QCOM

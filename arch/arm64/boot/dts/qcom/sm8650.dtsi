@@ -5343,6 +5343,38 @@
 			#power-domain-cells = <1>;
 		};
 
+		camera_icp: remoteproc@ac01000 {
+			compatible = "qcom,sm8650-camera-icp";
+			reg = <0 0x0ac01000 0 0x1000>,
+			      <0 0x0ac04000 0 0x1000>;
+			reg-names = "csr", "watchdog";
+
+			interrupts = <GIC_SPI 463 IRQ_TYPE_EDGE_RISING 0>;
+			interrupt-names = "watchdog";
+
+			clocks = <&camcc CAM_CC_ICP_AHB_CLK>,
+				 <&camcc CAM_CC_ICP_CLK_SRC>,
+				 <&camcc CAM_CC_ICP_CLK>,
+				 <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>;
+			clock-names = "icp_ahb", "icp_src", "icp", "qdss";
+			interconnects = <&gem_noc MASTER_APPSS_PROC 0
+					 &config_noc SLAVE_CAMERA_CFG 0>,
+					<&mmss_noc MASTER_CAMNOC_ICP 0
+					 &mc_virt SLAVE_EBI1 0>;
+			interconnect-names = "ahb", "memory";
+			iommus = <&apps_smmu 0x1820 0>,
+				 <&apps_smmu 0x18c0 0>,
+				 <&apps_smmu 0x1800 0>,
+				 <&apps_smmu 0x1840 0>,
+				 <&apps_smmu 0x1880 0>;
+			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
+			memory-region = <&camera_mem>;
+			firmware-name = "qcom/sm8650/CAMERA_ICP.mbn";
+			dma-coherent;
+
+			status = "disabled";
+		};
+
 		cci0: cci@ac15000 {
 			compatible = "qcom,sm8650-cci", "qcom,msm8996-cci";
 			reg = <0 0x0ac15000 0 0x1000>;
