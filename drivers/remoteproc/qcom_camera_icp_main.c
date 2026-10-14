@@ -26,6 +26,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/remoteproc.h>
+#include <linux/remoteproc/qcom_camera_icp.h>
 #include <linux/soc/qcom/mdt_loader.h>
 
 #include "qcom_camera_icp_hfi.h"
@@ -251,6 +252,7 @@ struct qcom_camera_icp {
 	struct device *dev;
 	struct rproc *rproc;
 	struct auxiliary_device *bps_auxdev;
+	struct qcom_camera_icp_bps bps;
 	struct clk_bulk_data clks[CAMERA_ICP_CLK_COUNT];
 	struct icc_bulk_data paths[CAMERA_ICP_NUM_PATHS];
 	struct dev_pm_domain_list *pds;
@@ -995,6 +997,85 @@ qcom_camera_icp_bps_session_close(struct qcom_camera_icp_bps_session *session)
 
 	return qcom_camera_icp_bps_session_destroy(session);
 }
+
+static int qcom_camera_icp_bps_power_on(struct qcom_camera_icp_bps *bps)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+	int ret;
+
+	ret = rproc_boot(icp->rproc);
+	if (ret)
+		return ret;
+	if (!READ_ONCE(icp->hfi_ready)) {
+		rproc_shutdown(icp->rproc);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static void qcom_camera_icp_bps_power_off(struct qcom_camera_icp_bps *bps)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+
+	rproc_shutdown(icp->rproc);
+}
+
+static struct qcom_camera_icp_bps_session *
+qcom_camera_icp_bps_client_session_open(struct qcom_camera_icp_bps *bps)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+	struct qcom_camera_icp_bps_session *session;
+	int ret;
+
+	if (!READ_ONCE(icp->hfi_ready))
+		return ERR_PTR(-EHOSTDOWN);
+	session = kzalloc_obj(*session);
+	if (!session)
+		return ERR_PTR(-ENOMEM);
+	ret = qcom_camera_icp_bps_session_open(icp, session);
+	if (ret) {
+		kfree(session);
+		return ERR_PTR(ret);
+	}
+
+	return session;
+}
+
+static int qcom_camera_icp_bps_client_session_close(
+	struct qcom_camera_icp_bps_session *session)
+{
+	int ret;
+
+	ret = qcom_camera_icp_bps_session_close(session);
+	if (!ret)
+		kfree(session);
+
+	return ret;
+}
+
+static int qcom_camera_icp_bps_client_session_map(
+	struct qcom_camera_icp_bps_session *session, dma_addr_t iova, size_t size)
+{
+	return qcom_camera_icp_bps_session_map(session, iova, size, true);
+}
+
+static int qcom_camera_icp_bps_client_session_unmap(
+	struct qcom_camera_icp_bps_session *session, dma_addr_t iova, size_t size)
+{
+	return qcom_camera_icp_bps_session_map(session, iova, size, false);
+}
+
+static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
+	.power_on = qcom_camera_icp_bps_power_on,
+	.power_off = qcom_camera_icp_bps_power_off,
+	.session_open = qcom_camera_icp_bps_client_session_open,
+	.session_close = qcom_camera_icp_bps_client_session_close,
+	.session_map = qcom_camera_icp_bps_client_session_map,
+	.session_unmap = qcom_camera_icp_bps_client_session_unmap,
+	.session_config = qcom_camera_icp_bps_session_config,
+	.session_submit = qcom_camera_icp_bps_session_submit,
+};
 
 static void
 qcom_camera_icp_init_bps_config(struct qcom_camera_icp *icp,
@@ -1745,6 +1826,7 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	icp->dev = dev;
 	icp->rproc = rproc;
 	icp->pas_id = CAMERA_ICP_PAS_ID;
+	icp->bps.ops = &qcom_camera_icp_bps_ops;
 	init_completion(&icp->hfi_sys_init_done);
 	init_completion(&icp->hfi_ping_done);
 	init_completion(&icp->hfi_command_done);
@@ -1837,7 +1919,7 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to add remoteproc\n");
 
-	icp->bps_auxdev = devm_auxiliary_device_create(dev, "bps", icp);
+	icp->bps_auxdev = devm_auxiliary_device_create(dev, "bps", &icp->bps);
 	if (!icp->bps_auxdev) {
 		ret = -ENOMEM;
 		goto del_rproc;
