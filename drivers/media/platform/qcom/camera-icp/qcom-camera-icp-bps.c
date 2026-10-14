@@ -77,6 +77,7 @@ struct qcom_camera_icp_bps_ctx {
 	bool powered;
 	bool aborting;
 	u64 request_id;
+	u32 sequence;
 };
 
 static int qcom_camera_icp_bps_open_session(
@@ -530,10 +531,15 @@ finish:
 		dst = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx);
 		if (src)
 			v4l2_m2m_buf_copy_metadata(src, dst);
+		if (state == VB2_BUF_STATE_DONE)
+			dst->sequence = ctx->sequence++;
 		v4l2_m2m_buf_done(dst, state);
 	}
-	if (src)
+	if (src) {
+		if (state == VB2_BUF_STATE_DONE)
+			src->sequence = dst ? dst->sequence : ctx->sequence++;
 		v4l2_m2m_buf_done(src, state);
+	}
 
 	v4l2_m2m_job_finish(ctx->bps->m2m_dev, ctx->m2m_ctx);
 }
