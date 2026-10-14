@@ -195,6 +195,7 @@ struct qcom_camera_icp_bps_session {
 	struct qcom_camera_icp_mapping mapping[CAMERA_ICP_BPS_MAX_MAPPINGS];
 	unsigned int mapping_count;
 	u32 handle;
+	dma_addr_t config_iova;
 	bool configured;
 	void *work_cpu;
 	dma_addr_t work_iova;
@@ -818,11 +819,17 @@ qcom_camera_icp_bps_session_map(struct qcom_camera_icp_bps_session *session,
 		mapping->iova = iova;
 		mapping->size = size;
 	} else {
+		if (session->configured &&
+		    qcom_camera_icp_bps_region_contains(iova, size,
+						 session->config_iova,
+						 sizeof(struct qcom_camera_icp_hfi_bps_config))) {
+			session->configured = false;
+			session->config_iova = 0;
+		}
 		session->mapping_count--;
 		if (i != session->mapping_count)
 			session->mapping[i] =
 				session->mapping[session->mapping_count];
-		session->configured = false;
 	}
 
 	return 0;
@@ -920,8 +927,10 @@ qcom_camera_icp_bps_session_config(struct qcom_camera_icp_bps_session *session,
 	ret = qcom_camera_icp_send_sync(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
 			QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO, token);
-	if (!ret)
+	if (!ret) {
 		session->configured = true;
+		session->config_iova = payload_iova;
+	}
 
 	return ret;
 }
@@ -987,6 +996,7 @@ qcom_camera_icp_bps_session_destroy(struct qcom_camera_icp_bps_session *session)
 			QCOM_CAMERA_ICP_HFI_BPS_DESTROY, token);
 	if (!ret) {
 		session->handle = 0;
+		session->config_iova = 0;
 		session->configured = false;
 	}
 
