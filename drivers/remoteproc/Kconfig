@@ -183,6 +183,7 @@ config QCOM_CAMERA_ICP
 	tristate "Qualcomm Camera Image Control Processor support"
 	depends on OF && ARCH_QCOM
 	depends on INTERCONNECT
+	select AUXILIARY_BUS
 	select QCOM_MDT_LOADER
 	select QCOM_SCM
 	help

@@ -5,6 +5,7 @@
  * Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
  */
 
+#include <linux/auxiliary_bus.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
@@ -249,6 +250,7 @@ struct qcom_camera_icp_hfi_ping {
 struct qcom_camera_icp {
 	struct device *dev;
 	struct rproc *rproc;
+	struct auxiliary_device *bps_auxdev;
 	struct clk_bulk_data clks[CAMERA_ICP_CLK_COUNT];
 	struct icc_bulk_data paths[CAMERA_ICP_NUM_PATHS];
 	struct dev_pm_domain_list *pds;
@@ -1835,7 +1837,17 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to add remoteproc\n");
 
+	icp->bps_auxdev = devm_auxiliary_device_create(dev, "bps", icp);
+	if (!icp->bps_auxdev) {
+		ret = -ENOMEM;
+		goto del_rproc;
+	}
+
 	return 0;
+
+del_rproc:
+	rproc_del(rproc);
+	return dev_err_probe(dev, ret, "failed to add BPS auxiliary device\n");
 }
 
 static void qcom_camera_icp_remove(struct platform_device *pdev)
