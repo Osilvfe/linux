@@ -507,6 +507,13 @@ unmap_aliases:
 		service->ops->alias_unmap(service, alias_iova[alias_count],
 					  size[alias_count]);
 	}
+	if (ret && ctx->session && !READ_ONCE(ctx->aborting)) {
+		dev_warn(ctx->bps->dev,
+			 "BPS frame mapping failed (%d), resetting firmware session\n",
+			 ret);
+		qcom_camera_icp_bps_abort_session(ctx);
+		recover = true;
+	}
 	if (recover) {
 		ret = qcom_camera_icp_bps_open_session(ctx);
 		if (ret)
