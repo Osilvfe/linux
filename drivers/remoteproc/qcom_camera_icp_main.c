@@ -1100,6 +1100,56 @@ static int qcom_camera_icp_bps_client_alias_map(
 	return qcom_camera_icp_bps_buffer_map(icp, &buffer, bps_iova);
 }
 
+static int qcom_camera_icp_bps_client_alias_map_sg(
+	struct qcom_camera_icp_bps *bps, struct sg_table *sgt,
+	dma_addr_t bps_iova, size_t size)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+	struct scatterlist *sg;
+	size_t mapped = 0;
+	unsigned int i;
+	int ret;
+
+	if (!sgt || !size || !IS_ALIGNED(bps_iova, PAGE_SIZE) ||
+	    !IS_ALIGNED(size, PAGE_SIZE) || bps_iova > U32_MAX - (size - 1))
+		return -EINVAL;
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t source_iova = sg_dma_address(sg);
+		size_t segment_size = min_t(size_t, sg_dma_len(sg), size - mapped);
+		size_t offset;
+
+		if (!IS_ALIGNED(source_iova, PAGE_SIZE) ||
+		    !IS_ALIGNED(segment_size, PAGE_SIZE)) {
+			ret = -EINVAL;
+			goto unmap;
+		}
+		for (offset = 0; offset < segment_size; offset += PAGE_SIZE) {
+			phys_addr_t phys;
+
+			phys = iommu_iova_to_phys(icp->domain, source_iova + offset);
+			if (!phys || !IS_ALIGNED(phys, PAGE_SIZE)) {
+				ret = -EFAULT;
+				goto unmap;
+			}
+			ret = iommu_map(icp->domain, bps_iova + mapped,
+					phys, PAGE_SIZE, IOMMU_READ | IOMMU_WRITE,
+					GFP_KERNEL);
+			if (ret)
+				goto unmap;
+			mapped += PAGE_SIZE;
+		}
+		if (mapped == size)
+			return 0;
+	}
+
+	ret = -EINVAL;
+unmap:
+	if (mapped)
+		iommu_unmap(icp->domain, bps_iova, mapped);
+	return ret;
+}
+
 static void qcom_camera_icp_bps_client_alias_unmap(
 	struct qcom_camera_icp_bps *bps, dma_addr_t bps_iova, size_t size)
 {
@@ -1227,6 +1277,7 @@ static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 	.session_prepare = qcom_camera_icp_bps_client_session_prepare,
 	.session_process = qcom_camera_icp_bps_client_session_process,
 	.alias_map = qcom_camera_icp_bps_client_alias_map,
+	.alias_map_sg = qcom_camera_icp_bps_client_alias_map_sg,
 	.alias_unmap = qcom_camera_icp_bps_client_alias_unmap,
 };
 

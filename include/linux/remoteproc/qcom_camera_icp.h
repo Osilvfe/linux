@@ -8,6 +8,7 @@
 
 struct qcom_camera_icp_bps;
 struct qcom_camera_icp_bps_session;
+struct sg_table;
 
 struct qcom_camera_icp_bps_job {
 	dma_addr_t input_iova;
@@ -35,6 +36,9 @@ struct qcom_camera_icp_bps_ops {
 			       const struct qcom_camera_icp_bps_job *job);
 	int (*alias_map)(struct qcom_camera_icp_bps *bps, dma_addr_t source_iova,
 			 dma_addr_t bps_iova, size_t size);
+	int (*alias_map_sg)(struct qcom_camera_icp_bps *bps,
+			    struct sg_table *sgt, dma_addr_t bps_iova,
+			    size_t size);
 	void (*alias_unmap)(struct qcom_camera_icp_bps *bps, dma_addr_t bps_iova,
 			    size_t size);
 };
