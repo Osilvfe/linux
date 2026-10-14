@@ -1083,11 +1083,12 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		command.user_data2 = cpu_to_le64(frame + 1);
 		dma_wmb();
 
-		ret = qcom_camera_icp_send_sync(icp, &command, sizeof(command),
-				       CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
-				       QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
-				       CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-				       QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+		ret = qcom_camera_icp_send_sync(
+			icp, &command, sizeof(command),
+			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
+			QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
+			CAMERA_ICP_HFI_TEST_TOKEN_BASE +
+			QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 		if (ret)
 			break;
 
