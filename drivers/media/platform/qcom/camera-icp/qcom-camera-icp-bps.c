@@ -19,6 +19,11 @@
 #define QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA 0x08100000
 #define QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA 0x08200000
 
+static bool test_timeout_once;
+module_param(test_timeout_once, bool, 0600);
+MODULE_PARM_DESC(test_timeout_once,
+		 "Return one synthetic frame timeout to test recovery");
+
 struct qcom_camera_icp_bps_fmt {
 	u32 pixelformat;
 	u32 width;
@@ -47,6 +52,49 @@ struct qcom_camera_icp_bps_ctx {
 	bool powered;
 	u64 request_id;
 };
+
+static int qcom_camera_icp_bps_open_session(
+	struct qcom_camera_icp_bps_ctx *ctx)
+{
+	struct qcom_camera_icp_bps *service = ctx->bps->service;
+	int ret;
+
+	ret = service->ops->power_on(service);
+	if (ret)
+		return ret;
+	ctx->powered = true;
+	ctx->session = service->ops->session_open(service);
+	if (IS_ERR(ctx->session)) {
+		ret = PTR_ERR(ctx->session);
+		ctx->session = NULL;
+		goto power_off;
+	}
+	ret = service->ops->session_prepare(ctx->session);
+	if (!ret)
+		return 0;
+
+	service->ops->session_close(ctx->session);
+	ctx->session = NULL;
+power_off:
+	service->ops->power_off(service);
+	ctx->powered = false;
+	return ret;
+}
+
+static void qcom_camera_icp_bps_abort_session(
+	struct qcom_camera_icp_bps_ctx *ctx)
+{
+	struct qcom_camera_icp_bps *service = ctx->bps->service;
+
+	if (ctx->powered) {
+		service->ops->power_off(service);
+		ctx->powered = false;
+	}
+	if (ctx->session) {
+		service->ops->session_abort(ctx->session);
+		ctx->session = NULL;
+	}
+}
 
 static void
 qcom_camera_icp_bps_default_formats(struct qcom_camera_icp_bps_ctx *ctx)
@@ -223,9 +271,7 @@ static int qcom_camera_icp_bps_start_streaming(struct vb2_queue *vq,
 				       unsigned int count)
 {
 	struct qcom_camera_icp_bps_ctx *ctx = vb2_get_drv_priv(vq);
-	struct qcom_camera_icp_bps *service = ctx->bps->service;
 	struct vb2_queue *other;
-	int ret;
 
 	other = V4L2_TYPE_IS_OUTPUT(vq->type) ?
 		v4l2_m2m_get_dst_vq(ctx->m2m_ctx) :
@@ -233,28 +279,7 @@ static int qcom_camera_icp_bps_start_streaming(struct vb2_queue *vq,
 	if (!vb2_is_streaming(other) || ctx->session)
 		return 0;
 
-	ret = service->ops->power_on(service);
-	if (ret)
-		return ret;
-	ctx->powered = true;
-	ctx->session = service->ops->session_open(service);
-	if (IS_ERR(ctx->session)) {
-		ret = PTR_ERR(ctx->session);
-		ctx->session = NULL;
-		service->ops->power_off(service);
-		ctx->powered = false;
-		return ret;
-	}
-	ret = service->ops->session_prepare(ctx->session);
-	if (ret) {
-		service->ops->session_close(ctx->session);
-		ctx->session = NULL;
-		service->ops->power_off(service);
-		ctx->powered = false;
-		return ret;
-	}
-
-	return 0;
+	return qcom_camera_icp_bps_open_session(ctx);
 }
 
 static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
@@ -341,6 +366,7 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
 	unsigned int alias_count = 0;
 	unsigned int map_count = 0;
+	bool recover = false;
 	int cleanup_ret;
 	int ret;
 
@@ -368,9 +394,20 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 			goto unmap_session;
 	}
 	job.request_id = ++ctx->request_id;
-	ret = service->ops->session_process(ctx->session, &job);
+	if (xchg(&test_timeout_once, false))
+		ret = -ETIMEDOUT;
+	else
+		ret = service->ops->session_process(ctx->session, &job);
 	if (!ret)
 		state = VB2_BUF_STATE_DONE;
+	else if (ret == -ETIMEDOUT) {
+		dev_warn(ctx->bps->dev,
+			 "BPS frame timed out, resetting firmware session\n");
+		/* Stop firmware before releasing buffers it may still access. */
+		qcom_camera_icp_bps_abort_session(ctx);
+		map_count = 0;
+		recover = true;
+	}
 
 unmap_session:
 	while (map_count) {
@@ -390,6 +427,12 @@ unmap_aliases:
 		alias_count--;
 		service->ops->alias_unmap(service, alias_iova[alias_count],
 					  size[alias_count]);
+	}
+	if (recover) {
+		ret = qcom_camera_icp_bps_open_session(ctx);
+		if (ret)
+			dev_err(ctx->bps->dev,
+				"failed to recover BPS session: %d\n", ret);
 	}
 finish:
 	if (src) {
