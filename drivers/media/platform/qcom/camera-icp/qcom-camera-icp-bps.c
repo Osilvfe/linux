@@ -474,9 +474,14 @@ static void qcom_camera_icp_bps_device_work(struct work_struct *work)
 	}
 	if (!ret && !READ_ONCE(ctx->aborting))
 		state = VB2_BUF_STATE_DONE;
-	else if (ret == -ETIMEDOUT) {
-		dev_warn(ctx->bps->dev,
-			 "BPS frame timed out, resetting firmware session\n");
+	else if (ret) {
+		if (ret == -ETIMEDOUT)
+			dev_warn(ctx->bps->dev,
+				 "BPS frame timed out, resetting firmware session\n");
+		else
+			dev_warn(ctx->bps->dev,
+				 "BPS frame failed (%d), resetting firmware session\n",
+				 ret);
 		/* Stop firmware before releasing buffers it may still access. */
 		qcom_camera_icp_bps_abort_session(ctx);
 		map_count = 0;
