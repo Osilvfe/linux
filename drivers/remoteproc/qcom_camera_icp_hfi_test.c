@@ -6,6 +6,7 @@
 #include <kunit/test.h>
 #include <linux/slab.h>
 
+#include "qcom_camera_icp_bps.h"
 #include "qcom_camera_icp_hfi.h"
 
 struct qcom_camera_icp_hfi_test_context {
@@ -171,6 +172,31 @@ static void qcom_camera_icp_hfi_bad_packet_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(queue->header->read_index), 1U);
 }
 
+static void qcom_camera_icp_bps_abi_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_create_handle),
+			28UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_async_indirect),
+			40UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_async_map), 56UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_async_destroy),
+			44UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_image_info), 64UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_image_desc), 96UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_bps_config), 1248UL);
+	KUNIT_EXPECT_EQ(test,
+			sizeof(struct qcom_camera_icp_hfi_bps_frame_buffers), 20UL);
+	KUNIT_EXPECT_EQ(test,
+			sizeof(struct qcom_camera_icp_hfi_bps_frame_set), 240UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_bps_frame_data),
+			5700UL);
+	KUNIT_EXPECT_EQ(test, sizeof(struct qcom_camera_icp_hfi_bps_frame), 5712UL);
+	KUNIT_EXPECT_EQ(test,
+			sizeof(struct qcom_camera_icp_hfi_bps_cdm_program), 24UL);
+	KUNIT_EXPECT_EQ(test,
+			sizeof(struct qcom_camera_icp_hfi_bps_frame_payload), 6128UL);
+}
+
 static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_layout_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_region_layout_test),
@@ -178,6 +204,7 @@ static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_queue_full_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_read_wrap_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_bad_packet_test),
+	KUNIT_CASE(qcom_camera_icp_bps_abi_test),
 	{}
 };
 

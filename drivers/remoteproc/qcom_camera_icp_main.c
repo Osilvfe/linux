@@ -27,6 +27,7 @@
 #include <linux/soc/qcom/mdt_loader.h>
 
 #include "qcom_camera_icp_hfi.h"
+#include "qcom_camera_icp_bps.h"
 
 #define CAMERA_ICP_FIRMWARE	"qcom/sm8650/CAMERA_ICP.mbn"
 #define CAMERA_ICP_BPS_STRIPING_FIRMWARE \
@@ -130,19 +131,6 @@ enum qcom_camera_icp_clock {
 #define CAMERA_ICP_HFI_PING_TOKEN		0x434149484f4e4701ULL
 #define CAMERA_ICP_HFI_TEST_TOKEN_BASE		0x434149484f4e4710ULL
 
-#define CAMERA_ICP_HFI_BPS_NON_RT		1
-#define CAMERA_ICP_HFI_BPS_CONFIG_IO		1
-#define CAMERA_ICP_HFI_BPS_FRAME_PROCESS	2
-#define CAMERA_ICP_HFI_BPS_DESTROY		4
-#define CAMERA_ICP_HFI_MEM_MAP			0xe
-#define CAMERA_ICP_HFI_MEM_UNMAP			0xf
-
-#define CAMERA_ICP_HFI_IMAGE_FORMAT_MIPI_10	2
-#define CAMERA_ICP_HFI_IMAGE_FORMAT_LINEAR_TP_10	18
-#define CAMERA_ICP_HFI_BPS_IMAGE_COUNT		12
-#define CAMERA_ICP_HFI_BPS_INPUT_IMAGE		0
-#define CAMERA_ICP_HFI_BPS_OUTPUT_IMAGE_FULL	1
-
 static bool test_bps_config;
 module_param(test_bps_config, bool, 0400);
 MODULE_PARM_DESC(test_bps_config,
@@ -221,148 +209,6 @@ struct qcom_camera_icp_hfi_ping {
 	__le32 packet_type;
 	__le32 user_data_low;
 	__le32 user_data_high;
-} __packed;
-
-struct qcom_camera_icp_hfi_create_handle {
-	__le32 size;
-	__le32 packet_type;
-	__le32 handle_type;
-	__le64 user_data1;
-	__le64 user_data2;
-} __packed;
-
-struct qcom_camera_icp_hfi_async_indirect {
-	__le32 size;
-	__le32 packet_type;
-	__le32 opcode;
-	__le64 user_data1;
-	__le64 user_data2;
-	__le32 num_fw_handles;
-	__le32 fw_handle;
-	__le32 payload_iova;
-} __packed;
-
-struct qcom_camera_icp_hfi_async_map {
-	__le32 size;
-	__le32 packet_type;
-	__le32 opcode;
-	__le64 user_data1;
-	__le64 user_data2;
-	__le32 num_fw_handles;
-	__le32 fw_handle;
-	__le64 map_user_data;
-	__le32 num_regions;
-	__le32 region_iova;
-	__le32 region_size;
-} __packed;
-
-struct qcom_camera_icp_hfi_async_destroy {
-	__le32 size;
-	__le32 packet_type;
-	__le32 opcode;
-	__le64 user_data1;
-	__le64 user_data2;
-	__le32 num_fw_handles;
-	__le32 fw_handle;
-	__le64 destroy_user_data;
-} __packed;
-
-struct qcom_camera_icp_hfi_buffer_layout {
-	__le32 stride;
-	__le32 height;
-} __packed;
-
-struct qcom_camera_icp_hfi_image_info {
-	__le32 format;
-	__le32 width;
-	__le32 height;
-	__le32 bayer_order;
-	__le32 pixel_alignment;
-	__le32 yuv422_order;
-	__le32 byte_swap;
-	__le32 ubwc_version;
-	__le32 ubwc_lossy_mode;
-	__le32 ubwc_bw_limit;
-	__le32 ubwc_lossy_threshold0;
-	__le32 ubwc_lossy_threshold1;
-	__le32 argb_alpha;
-	__le32 ubwc_lossy_offset;
-	__le32 from_downscale;
-	__le32 hdr_content;
-} __packed;
-
-struct qcom_camera_icp_hfi_image_desc {
-	struct qcom_camera_icp_hfi_image_info info;
-	struct qcom_camera_icp_hfi_buffer_layout plane[2];
-	struct qcom_camera_icp_hfi_buffer_layout metadata[2];
-} __packed;
-
-struct qcom_camera_icp_hfi_cadl_pass {
-	__le32 width;
-	__le32 height;
-	__le32 channels;
-	__le32 bps_input;
-	__le32 cadl_input;
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_config {
-	struct qcom_camera_icp_hfi_image_desc image[CAMERA_ICP_HFI_BPS_IMAGE_COUNT];
-	__le32 secure_mode;
-	__le32 cadl_pass_count;
-	struct qcom_camera_icp_hfi_cadl_pass cadl_pass[4];
-	__le64 user_data;
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_frame_buffers {
-	__le32 buffer[2];
-	__le32 metadata[2];
-	__le32 synx_handle;
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_frame_set {
-	struct qcom_camera_icp_hfi_bps_frame_buffers
-		buffer[CAMERA_ICP_HFI_BPS_IMAGE_COUNT];
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_frame_data {
-	__le32 max_cores;
-	__le32 target_time_ns;
-	__le32 ubwc_stats_iova;
-	__le32 ubwc_stats_size;
-	__le32 cdm_iova;
-	__le32 cdm_size;
-	__le32 iq_iova;
-	__le32 striping_iova;
-	__le32 cdm_program_array_iova;
-	__le32 request_id;
-	__le64 timestamp;
-	__le32 num_frame_sets;
-	struct qcom_camera_icp_hfi_bps_frame_set frame_set[16];
-	u8 cadl_frame_set[560];
-	__le32 reconfig_valid;
-	u8 reconfig_data[1240];
-	__le32 domain_id;
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_frame {
-	struct qcom_camera_icp_hfi_bps_frame_data data;
-	__le32 alignment_hole;
-	__le64 user_data;
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_cdm_program {
-	__le64 base_length;
-	__le32 type;
-	__le32 uid;
-	__le32 single_register;
-	__le32 internally_allocated;
-} __packed;
-
-struct qcom_camera_icp_hfi_bps_frame_payload {
-	struct qcom_camera_icp_hfi_bps_frame frame;
-	__le32 cdm_allocator;
-	__le32 cdm_num_programs;
-	struct qcom_camera_icp_hfi_bps_cdm_program program[17];
 } __packed;
 
 #define CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET	0
@@ -826,7 +672,7 @@ static int qcom_camera_icp_test_create_bps(struct qcom_camera_icp *icp)
 		.size = cpu_to_le32(sizeof(command)),
 		.packet_type =
 			cpu_to_le32(CAMERA_ICP_HFI_CMD_IPEBPS_CREATE_HANDLE),
-		.handle_type = cpu_to_le32(CAMERA_ICP_HFI_BPS_NON_RT),
+		.handle_type = cpu_to_le32(QCOM_CAMERA_ICP_HFI_BPS_NON_RT),
 		.user_data1 = cpu_to_le64(token),
 	};
 	int ret;
@@ -848,8 +694,8 @@ static int qcom_camera_icp_test_create_bps(struct qcom_camera_icp *icp)
 static int qcom_camera_icp_test_map_region(struct qcom_camera_icp *icp,
 				   dma_addr_t iova, size_t size, bool map)
 {
-	const u32 opcode = map ? CAMERA_ICP_HFI_MEM_MAP :
-				 CAMERA_ICP_HFI_MEM_UNMAP;
+	const u32 opcode = map ? QCOM_CAMERA_ICP_HFI_MEM_MAP :
+				 QCOM_CAMERA_ICP_HFI_MEM_UNMAP;
 	const u64 token = CAMERA_ICP_HFI_TEST_TOKEN_BASE + opcode;
 	struct qcom_camera_icp_hfi_async_map command = {
 		.size = cpu_to_le32(sizeof(command)),
@@ -879,12 +725,12 @@ static int qcom_camera_icp_test_map(struct qcom_camera_icp *icp, bool map)
 static int qcom_camera_icp_test_config_bps(struct qcom_camera_icp *icp)
 {
 	const u64 token = CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-			  CAMERA_ICP_HFI_BPS_CONFIG_IO;
+			  QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO;
 	struct qcom_camera_icp_hfi_async_indirect command = {
 		.size = cpu_to_le32(sizeof(command)),
 		.packet_type =
 			cpu_to_le32(CAMERA_ICP_HFI_CMD_IPEBPS_ASYNC_INDIRECT),
-		.opcode = cpu_to_le32(CAMERA_ICP_HFI_BPS_CONFIG_IO),
+		.opcode = cpu_to_le32(QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO),
 		.user_data1 = cpu_to_le64(token),
 		.num_fw_handles = cpu_to_le32(1),
 		.fw_handle = cpu_to_le32(READ_ONCE(icp->hfi_test_handle)),
@@ -893,18 +739,18 @@ static int qcom_camera_icp_test_config_bps(struct qcom_camera_icp *icp)
 
 	return qcom_camera_icp_test_send(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
-			CAMERA_ICP_HFI_BPS_CONFIG_IO, token);
+			QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO, token);
 }
 
 static int qcom_camera_icp_test_destroy_bps(struct qcom_camera_icp *icp)
 {
 	const u64 token = CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-			  CAMERA_ICP_HFI_BPS_DESTROY;
+			  QCOM_CAMERA_ICP_HFI_BPS_DESTROY;
 	struct qcom_camera_icp_hfi_async_destroy command = {
 		.size = cpu_to_le32(sizeof(command)),
 		.packet_type =
 			cpu_to_le32(CAMERA_ICP_HFI_CMD_IPEBPS_ASYNC_DIRECT),
-		.opcode = cpu_to_le32(CAMERA_ICP_HFI_BPS_DESTROY),
+		.opcode = cpu_to_le32(QCOM_CAMERA_ICP_HFI_BPS_DESTROY),
 		.user_data1 = cpu_to_le64(token),
 		.num_fw_handles = cpu_to_le32(1),
 		.fw_handle = cpu_to_le32(READ_ONCE(icp->hfi_test_handle)),
@@ -913,7 +759,7 @@ static int qcom_camera_icp_test_destroy_bps(struct qcom_camera_icp *icp)
 
 	return qcom_camera_icp_test_send(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_DIRECT_ACK,
-			CAMERA_ICP_HFI_BPS_DESTROY, token);
+			QCOM_CAMERA_ICP_HFI_BPS_DESTROY, token);
 }
 
 static void
@@ -925,20 +771,20 @@ qcom_camera_icp_init_bps_config(struct qcom_camera_icp *icp,
 	u32 input_stride;
 	u32 output_stride;
 
-	input = &config->image[CAMERA_ICP_HFI_BPS_INPUT_IMAGE];
-	output = &config->image[CAMERA_ICP_HFI_BPS_OUTPUT_IMAGE_FULL];
+	input = &config->image[QCOM_CAMERA_ICP_HFI_BPS_INPUT_IMAGE];
+	output = &config->image[QCOM_CAMERA_ICP_HFI_BPS_OUTPUT_IMAGE_FULL];
 	input_stride = ALIGN(DIV_ROUND_UP(test_bps_width * 10, 8), 64);
 	output_stride = ALIGN(DIV_ROUND_UP(test_bps_width, 3) * 4, 128);
 
 	input->info.format =
-		cpu_to_le32(CAMERA_ICP_HFI_IMAGE_FORMAT_MIPI_10);
+		cpu_to_le32(QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_MIPI_10);
 	input->info.width = cpu_to_le32(test_bps_width);
 	input->info.height = cpu_to_le32(test_bps_height);
 	input->plane[0].stride = cpu_to_le32(input_stride);
 	input->plane[0].height = cpu_to_le32(test_bps_height);
 
 	output->info.format =
-		cpu_to_le32(CAMERA_ICP_HFI_IMAGE_FORMAT_LINEAR_TP_10);
+		cpu_to_le32(QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_LINEAR_TP_10);
 	output->info.width = cpu_to_le32(test_bps_width);
 	output->info.height = cpu_to_le32(test_bps_height);
 	output->plane[0].stride = cpu_to_le32(output_stride);
@@ -947,7 +793,7 @@ qcom_camera_icp_init_bps_config(struct qcom_camera_icp *icp,
 	output->plane[1].height = cpu_to_le32(test_bps_height / 2);
 	config->user_data =
 		cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-			    CAMERA_ICP_HFI_BPS_CONFIG_IO);
+			    QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO);
 
 	dev_info(icp->dev,
 		 "BPS CONFIG_IO probe: %ux%u MIPI10 stride %u to linear TP10 stride %u\n",
@@ -1161,7 +1007,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		cpu_to_le32((bps_base +
 			       CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET) >> 8);
 	payload->frame.user_data = cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-					      CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+					      QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	dma_wmb();
 	ret = qcom_camera_icp_test_create_bps(icp);
 	if (ret)
@@ -1186,9 +1032,9 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	command.size = cpu_to_le32(sizeof(command));
 	command.packet_type =
 		cpu_to_le32(CAMERA_ICP_HFI_CMD_IPEBPS_ASYNC_INDIRECT);
-	command.opcode = cpu_to_le32(CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+	command.opcode = cpu_to_le32(QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	command.user_data1 = cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-					 CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+					 QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	command.num_fw_handles = cpu_to_le32(1);
 	command.fw_handle = cpu_to_le32(READ_ONCE(icp->hfi_test_handle));
 	command.payload_iova = cpu_to_le32(icp->hfi_test_buffer_iova +
@@ -1226,9 +1072,9 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 
 		ret = qcom_camera_icp_test_send(icp, &command, sizeof(command),
 				CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
-				CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
+				QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
 				CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-				CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+				QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 		if (ret)
 			break;
 
@@ -1462,8 +1308,8 @@ static void qcom_camera_icp_handle_hfi_irq(struct qcom_camera_icp *icp)
 			opcode = le32_to_cpu(icp->hfi_msg[2]);
 			if (opcode != READ_ONCE(icp->hfi_test_opcode))
 				continue;
-			if ((opcode == CAMERA_ICP_HFI_BPS_CONFIG_IO ||
-			     opcode == CAMERA_ICP_HFI_BPS_FRAME_PROCESS) &&
+			if ((opcode == QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO ||
+			     opcode == QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS) &&
 			    packet_size < 9 * sizeof(u32))
 				continue;
 			token = le32_to_cpu(icp->hfi_msg[3]);
@@ -1473,8 +1319,8 @@ static void qcom_camera_icp_handle_hfi_irq(struct qcom_camera_icp *icp)
 			WRITE_ONCE(icp->hfi_test_error,
 				   le32_to_cpu(icp->hfi_msg[7]));
 			WRITE_ONCE(icp->hfi_test_result,
-				   (opcode == CAMERA_ICP_HFI_BPS_CONFIG_IO ||
-				    opcode == CAMERA_ICP_HFI_BPS_FRAME_PROCESS) ?
+				   (opcode == QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO ||
+				    opcode == QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS) ?
 				   le32_to_cpu(icp->hfi_msg[8]) : 0);
 			complete(&icp->hfi_test_done);
 		} else {
