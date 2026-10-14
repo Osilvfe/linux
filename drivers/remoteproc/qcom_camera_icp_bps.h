@@ -23,6 +23,24 @@
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_CDM_PROGRAMS	17
 #define QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT		8
 
+static inline int qcom_camera_icp_bps_validate_region(u64 iova, u64 size)
+{
+	if (!size)
+		return -EINVAL;
+	if (iova > U32_MAX || size > U32_MAX ||
+	    iova > U32_MAX - (size - 1))
+		return -ERANGE;
+
+	return 0;
+}
+
+static inline bool qcom_camera_icp_bps_region_contains(u64 base, u64 size,
+					       u64 iova, u64 length)
+{
+	return length && iova >= base && iova - base < size &&
+	       length <= size - (iova - base);
+}
+
 static inline int qcom_camera_icp_bps_encode_buffer(u64 iova, __le32 *encoded)
 {
 	if (iova & ((1U << QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT) - 1))

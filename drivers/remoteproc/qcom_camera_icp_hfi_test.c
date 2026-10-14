@@ -213,6 +213,46 @@ static void qcom_camera_icp_bps_buffer_address_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
 }
 
+static void qcom_camera_icp_bps_region_address_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test,
+		qcom_camera_icp_bps_validate_region(0x08000000, 0x286000), 0);
+	KUNIT_EXPECT_EQ(test,
+		qcom_camera_icp_bps_validate_region(U32_MAX, 1), 0);
+	KUNIT_EXPECT_EQ(test,
+		qcom_camera_icp_bps_validate_region(0, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test,
+		qcom_camera_icp_bps_validate_region(U32_MAX, 2), -ERANGE);
+	KUNIT_EXPECT_EQ(test,
+		qcom_camera_icp_bps_validate_region(1ULL << 32, 1), -ERANGE);
+	KUNIT_EXPECT_EQ(test,
+		qcom_camera_icp_bps_validate_region(0, 1ULL << 32), -ERANGE);
+}
+
+static void qcom_camera_icp_bps_region_contains_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test,
+		qcom_camera_icp_bps_region_contains(0x1000, 0x1000,
+						    0x1000, 0x1000));
+	KUNIT_EXPECT_TRUE(test,
+		qcom_camera_icp_bps_region_contains(0x1000, 0x1000,
+						    0x1fff, 1));
+	KUNIT_EXPECT_FALSE(test,
+		qcom_camera_icp_bps_region_contains(0x1000, 0x1000,
+						    0x1000, 0));
+	KUNIT_EXPECT_FALSE(test,
+		qcom_camera_icp_bps_region_contains(0x1000, 0x1000,
+						    0x1fff, 2));
+	KUNIT_EXPECT_FALSE(test,
+		qcom_camera_icp_bps_region_contains(0x1000, 0x1000,
+						    0x2000, 1));
+	KUNIT_EXPECT_FALSE(test,
+		qcom_camera_icp_bps_region_contains(0x1000, 0x1000,
+						    0x0fff, 1));
+	KUNIT_EXPECT_FALSE(test,
+		qcom_camera_icp_bps_region_contains(U64_MAX - 1, 2, 0, 1));
+}
+
 static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_layout_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_region_layout_test),
@@ -222,6 +262,8 @@ static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_bad_packet_test),
 	KUNIT_CASE(qcom_camera_icp_bps_abi_test),
 	KUNIT_CASE(qcom_camera_icp_bps_buffer_address_test),
+	KUNIT_CASE(qcom_camera_icp_bps_region_address_test),
+	KUNIT_CASE(qcom_camera_icp_bps_region_contains_test),
 	{}
 };
 
