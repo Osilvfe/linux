@@ -11,7 +11,7 @@
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
-#include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-dma-sg.h>
 
 #define QCOM_CAMERA_ICP_BPS_NAME	"qcom-camera-icp-bps"
 #define V4L2_PIX_FMT_QCOM_TP10		v4l2_fourcc('Q', 'T', '1', '0')
@@ -308,7 +308,7 @@ static int qcom_camera_icp_bps_queue_init(void *priv,
 				       V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 		queues[i]->io_modes = VB2_MMAP | VB2_DMABUF;
 		queues[i]->ops = &qcom_camera_icp_bps_vb2_ops;
-		queues[i]->mem_ops = &vb2_dma_contig_memops;
+		queues[i]->mem_ops = &vb2_dma_sg_memops;
 		queues[i]->drv_priv = ctx;
 		queues[i]->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 		queues[i]->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
@@ -333,7 +333,7 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 		.output_y_iova = QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA,
 		.output_c_iova = QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA,
 	};
-	dma_addr_t source_iova[3];
+	struct sg_table *sgt[3];
 	dma_addr_t alias_iova[3] = { job.input_iova, job.output_y_iova,
 				     job.output_c_iova };
 	size_t size[3] = { PAGE_ALIGN(832 * 480), PAGE_ALIGN(896 * 480),
@@ -349,13 +349,15 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 	if (!src || !dst || !ctx->session)
 		goto finish;
 
-	source_iova[0] = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-	source_iova[1] = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
-	source_iova[2] = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 1);
+	sgt[0] = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
+	sgt[1] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 0);
+	sgt[2] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 1);
 	for (alias_count = 0; alias_count < ARRAY_SIZE(alias_iova); alias_count++) {
-		ret = service->ops->alias_map(service, source_iova[alias_count],
-					      alias_iova[alias_count],
-					      size[alias_count]);
+		dev_dbg(ctx->bps->dev, "mapping plane %u from %u DMA segments\n",
+			alias_count, sgt[alias_count]->nents);
+		ret = service->ops->alias_map_sg(service, sgt[alias_count],
+						 alias_iova[alias_count],
+						 size[alias_count]);
 		if (ret)
 			goto unmap_aliases;
 	}
