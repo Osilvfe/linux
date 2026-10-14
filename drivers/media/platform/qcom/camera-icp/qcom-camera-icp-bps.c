@@ -240,6 +240,14 @@ static int qcom_camera_icp_bps_start_streaming(struct vb2_queue *vq,
 		ctx->powered = false;
 		return ret;
 	}
+	ret = service->ops->session_prepare(ctx->session);
+	if (ret) {
+		service->ops->session_close(ctx->session);
+		ctx->session = NULL;
+		service->ops->power_off(service);
+		ctx->powered = false;
+		return ret;
+	}
 
 	return 0;
 }
