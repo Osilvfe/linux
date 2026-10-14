@@ -161,6 +161,11 @@ module_param(test_bps_frame, bool, 0400);
 MODULE_PARM_DESC(test_bps_frame,
 		 "Run one bounded 640x480 BPS frame using an offline striping blob");
 
+static unsigned int test_bps_frames = 1;
+module_param(test_bps_frames, uint, 0400);
+MODULE_PARM_DESC(test_bps_frames,
+		 "Number of bounded BPS frames to process (1-16)");
+
 #define CAMERA_ICP_HFI_MEM_REGION_GLOBAL_SYNC	0
 #define CAMERA_ICP_HFI_MEM_REGION_SYNX_MUTEX	1
 #define CAMERA_ICP_HFI_MEM_REGION_IPC_MUTEX	2
@@ -1022,6 +1027,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	u8 *input;
 	u8 *output_y;
 	u8 *output_c;
+	u32 frame;
 	u32 x;
 	u32 y;
 	bool mapped = false;
@@ -1060,7 +1066,8 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	BUILD_BUG_ON(U32_MAX - (CAMERA_ICP_BPS_FRAME_BUFFER_SIZE - 1) <
 		     CAMERA_ICP_BPS_FRAME_IOVA);
 
-	if (test_bps_width != 640 || test_bps_height != 480)
+	if (test_bps_width != 640 || test_bps_height != 480 ||
+	    !test_bps_frames || test_bps_frames > 16)
 		return -EINVAL;
 
 	ret = request_firmware(&striping_firmware,
@@ -1102,27 +1109,6 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	qcom_camera_icp_init_bps_config(icp, config);
 	memcpy(icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
 	       striping_firmware->data, striping_firmware->size);
-	for (y = 0; y < 480; y++) {
-		u8 *row = input + y * 832;
-
-		for (x = 0; x < 640; x += 4) {
-			u16 p0 = (x + y * 3) & 0x3ff;
-			u16 p1 = (x + 1 + y * 3) & 0x3ff;
-			u16 p2 = (x + 2 + y * 3) & 0x3ff;
-			u16 p3 = (x + 3 + y * 3) & 0x3ff;
-			u8 *group = row + x / 4 * 5;
-
-			group[0] = p0 >> 2;
-			group[1] = p1 >> 2;
-			group[2] = p2 >> 2;
-			group[3] = p3 >> 2;
-			group[4] = (p0 & 3) | ((p1 & 3) << 2) |
-				   ((p2 & 3) << 4) | ((p3 & 3) << 6);
-		}
-	}
-	memset(output_y, 0xa5, 896 * 480);
-	memset(output_c, 0xa5, 896 * 240);
-
 	payload->frame.data.max_cores = cpu_to_le32(1);
 	payload->frame.data.cdm_iova =
 		cpu_to_le32(fw_base + CAMERA_ICP_BPS_FRAME_CDM_OFFSET);
@@ -1136,7 +1122,6 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET +
 		offsetof(struct qcom_camera_icp_hfi_bps_frame_payload,
 			 cdm_allocator));
-	payload->frame.data.request_id = cpu_to_le32(1);
 	payload->frame.data.num_frame_sets = cpu_to_le32(1);
 	/* BPS frame-buffer addresses use 256-byte units in the striping ABI. */
 	payload->frame.data.frame_set[0].buffer[0].buffer[0] =
@@ -1148,7 +1133,6 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	payload->frame.user_data = cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
 					      CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	dma_wmb();
-
 	ret = qcom_camera_icp_test_create_bps(icp);
 	if (ret)
 		goto unmap_alias;
@@ -1175,16 +1159,51 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	command.opcode = cpu_to_le32(CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	command.user_data1 = cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
 					 CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
-	command.user_data2 = cpu_to_le64(1);
 	command.num_fw_handles = cpu_to_le32(1);
 	command.fw_handle = cpu_to_le32(READ_ONCE(icp->hfi_test_handle));
 	command.payload_iova = cpu_to_le32(icp->hfi_test_buffer_iova +
 					 CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET);
-	ret = qcom_camera_icp_test_send(icp, &command, sizeof(command),
-			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
-			CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
-			CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-			CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+	for (frame = 0; frame < test_bps_frames; frame++) {
+		for (y = 0; y < 480; y++) {
+			u8 *row = input + y * 832;
+
+			for (x = 0; x < 640; x += 4) {
+				u16 p0 = (x + y * 3 + frame * 17) & 0x3ff;
+				u16 p1 = (x + 1 + y * 3 + frame * 17) & 0x3ff;
+				u16 p2 = (x + 2 + y * 3 + frame * 17) & 0x3ff;
+				u16 p3 = (x + 3 + y * 3 + frame * 17) & 0x3ff;
+				u8 *group = row + x / 4 * 5;
+
+				group[0] = p0 >> 2;
+				group[1] = p1 >> 2;
+				group[2] = p2 >> 2;
+				group[3] = p3 >> 2;
+				group[4] = (p0 & 3) | ((p1 & 3) << 2) |
+					   ((p2 & 3) << 4) |
+					   ((p3 & 3) << 6);
+			}
+		}
+		memset(output_y, 0xa5, 896 * 480);
+		memset(output_c, 0xa5, 896 * 240);
+		payload->frame.data.request_id = cpu_to_le32(frame + 1);
+		command.user_data2 = cpu_to_le64(frame + 1);
+		dma_wmb();
+
+		ret = qcom_camera_icp_test_send(icp, &command, sizeof(command),
+				CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
+				CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
+				CAMERA_ICP_HFI_TEST_TOKEN_BASE +
+				CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+		if (ret)
+			break;
+
+		dma_rmb();
+		if (!memchr_inv(output_y, 0xa5, 896 * 480) &&
+		    !memchr_inv(output_c, 0xa5, 896 * 240)) {
+			ret = -ENODATA;
+			break;
+		}
+	}
 	/*
 	 * A timeout leaves ownership uncertain.  Do not unmap or free memory the
 	 * firmware may still touch; the remoteproc shutdown path resets ICP first
@@ -1192,13 +1211,6 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	 */
 	if (ret == -ETIMEDOUT)
 		goto release_firmware;
-	if (!ret) {
-		dma_rmb();
-		if (!memchr_inv(output_y, 0xa5, 896 * 480) &&
-		    !memchr_inv(output_c, 0xa5, 896 * 240))
-			ret = -ENODATA;
-	}
-
 unmap_buffer:
 	if (alias_mapped) {
 		cleanup_ret = qcom_camera_icp_test_map_region(icp,
@@ -1229,7 +1241,8 @@ free_buffer:
 release_firmware:
 	release_firmware(striping_firmware);
 	if (!ret)
-		dev_info(icp->dev, "Camera ICP BPS one-frame probe succeeded\n");
+		dev_info(icp->dev, "Camera ICP BPS %u-frame probe succeeded\n",
+			 test_bps_frames);
 	return ret;
 }
 
