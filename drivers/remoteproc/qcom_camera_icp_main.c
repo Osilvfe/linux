@@ -750,8 +750,7 @@ static int qcom_camera_icp_test_config_bps(struct qcom_camera_icp *icp)
 			QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO, token);
 }
 
-static int qcom_camera_icp_send_bps_frame(
-	struct qcom_camera_icp *icp,
+static int qcom_camera_icp_send_bps_frame(struct qcom_camera_icp *icp,
 	const struct qcom_camera_icp_hfi_async_indirect *command)
 {
 	return qcom_camera_icp_send_sync(icp, command, sizeof(*command),
