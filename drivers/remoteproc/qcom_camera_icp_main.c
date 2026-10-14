@@ -18,6 +18,7 @@
 #include <linux/iopoll.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
@@ -246,6 +247,8 @@ struct qcom_camera_icp {
 	struct completion hfi_sys_init_done;
 	struct completion hfi_ping_done;
 	struct completion hfi_test_done;
+	/* Serializes the single firmware command/response transaction slot. */
+	struct mutex hfi_command_lock;
 	__le32 hfi_msg[CAMERA_ICP_HFI_MAX_MSG_WORDS];
 	u32 hfi_sys_init_error;
 	u64 hfi_ping_token;
@@ -629,12 +632,13 @@ static int qcom_camera_icp_ping(struct qcom_camera_icp *icp)
 	return 0;
 }
 
-static int qcom_camera_icp_test_send(struct qcom_camera_icp *icp,
+static int qcom_camera_icp_send_sync(struct qcom_camera_icp *icp,
 				     const void *command, size_t command_size,
 				     u32 ack, u32 opcode, u64 token)
 {
 	int ret;
 
+	mutex_lock(&icp->hfi_command_lock);
 	reinit_completion(&icp->hfi_test_done);
 	WRITE_ONCE(icp->hfi_test_ack, ack);
 	WRITE_ONCE(icp->hfi_test_opcode, opcode);
@@ -643,14 +647,15 @@ static int qcom_camera_icp_test_send(struct qcom_camera_icp *icp,
 	WRITE_ONCE(icp->hfi_test_result, U32_MAX);
 	ret = qcom_camera_icp_hfi_write(&icp->hfi, command, command_size);
 	if (ret)
-		return ret;
+		goto unlock;
 
 	writel(1, icp->csr + CAMERA_ICP_HFI_HOST_TO_ICP);
 	if (!wait_for_completion_timeout(&icp->hfi_test_done,
 					 CAMERA_ICP_HFI_PING_TIMEOUT)) {
 		dev_err(icp->dev, "HFI test command %#x/%#x timed out\n",
 			ack, opcode);
-		return -ETIMEDOUT;
+		ret = -ETIMEDOUT;
+		goto unlock;
 	}
 
 	if (READ_ONCE(icp->hfi_test_error) ||
@@ -659,10 +664,13 @@ static int qcom_camera_icp_test_send(struct qcom_camera_icp *icp,
 			"HFI test command %#x/%#x failed: transport %#x result %#x\n",
 			ack, opcode, READ_ONCE(icp->hfi_test_error),
 			READ_ONCE(icp->hfi_test_result));
-		return -EREMOTEIO;
+		ret = -EREMOTEIO;
+		goto unlock;
 	}
 
-	return 0;
+unlock:
+	mutex_unlock(&icp->hfi_command_lock);
+	return ret;
 }
 
 static int qcom_camera_icp_test_create_bps(struct qcom_camera_icp *icp)
@@ -678,7 +686,7 @@ static int qcom_camera_icp_test_create_bps(struct qcom_camera_icp *icp)
 	int ret;
 
 	WRITE_ONCE(icp->hfi_test_handle, 0);
-	ret = qcom_camera_icp_test_send(icp, &command, sizeof(command),
+	ret = qcom_camera_icp_send_sync(icp, &command, sizeof(command),
 					CAMERA_ICP_HFI_MSG_IPEBPS_CREATE_HANDLE_ACK,
 					0, token);
 	if (ret)
@@ -711,7 +719,7 @@ static int qcom_camera_icp_test_map_region(struct qcom_camera_icp *icp,
 		.region_size = cpu_to_le32(size),
 	};
 
-	return qcom_camera_icp_test_send(icp, &command, sizeof(command),
+	return qcom_camera_icp_send_sync(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_DIRECT_ACK, opcode,
 			token);
 }
@@ -737,7 +745,7 @@ static int qcom_camera_icp_test_config_bps(struct qcom_camera_icp *icp)
 		.payload_iova = cpu_to_le32(icp->hfi_test_buffer_iova),
 	};
 
-	return qcom_camera_icp_test_send(icp, &command, sizeof(command),
+	return qcom_camera_icp_send_sync(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
 			QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO, token);
 }
@@ -757,7 +765,7 @@ static int qcom_camera_icp_test_destroy_bps(struct qcom_camera_icp *icp)
 		.destroy_user_data = cpu_to_le64(token),
 	};
 
-	return qcom_camera_icp_test_send(icp, &command, sizeof(command),
+	return qcom_camera_icp_send_sync(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_DIRECT_ACK,
 			QCOM_CAMERA_ICP_HFI_BPS_DESTROY, token);
 }
@@ -1075,11 +1083,11 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		command.user_data2 = cpu_to_le64(frame + 1);
 		dma_wmb();
 
-		ret = qcom_camera_icp_test_send(icp, &command, sizeof(command),
-				CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
-				QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
-				CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-				QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+		ret = qcom_camera_icp_send_sync(icp, &command, sizeof(command),
+				       CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
+				       QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
+				       CAMERA_ICP_HFI_TEST_TOKEN_BASE +
+				       QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 		if (ret)
 			break;
 
@@ -1572,6 +1580,7 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	init_completion(&icp->hfi_sys_init_done);
 	init_completion(&icp->hfi_ping_done);
 	init_completion(&icp->hfi_test_done);
+	mutex_init(&icp->hfi_command_lock);
 	platform_set_drvdata(pdev, icp);
 
 	ret = qcom_camera_icp_alloc_memory(icp);
