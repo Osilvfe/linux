@@ -728,6 +728,7 @@ static const struct v4l2_ioctl_ops qcom_camera_icp_bps_ioctl_ops = {
 	.vidioc_s_fmt_vid_out_mplane = qcom_camera_icp_bps_s_fmt,
 	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
