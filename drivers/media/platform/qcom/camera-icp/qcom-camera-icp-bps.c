@@ -83,7 +83,7 @@ static int qcom_camera_icp_bps_open_session(
 	struct qcom_camera_icp_bps_ctx *ctx)
 {
 	struct qcom_camera_icp_bps *service = ctx->bps->service;
-	int ret;
+	int ret, cleanup_ret;
 
 	ret = service->ops->power_on(service);
 	if (ret)
@@ -99,8 +99,8 @@ static int qcom_camera_icp_bps_open_session(
 	if (!ret)
 		return 0;
 
-	ret = service->ops->session_close(ctx->session);
-	if (ret)
+	cleanup_ret = service->ops->session_close(ctx->session);
+	if (cleanup_ret)
 		service->ops->session_abort(ctx->session);
 	ctx->session = NULL;
 power_off:
