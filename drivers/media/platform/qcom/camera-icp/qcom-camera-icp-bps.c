@@ -374,6 +374,42 @@ static int qcom_camera_icp_bps_s_fmt(struct file *file, void *fh,
 	return 0;
 }
 
+static int qcom_camera_icp_bps_g_selection(struct file *file, void *fh,
+					   struct v4l2_selection *selection)
+{
+	struct qcom_camera_icp_bps_ctx *ctx;
+
+	if (!V4L2_TYPE_IS_OUTPUT(selection->type))
+		return -EINVAL;
+
+	switch (selection->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ctx = container_of(file->private_data,
+			   struct qcom_camera_icp_bps_ctx, fh);
+	selection->r.left = 0;
+	selection->r.top = 0;
+	selection->r.width = ctx->output.width;
+	selection->r.height = ctx->output.height;
+
+	return 0;
+}
+
+static int qcom_camera_icp_bps_s_selection(struct file *file, void *fh,
+					   struct v4l2_selection *selection)
+{
+	if (selection->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+
+	return qcom_camera_icp_bps_g_selection(file, fh, selection);
+}
+
 static int qcom_camera_icp_bps_queue_setup(struct vb2_queue *vq,
 				   unsigned int *num_buffers,
 				   unsigned int *num_planes,
@@ -726,6 +762,8 @@ static const struct v4l2_ioctl_ops qcom_camera_icp_bps_ioctl_ops = {
 	.vidioc_try_fmt_vid_out_mplane = qcom_camera_icp_bps_try_fmt,
 	.vidioc_s_fmt_vid_cap_mplane = qcom_camera_icp_bps_s_fmt,
 	.vidioc_s_fmt_vid_out_mplane = qcom_camera_icp_bps_s_fmt,
+	.vidioc_g_selection = qcom_camera_icp_bps_g_selection,
+	.vidioc_s_selection = qcom_camera_icp_bps_s_selection,
 	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
