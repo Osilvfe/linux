@@ -824,14 +824,31 @@ qcom_camera_icp_bps_session_unmap_all(struct qcom_camera_icp_bps_session *sessio
 	return 0;
 }
 
-static int qcom_camera_icp_test_map(struct qcom_camera_icp_bps_session *session,
-				    bool map)
+static int
+qcom_camera_icp_bps_session_map_buffer(struct qcom_camera_icp_bps_session *session,
+				       struct qcom_camera_icp_bps_buffer *buffer)
 {
-	struct qcom_camera_icp *icp = session->icp;
+	int cleanup_ret;
+	int ret;
 
-	return qcom_camera_icp_bps_session_map(session,
-					icp->bps_test_buffer.iova,
-					icp->bps_test_buffer.size, map);
+	if (!buffer->cpu || !buffer->size)
+		return -EINVAL;
+	if (buffer->bps_size && buffer->bps_size != buffer->size)
+		return -EINVAL;
+
+	ret = qcom_camera_icp_bps_session_map(session, buffer->iova,
+					      buffer->size, true);
+	if (ret || !buffer->bps_size || buffer->bps_iova == buffer->iova)
+		return ret;
+
+	ret = qcom_camera_icp_bps_session_map(session, buffer->bps_iova,
+					      buffer->bps_size, true);
+	if (!ret)
+		return 0;
+
+	cleanup_ret = qcom_camera_icp_bps_session_map(session, buffer->iova,
+						      buffer->size, false);
+	return cleanup_ret ?: ret;
 }
 
 static bool
@@ -1040,7 +1057,8 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 	if (ret)
 		goto free_buffer;
 
-	ret = qcom_camera_icp_test_map(&session, true);
+	ret = qcom_camera_icp_bps_session_map_buffer(&session,
+					     &icp->bps_test_buffer);
 	if (ret)
 		goto close_session;
 
@@ -1200,12 +1218,8 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	ret = qcom_camera_icp_bps_session_create(&session);
 	if (ret)
 		goto free_buffer;
-	ret = qcom_camera_icp_test_map(&session, true);
-	if (ret)
-		goto close_session;
-	ret = qcom_camera_icp_bps_session_map(&session,
-				      icp->bps_test_buffer.bps_iova,
-				      icp->bps_test_buffer.bps_size, true);
+	ret = qcom_camera_icp_bps_session_map_buffer(&session,
+					     &icp->bps_test_buffer);
 	if (ret)
 		goto close_session;
 	ret = qcom_camera_icp_bps_session_config(&session,
