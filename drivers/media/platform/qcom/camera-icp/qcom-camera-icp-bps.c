@@ -347,6 +347,10 @@ static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
 	struct vb2_v4l2_buffer *buf;
 	int ret;
 
+	/* Do not tear down the firmware session under an in-flight work item. */
+	WRITE_ONCE(ctx->aborting, true);
+	flush_work(&ctx->work);
+
 	if (ctx->session) {
 		ret = service->ops->session_close(ctx->session);
 		if (ret)
