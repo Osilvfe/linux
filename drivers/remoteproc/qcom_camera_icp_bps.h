@@ -4,6 +4,7 @@
 #ifndef __QCOM_CAMERA_ICP_BPS_H__
 #define __QCOM_CAMERA_ICP_BPS_H__
 
+#include <linux/errno.h>
 #include <linux/types.h>
 
 #define QCOM_CAMERA_ICP_HFI_BPS_NON_RT		1
@@ -20,6 +21,18 @@
 #define QCOM_CAMERA_ICP_HFI_BPS_OUTPUT_IMAGE_FULL	1
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_FRAME_SETS		16
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_CDM_PROGRAMS	17
+#define QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT		8
+
+static inline int qcom_camera_icp_bps_encode_buffer(u64 iova, __le32 *encoded)
+{
+	if (iova & ((1U << QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT) - 1))
+		return -EINVAL;
+	if (iova >> QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT > U32_MAX)
+		return -ERANGE;
+
+	*encoded = cpu_to_le32(iova >> QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT);
+	return 0;
+}
 
 struct qcom_camera_icp_hfi_create_handle {
 	__le32 size;

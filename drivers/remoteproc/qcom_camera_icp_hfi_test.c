@@ -197,6 +197,22 @@ static void qcom_camera_icp_bps_abi_test(struct kunit *test)
 			sizeof(struct qcom_camera_icp_hfi_bps_frame_payload), 6128UL);
 }
 
+static void qcom_camera_icp_bps_buffer_address_test(struct kunit *test)
+{
+	__le32 encoded = 0;
+	int ret;
+
+	ret = qcom_camera_icp_bps_encode_buffer(0x08086000, &encoded);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(encoded), 0x00080860U);
+
+	ret = qcom_camera_icp_bps_encode_buffer(0x08086001, &encoded);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+
+	ret = qcom_camera_icp_bps_encode_buffer(1ULL << 40, &encoded);
+	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
+}
+
 static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_layout_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_region_layout_test),
@@ -205,6 +221,7 @@ static struct kunit_case qcom_camera_icp_hfi_test_cases[] = {
 	KUNIT_CASE(qcom_camera_icp_hfi_read_wrap_test),
 	KUNIT_CASE(qcom_camera_icp_hfi_bad_packet_test),
 	KUNIT_CASE(qcom_camera_icp_bps_abi_test),
+	KUNIT_CASE(qcom_camera_icp_bps_buffer_address_test),
 	{}
 };
 

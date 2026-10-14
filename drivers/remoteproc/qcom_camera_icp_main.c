@@ -991,21 +991,26 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		offsetof(struct qcom_camera_icp_hfi_bps_frame_payload,
 			 cdm_allocator));
 	payload->frame.data.num_frame_sets = cpu_to_le32(test_bps_batch);
-	/* BPS frame-buffer addresses use 256-byte units in the striping ABI. */
-	payload->frame.data.frame_set[0].buffer[0].buffer[0] =
-		cpu_to_le32((bps_base + CAMERA_ICP_BPS_FRAME_INPUT_OFFSET) >> 8);
-	payload->frame.data.frame_set[0].buffer[1].buffer[0] =
-		cpu_to_le32((bps_base + CAMERA_ICP_BPS_FRAME_OUTPUT_Y_OFFSET) >> 8);
-	payload->frame.data.frame_set[0].buffer[1].buffer[1] =
-		cpu_to_le32((bps_base + CAMERA_ICP_BPS_FRAME_OUTPUT_C_OFFSET) >> 8);
-	payload->frame.data.frame_set[1].buffer[0].buffer[0] =
-		cpu_to_le32((bps_base + CAMERA_ICP_BPS_FRAME_INPUT_2_OFFSET) >> 8);
-	payload->frame.data.frame_set[1].buffer[1].buffer[0] =
-		cpu_to_le32((bps_base +
-			       CAMERA_ICP_BPS_FRAME_OUTPUT_Y_2_OFFSET) >> 8);
-	payload->frame.data.frame_set[1].buffer[1].buffer[1] =
-		cpu_to_le32((bps_base +
-			       CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET) >> 8);
+	ret = qcom_camera_icp_bps_encode_buffer(bps_base +
+			CAMERA_ICP_BPS_FRAME_INPUT_OFFSET,
+			&payload->frame.data.frame_set[0].buffer[0].buffer[0]);
+	ret |= qcom_camera_icp_bps_encode_buffer(bps_base +
+			 CAMERA_ICP_BPS_FRAME_OUTPUT_Y_OFFSET,
+			 &payload->frame.data.frame_set[0].buffer[1].buffer[0]);
+	ret |= qcom_camera_icp_bps_encode_buffer(bps_base +
+			 CAMERA_ICP_BPS_FRAME_OUTPUT_C_OFFSET,
+			 &payload->frame.data.frame_set[0].buffer[1].buffer[1]);
+	ret |= qcom_camera_icp_bps_encode_buffer(bps_base +
+			 CAMERA_ICP_BPS_FRAME_INPUT_2_OFFSET,
+			 &payload->frame.data.frame_set[1].buffer[0].buffer[0]);
+	ret |= qcom_camera_icp_bps_encode_buffer(bps_base +
+			 CAMERA_ICP_BPS_FRAME_OUTPUT_Y_2_OFFSET,
+			 &payload->frame.data.frame_set[1].buffer[1].buffer[0]);
+	ret |= qcom_camera_icp_bps_encode_buffer(bps_base +
+			 CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET,
+			 &payload->frame.data.frame_set[1].buffer[1].buffer[1]);
+	if (ret)
+		goto unmap_alias;
 	payload->frame.user_data = cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
 					      QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	dma_wmb();
