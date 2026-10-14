@@ -16,7 +16,6 @@
 #include <media/videobuf2-dma-sg.h>
 
 #define QCOM_CAMERA_ICP_BPS_NAME	"qcom-camera-icp-bps"
-#define V4L2_PIX_FMT_QCOM_TP10		v4l2_fourcc('Q', 'T', '1', '0')
 #define QCOM_CAMERA_ICP_BPS_INPUT_IOVA	0x08000000
 #define QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA 0x08100000
 #define QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA 0x08200000
@@ -32,7 +31,28 @@ struct qcom_camera_icp_bps_fmt {
 	u32 height;
 	u32 bytesperline[2];
 	u32 sizeimage[2];
+	enum v4l2_colorspace colorspace;
 	u8 num_planes;
+};
+
+static const struct qcom_camera_icp_bps_fmt qcom_camera_icp_bps_output_fmt = {
+	.pixelformat = V4L2_PIX_FMT_SBGGR10P,
+	.width = 640,
+	.height = 480,
+	.bytesperline = { 832 },
+	.sizeimage = { 832 * 480 },
+	.colorspace = V4L2_COLORSPACE_RAW,
+	.num_planes = 1,
+};
+
+static const struct qcom_camera_icp_bps_fmt qcom_camera_icp_bps_capture_fmt = {
+	.pixelformat = V4L2_PIX_FMT_TP10,
+	.width = 640,
+	.height = 480,
+	.bytesperline = { 896, 896 },
+	.sizeimage = { 896 * 480, 896 * 240 },
+	.colorspace = V4L2_COLORSPACE_DEFAULT,
+	.num_planes = 2,
 };
 
 struct qcom_camera_icp_bps_dev {
@@ -103,21 +123,19 @@ static void qcom_camera_icp_bps_abort_session(
 static void
 qcom_camera_icp_bps_default_formats(struct qcom_camera_icp_bps_ctx *ctx)
 {
-	ctx->output.pixelformat = V4L2_PIX_FMT_SBGGR10P;
-	ctx->output.width = 640;
-	ctx->output.height = 480;
-	ctx->output.num_planes = 1;
-	ctx->output.bytesperline[0] = 832;
-	ctx->output.sizeimage[0] = 832 * 480;
+	ctx->output = qcom_camera_icp_bps_output_fmt;
+	ctx->capture = qcom_camera_icp_bps_capture_fmt;
+}
 
-	ctx->capture.pixelformat = V4L2_PIX_FMT_QCOM_TP10;
-	ctx->capture.width = 640;
-	ctx->capture.height = 480;
-	ctx->capture.num_planes = 2;
-	ctx->capture.bytesperline[0] = 896;
-	ctx->capture.bytesperline[1] = 896;
-	ctx->capture.sizeimage[0] = 896 * 480;
-	ctx->capture.sizeimage[1] = 896 * 240;
+static const struct qcom_camera_icp_bps_fmt *
+qcom_camera_icp_bps_get_default_fmt(u32 type)
+{
+	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+		return &qcom_camera_icp_bps_output_fmt;
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		return &qcom_camera_icp_bps_capture_fmt;
+
+	return NULL;
 }
 
 static struct qcom_camera_icp_bps_fmt *
@@ -150,10 +168,29 @@ static int qcom_camera_icp_bps_enum_fmt(struct file *file, void *fh,
 
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 		f->pixelformat = V4L2_PIX_FMT_SBGGR10P;
-	else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
-		f->pixelformat = V4L2_PIX_FMT_QCOM_TP10;
+	else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		f->pixelformat = V4L2_PIX_FMT_TP10;
+		strscpy(f->description, "Qualcomm TP10",
+			sizeof(f->description));
+	}
 	else
 		return -EINVAL;
+
+	return 0;
+}
+
+static int qcom_camera_icp_bps_enum_framesizes(
+	struct file *file, void *fh, struct v4l2_frmsizeenum *fsize)
+{
+	if (fsize->index)
+		return -EINVAL;
+	if (fsize->pixel_format != V4L2_PIX_FMT_SBGGR10P &&
+	    fsize->pixel_format != V4L2_PIX_FMT_TP10)
+		return -EINVAL;
+
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+	fsize->discrete.width = 640;
+	fsize->discrete.height = 480;
 
 	return 0;
 }
@@ -164,11 +201,12 @@ qcom_camera_icp_bps_fill_pix_mp(struct v4l2_pix_format_mplane *pix,
 {
 	unsigned int i;
 
+	memset(pix, 0, sizeof(*pix));
 	pix->width = fmt->width;
 	pix->height = fmt->height;
 	pix->pixelformat = fmt->pixelformat;
 	pix->field = V4L2_FIELD_NONE;
-	pix->colorspace = V4L2_COLORSPACE_RAW;
+	pix->colorspace = fmt->colorspace;
 	pix->num_planes = fmt->num_planes;
 	for (i = 0; i < fmt->num_planes; i++) {
 		pix->plane_fmt[i].bytesperline = fmt->bytesperline[i];
@@ -179,9 +217,11 @@ qcom_camera_icp_bps_fill_pix_mp(struct v4l2_pix_format_mplane *pix,
 static int qcom_camera_icp_bps_g_fmt(struct file *file, void *fh,
 				    struct v4l2_format *f)
 {
-	struct qcom_camera_icp_bps_ctx *ctx = fh;
-	struct qcom_camera_icp_bps_fmt *fmt;
+	struct qcom_camera_icp_bps_ctx *ctx;
+	const struct qcom_camera_icp_bps_fmt *fmt;
 
+	ctx = container_of(file->private_data,
+			   struct qcom_camera_icp_bps_ctx, fh);
 	fmt = qcom_camera_icp_bps_get_fmt(ctx, f->type);
 	if (!fmt)
 		return -EINVAL;
@@ -193,10 +233,10 @@ static int qcom_camera_icp_bps_g_fmt(struct file *file, void *fh,
 static int qcom_camera_icp_bps_try_fmt(struct file *file, void *fh,
 				      struct v4l2_format *f)
 {
-	struct qcom_camera_icp_bps_ctx *ctx = fh;
-	struct qcom_camera_icp_bps_fmt *fmt;
+	const struct qcom_camera_icp_bps_fmt *fmt;
 
-	fmt = qcom_camera_icp_bps_get_fmt(ctx, f->type);
+	/* TRY_FMT is also valid before a file handle exists. */
+	fmt = qcom_camera_icp_bps_get_default_fmt(f->type);
 	if (!fmt)
 		return -EINVAL;
 	qcom_camera_icp_bps_fill_pix_mp(&f->fmt.pix_mp, fmt);
@@ -207,8 +247,14 @@ static int qcom_camera_icp_bps_try_fmt(struct file *file, void *fh,
 static int qcom_camera_icp_bps_s_fmt(struct file *file, void *fh,
 				    struct v4l2_format *f)
 {
-	struct qcom_camera_icp_bps_ctx *ctx = fh;
+	struct qcom_camera_icp_bps_ctx *ctx;
+	const struct qcom_camera_icp_bps_fmt *default_fmt;
+	struct qcom_camera_icp_bps_fmt *fmt;
 	struct vb2_queue *vq;
+	int ret;
+
+	ctx = container_of(file->private_data,
+			   struct qcom_camera_icp_bps_ctx, fh);
 
 	vq = v4l2_m2m_get_vq(ctx->m2m_ctx, f->type);
 	if (!vq)
@@ -216,7 +262,14 @@ static int qcom_camera_icp_bps_s_fmt(struct file *file, void *fh,
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 
-	return qcom_camera_icp_bps_try_fmt(file, fh, f);
+	ret = qcom_camera_icp_bps_try_fmt(file, fh, f);
+	if (ret)
+		return ret;
+	default_fmt = qcom_camera_icp_bps_get_default_fmt(f->type);
+	fmt = qcom_camera_icp_bps_get_fmt(ctx, f->type);
+	*fmt = *default_fmt;
+
+	return 0;
 }
 
 static int qcom_camera_icp_bps_queue_setup(struct vb2_queue *vq,
@@ -367,8 +420,9 @@ static void qcom_camera_icp_bps_device_work(struct work_struct *work)
 	struct sg_table *sgt[3];
 	dma_addr_t alias_iova[3] = { job.input_iova, job.output_y_iova,
 				     job.output_c_iova };
-	size_t size[3] = { PAGE_ALIGN(832 * 480), PAGE_ALIGN(896 * 480),
-			   PAGE_ALIGN(896 * 240) };
+	size_t size[3] = { PAGE_ALIGN(ctx->output.sizeimage[0]),
+			   PAGE_ALIGN(ctx->capture.sizeimage[0]),
+			   PAGE_ALIGN(ctx->capture.sizeimage[1]) };
 	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
 	unsigned int alias_count = 0;
 	unsigned int map_count = 0;
@@ -539,6 +593,7 @@ static const struct v4l2_ioctl_ops qcom_camera_icp_bps_ioctl_ops = {
 	.vidioc_querycap = qcom_camera_icp_bps_querycap,
 	.vidioc_enum_fmt_vid_cap = qcom_camera_icp_bps_enum_fmt,
 	.vidioc_enum_fmt_vid_out = qcom_camera_icp_bps_enum_fmt,
+	.vidioc_enum_framesizes = qcom_camera_icp_bps_enum_framesizes,
 	.vidioc_g_fmt_vid_cap_mplane = qcom_camera_icp_bps_g_fmt,
 	.vidioc_g_fmt_vid_out_mplane = qcom_camera_icp_bps_g_fmt,
 	.vidioc_try_fmt_vid_cap_mplane = qcom_camera_icp_bps_try_fmt,
