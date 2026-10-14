@@ -744,6 +744,16 @@ qcom_camera_icp_bps_session_create(struct qcom_camera_icp_bps_session *session)
 }
 
 static int
+qcom_camera_icp_bps_session_open(struct qcom_camera_icp *icp,
+				 struct qcom_camera_icp_bps_session *session)
+{
+	memset(session, 0, sizeof(*session));
+	session->icp = icp;
+
+	return qcom_camera_icp_bps_session_create(session);
+}
+
+static int
 qcom_camera_icp_bps_session_map(struct qcom_camera_icp_bps_session *session,
 				dma_addr_t iova, size_t size, bool map)
 {
@@ -1024,7 +1034,7 @@ qcom_camera_icp_init_bps_config(struct qcom_camera_icp *icp,
 
 static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 {
-	struct qcom_camera_icp_bps_session session = { .icp = icp };
+	struct qcom_camera_icp_bps_session session;
 	struct qcom_camera_icp_hfi_bps_config *config;
 	int cleanup_ret;
 	int ret;
@@ -1053,7 +1063,7 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 	qcom_camera_icp_init_bps_config(icp, config);
 	dma_wmb();
 
-	ret = qcom_camera_icp_bps_session_create(&session);
+	ret = qcom_camera_icp_bps_session_open(icp, &session);
 	if (ret)
 		goto free_buffer;
 
@@ -1085,7 +1095,7 @@ free_buffer:
 static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 {
 	const struct firmware *striping_firmware;
-	struct qcom_camera_icp_bps_session session = { .icp = icp };
+	struct qcom_camera_icp_bps_session session;
 	struct qcom_camera_icp_hfi_bps_frame_payload *payload;
 	struct qcom_camera_icp_hfi_bps_config *config;
 	dma_addr_t bps_base;
@@ -1215,7 +1225,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	payload->frame.user_data = cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
 					      QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
 	dma_wmb();
-	ret = qcom_camera_icp_bps_session_create(&session);
+	ret = qcom_camera_icp_bps_session_open(icp, &session);
 	if (ret)
 		goto free_buffer;
 	ret = qcom_camera_icp_bps_session_map_buffer(&session,
