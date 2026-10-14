@@ -1075,6 +1075,15 @@ static int qcom_camera_icp_bps_client_session_close(
 	return ret;
 }
 
+static void qcom_camera_icp_bps_client_session_abort(
+	struct qcom_camera_icp_bps_session *session)
+{
+	if (session->work_cpu)
+		dma_free_coherent(session->icp->dev, session->work_size,
+				  session->work_cpu, session->work_iova);
+	kfree(session);
+}
+
 static int qcom_camera_icp_bps_client_session_map(
 	struct qcom_camera_icp_bps_session *session, dma_addr_t iova, size_t size)
 {
@@ -1270,6 +1279,7 @@ static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 	.power_off = qcom_camera_icp_bps_power_off,
 	.session_open = qcom_camera_icp_bps_client_session_open,
 	.session_close = qcom_camera_icp_bps_client_session_close,
+	.session_abort = qcom_camera_icp_bps_client_session_abort,
 	.session_map = qcom_camera_icp_bps_client_session_map,
 	.session_unmap = qcom_camera_icp_bps_client_session_unmap,
 	.session_config = qcom_camera_icp_bps_session_config,

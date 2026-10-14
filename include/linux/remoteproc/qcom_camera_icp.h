@@ -23,6 +23,7 @@ struct qcom_camera_icp_bps_ops {
 	struct qcom_camera_icp_bps_session *
 		(*session_open)(struct qcom_camera_icp_bps *bps);
 	int (*session_close)(struct qcom_camera_icp_bps_session *session);
+	void (*session_abort)(struct qcom_camera_icp_bps_session *session);
 	int (*session_map)(struct qcom_camera_icp_bps_session *session,
 			   dma_addr_t iova, size_t size);
 	int (*session_unmap)(struct qcom_camera_icp_bps_session *session,
