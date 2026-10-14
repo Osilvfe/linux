@@ -23,6 +23,10 @@ struct qcom_camera_icp_bps_ops {
 			      dma_addr_t payload_iova);
 	int (*session_submit)(struct qcom_camera_icp_bps_session *session,
 			      dma_addr_t payload_iova, u64 request_id);
+	int (*alias_map)(struct qcom_camera_icp_bps *bps, dma_addr_t source_iova,
+			 dma_addr_t bps_iova, size_t size);
+	void (*alias_unmap)(struct qcom_camera_icp_bps *bps, dma_addr_t bps_iova,
+			    size_t size);
 };
 
 struct qcom_camera_icp_bps {

@@ -1066,6 +1066,31 @@ static int qcom_camera_icp_bps_client_session_unmap(
 	return qcom_camera_icp_bps_session_map(session, iova, size, false);
 }
 
+static int qcom_camera_icp_bps_client_alias_map(
+	struct qcom_camera_icp_bps *bps, dma_addr_t source_iova,
+	dma_addr_t bps_iova, size_t size)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+	struct qcom_camera_icp_bps_buffer buffer = {
+		.iova = source_iova,
+		.size = size,
+	};
+
+	return qcom_camera_icp_bps_buffer_map(icp, &buffer, bps_iova);
+}
+
+static void qcom_camera_icp_bps_client_alias_unmap(
+	struct qcom_camera_icp_bps *bps, dma_addr_t bps_iova, size_t size)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+	struct qcom_camera_icp_bps_buffer buffer = {
+		.bps_iova = bps_iova,
+		.bps_size = size,
+	};
+
+	qcom_camera_icp_bps_buffer_unmap(icp, &buffer);
+}
+
 static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 	.power_on = qcom_camera_icp_bps_power_on,
 	.power_off = qcom_camera_icp_bps_power_off,
@@ -1075,6 +1100,8 @@ static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 	.session_unmap = qcom_camera_icp_bps_client_session_unmap,
 	.session_config = qcom_camera_icp_bps_session_config,
 	.session_submit = qcom_camera_icp_bps_session_submit,
+	.alias_map = qcom_camera_icp_bps_client_alias_map,
+	.alias_unmap = qcom_camera_icp_bps_client_alias_unmap,
 };
 
 static void
