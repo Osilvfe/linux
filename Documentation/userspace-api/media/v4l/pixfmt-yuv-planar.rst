@@ -138,6 +138,13 @@ All components are stored with the same number of bits per component.
       - Cb, Cr
       - No
       - Linear
+    * - V4L2_PIX_FMT_TP10
+      - 'TP10'
+      - 10
+      - 4:2:0
+      - Cb, Cr
+      - No
+      - Linear, 3 components in 32 bits
     * - V4L2_PIX_FMT_NV15
       - 'NV15'
       - 10
@@ -955,6 +962,19 @@ Data in the 12 high bits, zeros in the 4 low bits, arranged in little endian ord
       - Cr\ :sub:`10`
       - Cb\ :sub:`11`
       - Cr\ :sub:`11`
+
+.. _V4L2-PIX-FMT-TP10:
+
+TP10
+----
+
+TP10 is a Qualcomm semi-planar 4:2:0 format with two non-contiguous memory
+planes. The first plane contains Y components and the second plane contains
+interleaved Cb and Cr components. Three consecutive 10-bit components are
+stored in bits 0-29 of each little-endian 32-bit word, with bits 30-31 holding
+unspecified padding values. The bytesperline value for both planes is therefore
+at least ``DIV_ROUND_UP(width, 3) * 4``. The chroma plane contains half as many
+lines as the luma plane.
 
 
 Fully Planar YUV Formats
