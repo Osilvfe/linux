@@ -750,6 +750,17 @@ static int qcom_camera_icp_test_config_bps(struct qcom_camera_icp *icp)
 			QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO, token);
 }
 
+static int qcom_camera_icp_send_bps_frame(
+	struct qcom_camera_icp *icp,
+	const struct qcom_camera_icp_hfi_async_indirect *command)
+{
+	return qcom_camera_icp_send_sync(icp, command, sizeof(*command),
+		CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
+		QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
+		CAMERA_ICP_HFI_TEST_TOKEN_BASE +
+		QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+}
+
 static int qcom_camera_icp_test_destroy_bps(struct qcom_camera_icp *icp)
 {
 	const u64 token = CAMERA_ICP_HFI_TEST_TOKEN_BASE +
@@ -1083,12 +1094,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		command.user_data2 = cpu_to_le64(frame + 1);
 		dma_wmb();
 
-		ret = qcom_camera_icp_send_sync(
-			icp, &command, sizeof(command),
-			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_INDIRECT_ACK,
-			QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS,
-			CAMERA_ICP_HFI_TEST_TOKEN_BASE +
-			QCOM_CAMERA_ICP_HFI_BPS_FRAME_PROCESS);
+		ret = qcom_camera_icp_send_bps_frame(icp, &command);
 		if (ret)
 			break;
 
