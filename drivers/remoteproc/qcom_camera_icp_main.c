@@ -196,6 +196,14 @@ struct qcom_camera_icp_bps_session {
 	bool configured;
 };
 
+struct qcom_camera_icp_bps_buffer {
+	void *cpu;
+	dma_addr_t iova;
+	size_t size;
+	dma_addr_t bps_iova;
+	size_t bps_size;
+};
+
 struct qcom_camera_icp_hfi_mem_region {
 	__le32 id;
 	__le32 type;
@@ -267,11 +275,7 @@ struct qcom_camera_icp {
 	u32 hfi_command_error;
 	u32 hfi_command_result;
 	u32 hfi_command_handle;
-	void *hfi_test_buffer;
-	dma_addr_t hfi_test_buffer_iova;
-	size_t hfi_test_buffer_size;
-	dma_addr_t hfi_test_fw_iova;
-	size_t hfi_test_fw_iova_size;
+	struct qcom_camera_icp_bps_buffer bps_test_buffer;
 	bool hfi_ready;
 
 	void __iomem *mem_region;
@@ -298,36 +302,39 @@ static int qcom_camera_icp_map(struct qcom_camera_icp *icp, dma_addr_t iova,
 	return 0;
 }
 
-static void qcom_camera_icp_unmap_test_alias(struct qcom_camera_icp *icp)
+static void qcom_camera_icp_bps_buffer_unmap(struct qcom_camera_icp *icp,
+				     struct qcom_camera_icp_bps_buffer *buffer)
 {
 	size_t unmapped;
 
-	if (!icp->hfi_test_fw_iova_size)
+	if (!buffer->bps_size)
 		return;
 
-	unmapped = iommu_unmap(icp->domain, icp->hfi_test_fw_iova,
-			     icp->hfi_test_fw_iova_size);
-	if (unmapped != icp->hfi_test_fw_iova_size)
-		dev_warn(icp->dev, "only unmapped %zu of %zu test bytes at %pad\n",
-			 unmapped, icp->hfi_test_fw_iova_size,
-			 &icp->hfi_test_fw_iova);
+	unmapped = iommu_unmap(icp->domain, buffer->bps_iova, buffer->bps_size);
+	if (unmapped != buffer->bps_size)
+		dev_warn(icp->dev, "only unmapped %zu of %zu BPS bytes at %pad\n",
+			 unmapped, buffer->bps_size, &buffer->bps_iova);
 
-	icp->hfi_test_fw_iova = 0;
-	icp->hfi_test_fw_iova_size = 0;
+	buffer->bps_iova = 0;
+	buffer->bps_size = 0;
 }
 
-static int qcom_camera_icp_map_test_alias(struct qcom_camera_icp *icp)
+static int qcom_camera_icp_bps_buffer_map(struct qcom_camera_icp *icp,
+				   struct qcom_camera_icp_bps_buffer *buffer,
+				   dma_addr_t bps_iova)
 {
-	dma_addr_t source_iova = icp->hfi_test_buffer_iova;
+	dma_addr_t source_iova = buffer->iova;
 	size_t mapped = 0;
 	phys_addr_t phys;
 	int ret;
 
 	if (!IS_ALIGNED(source_iova, PAGE_SIZE) ||
-	    !IS_ALIGNED(icp->hfi_test_buffer_size, PAGE_SIZE))
+	    !IS_ALIGNED(bps_iova, PAGE_SIZE) ||
+	    !IS_ALIGNED(buffer->size, PAGE_SIZE) || buffer->bps_size ||
+	    bps_iova > U32_MAX - (buffer->size - 1))
 		return -EINVAL;
 
-	while (mapped < icp->hfi_test_buffer_size) {
+	while (mapped < buffer->size) {
 		phys = iommu_iova_to_phys(icp->domain, source_iova + mapped);
 		if (!phys) {
 			ret = -EFAULT;
@@ -338,7 +345,7 @@ static int qcom_camera_icp_map_test_alias(struct qcom_camera_icp *icp)
 			goto unmap;
 		}
 
-		ret = iommu_map(icp->domain, CAMERA_ICP_BPS_FRAME_IOVA + mapped,
+		ret = iommu_map(icp->domain, bps_iova + mapped,
 				phys, PAGE_SIZE, IOMMU_READ | IOMMU_WRITE,
 				GFP_KERNEL);
 		if (ret)
@@ -346,20 +353,51 @@ static int qcom_camera_icp_map_test_alias(struct qcom_camera_icp *icp)
 		mapped += PAGE_SIZE;
 	}
 
-	icp->hfi_test_fw_iova = CAMERA_ICP_BPS_FRAME_IOVA;
-	icp->hfi_test_fw_iova_size = mapped;
+	buffer->bps_iova = bps_iova;
+	buffer->bps_size = mapped;
 	return 0;
 
 unmap:
 	if (mapped)
-		iommu_unmap(icp->domain, CAMERA_ICP_BPS_FRAME_IOVA, mapped);
+		iommu_unmap(icp->domain, bps_iova, mapped);
 	return ret;
+}
+
+static int qcom_camera_icp_bps_buffer_alloc(struct qcom_camera_icp *icp,
+				     struct qcom_camera_icp_bps_buffer *buffer,
+				     size_t size)
+{
+	if (!size || buffer->cpu)
+		return -EINVAL;
+
+	buffer->cpu = dma_alloc_coherent(icp->dev, size, &buffer->iova,
+					 GFP_KERNEL | GFP_DMA32);
+	if (!buffer->cpu)
+		return -ENOMEM;
+	buffer->size = size;
+
+	if (buffer->iova > U32_MAX - (size - 1)) {
+		dma_free_coherent(icp->dev, buffer->size, buffer->cpu,
+				  buffer->iova);
+		memset(buffer, 0, sizeof(*buffer));
+		return -ERANGE;
+	}
+
+	return 0;
+}
+
+static void qcom_camera_icp_bps_buffer_free(struct qcom_camera_icp *icp,
+				      struct qcom_camera_icp_bps_buffer *buffer)
+{
+	qcom_camera_icp_bps_buffer_unmap(icp, buffer);
+	if (buffer->cpu)
+		dma_free_coherent(icp->dev, buffer->size, buffer->cpu,
+				  buffer->iova);
+	memset(buffer, 0, sizeof(*buffer));
 }
 
 static void qcom_camera_icp_unprepare_hfi(struct qcom_camera_icp *icp)
 {
-	qcom_camera_icp_unmap_test_alias(icp);
-
 	while (icp->mapping_count) {
 		struct qcom_camera_icp_mapping *mapping;
 		size_t unmapped;
@@ -370,14 +408,7 @@ static void qcom_camera_icp_unprepare_hfi(struct qcom_camera_icp *icp)
 			dev_warn(icp->dev, "only unmapped %zu of %zu bytes at %pad\n",
 				 unmapped, mapping->size, &mapping->iova);
 	}
-	if (icp->hfi_test_buffer) {
-		dma_free_coherent(icp->dev, icp->hfi_test_buffer_size,
-				  icp->hfi_test_buffer,
-				  icp->hfi_test_buffer_iova);
-		icp->hfi_test_buffer = NULL;
-		icp->hfi_test_buffer_iova = 0;
-		icp->hfi_test_buffer_size = 0;
-	}
+	qcom_camera_icp_bps_buffer_free(icp, &icp->bps_test_buffer);
 
 	if (icp->hfi_region.base) {
 		dma_free_coherent(icp->dev, icp->hfi_region.size,
@@ -793,8 +824,8 @@ static int qcom_camera_icp_test_map(struct qcom_camera_icp_bps_session *session,
 	struct qcom_camera_icp *icp = session->icp;
 
 	return qcom_camera_icp_bps_session_map(session,
-					icp->hfi_test_buffer_iova,
-					icp->hfi_test_buffer_size, map);
+					icp->bps_test_buffer.iova,
+					icp->bps_test_buffer.size, map);
 }
 
 static int
@@ -954,19 +985,13 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 	    !IS_ALIGNED(test_bps_height, 2))
 		return -EINVAL;
 
-	icp->hfi_test_buffer_size = PAGE_SIZE;
-	icp->hfi_test_buffer = dma_alloc_coherent(icp->dev,
-						  icp->hfi_test_buffer_size,
-						  &icp->hfi_test_buffer_iova,
-						  GFP_KERNEL | GFP_DMA32);
-	if (!icp->hfi_test_buffer)
-		return -ENOMEM;
-	if (icp->hfi_test_buffer_iova > U32_MAX -
-					     (icp->hfi_test_buffer_size - 1))
-		return -ERANGE;
+	ret = qcom_camera_icp_bps_buffer_alloc(icp, &icp->bps_test_buffer,
+					       PAGE_SIZE);
+	if (ret)
+		return ret;
 
-	config = icp->hfi_test_buffer;
-	memset(config, 0, icp->hfi_test_buffer_size);
+	config = icp->bps_test_buffer.cpu;
+	memset(config, 0, icp->bps_test_buffer.size);
 	qcom_camera_icp_init_bps_config(icp, config);
 	dma_wmb();
 
@@ -979,7 +1004,7 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 		return ret;
 
 	ret = qcom_camera_icp_bps_session_config(&session,
-					icp->hfi_test_buffer_iova);
+					icp->bps_test_buffer.iova);
 	if (ret == -ETIMEDOUT)
 		return ret;
 
@@ -991,11 +1016,7 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 	if (cleanup_ret)
 		return cleanup_ret;
 
-	dma_free_coherent(icp->dev, icp->hfi_test_buffer_size,
-			  icp->hfi_test_buffer, icp->hfi_test_buffer_iova);
-	icp->hfi_test_buffer = NULL;
-	icp->hfi_test_buffer_iova = 0;
-	icp->hfi_test_buffer_size = 0;
+	qcom_camera_icp_bps_buffer_free(icp, &icp->bps_test_buffer);
 
 	if (ret)
 		return ret;
@@ -1077,40 +1098,31 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		goto release_firmware;
 	}
 
-	icp->hfi_test_buffer_size = CAMERA_ICP_BPS_FRAME_BUFFER_SIZE;
-	icp->hfi_test_buffer = dma_alloc_coherent(icp->dev,
-						  icp->hfi_test_buffer_size,
-						  &icp->hfi_test_buffer_iova,
-						  GFP_KERNEL | GFP_DMA32);
-	if (!icp->hfi_test_buffer) {
-		ret = -ENOMEM;
-		goto release_firmware;
-	}
-	if (icp->hfi_test_buffer_iova > U32_MAX -
-					     (icp->hfi_test_buffer_size - 1)) {
-		ret = -ERANGE;
+	ret = qcom_camera_icp_bps_buffer_alloc(icp, &icp->bps_test_buffer,
+				 CAMERA_ICP_BPS_FRAME_BUFFER_SIZE);
+	if (ret)
 		goto free_buffer;
-	}
-	ret = qcom_camera_icp_map_test_alias(icp);
+	ret = qcom_camera_icp_bps_buffer_map(icp, &icp->bps_test_buffer,
+					     CAMERA_ICP_BPS_FRAME_IOVA);
 	if (ret)
 		goto free_buffer;
 
-	memset(icp->hfi_test_buffer, 0, icp->hfi_test_buffer_size);
-	bps_base = icp->hfi_test_fw_iova;
-	fw_base = icp->hfi_test_buffer_iova;
-	config = icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET;
-	payload = icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET;
-	input = icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_INPUT_OFFSET;
-	input_2 = icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_INPUT_2_OFFSET;
-	output_y = icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_OUTPUT_Y_OFFSET;
-	output_y_2 = icp->hfi_test_buffer +
+	memset(icp->bps_test_buffer.cpu, 0, icp->bps_test_buffer.size);
+	bps_base = icp->bps_test_buffer.bps_iova;
+	fw_base = icp->bps_test_buffer.iova;
+	config = icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET;
+	payload = icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET;
+	input = icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_INPUT_OFFSET;
+	input_2 = icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_INPUT_2_OFFSET;
+	output_y = icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_OUTPUT_Y_OFFSET;
+	output_y_2 = icp->bps_test_buffer.cpu +
 		CAMERA_ICP_BPS_FRAME_OUTPUT_Y_2_OFFSET;
-	output_c = icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_OUTPUT_C_OFFSET;
-	output_c_2 = icp->hfi_test_buffer +
+	output_c = icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_OUTPUT_C_OFFSET;
+	output_c_2 = icp->bps_test_buffer.cpu +
 		CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET;
 
 	qcom_camera_icp_init_bps_config(icp, config);
-	memcpy(icp->hfi_test_buffer + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
+	memcpy(icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
 	       striping_firmware->data, striping_firmware->size);
 	payload->frame.data.max_cores = cpu_to_le32(1);
 	payload->frame.data.cdm_iova =
@@ -1158,13 +1170,13 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		goto destroy_handle;
 	mapped = true;
 	ret = qcom_camera_icp_bps_session_map(&session,
-				      icp->hfi_test_fw_iova,
-				      icp->hfi_test_fw_iova_size, true);
+				      icp->bps_test_buffer.bps_iova,
+				      icp->bps_test_buffer.bps_size, true);
 	if (ret)
 		goto unmap_buffer;
 	alias_mapped = true;
 	ret = qcom_camera_icp_bps_session_config(&session,
-					icp->hfi_test_buffer_iova);
+					icp->bps_test_buffer.iova);
 	if (ret == -ETIMEDOUT)
 		goto release_firmware;
 	if (ret)
@@ -1201,7 +1213,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		dma_wmb();
 
 		ret = qcom_camera_icp_bps_session_submit(&session,
-			icp->hfi_test_buffer_iova +
+			icp->bps_test_buffer.iova +
 			CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET, frame + 1);
 		if (ret)
 			break;
@@ -1239,13 +1251,8 @@ destroy_handle:
 			ret = cleanup_ret;
 	}
 unmap_alias:
-	qcom_camera_icp_unmap_test_alias(icp);
 free_buffer:
-	dma_free_coherent(icp->dev, icp->hfi_test_buffer_size,
-			  icp->hfi_test_buffer, icp->hfi_test_buffer_iova);
-	icp->hfi_test_buffer = NULL;
-	icp->hfi_test_buffer_iova = 0;
-	icp->hfi_test_buffer_size = 0;
+	qcom_camera_icp_bps_buffer_free(icp, &icp->bps_test_buffer);
 release_firmware:
 	release_firmware(striping_firmware);
 	if (!ret)
