@@ -33,8 +33,9 @@
 #include "qcom_camera_icp_bps.h"
 
 #define CAMERA_ICP_FIRMWARE	"qcom/sm8650/CAMERA_ICP.mbn"
-#define CAMERA_ICP_BPS_STRIPING_FIRMWARE \
-	"qcom/sm8650/bps-striping-640x480.bin"
+#define CAMERA_ICP_BPS_STRIPING_FIRMWARE_FMT \
+	"qcom/sm8650/bps-striping-%ux%u.bin"
+#define CAMERA_ICP_BPS_TEST_STRIPING_FIRMWARE "qcom/sm8650/bps-striping-640x480.bin"
 #define CAMERA_ICP_PAS_ID	33
 #define CAMERA_ICP_RATE		400000000UL
 #define CAMERA_ICP_SLOW_AHB_RATE	80000000UL
@@ -294,6 +295,7 @@ struct qcom_camera_icp {
 
 static void qcom_camera_icp_init_bps_config(
 	struct qcom_camera_icp *icp,
+	const struct qcom_camera_icp_bps_config *client_config,
 	struct qcom_camera_icp_hfi_bps_config *config);
 
 static int qcom_camera_icp_map(struct qcom_camera_icp *icp, dma_addr_t iova,
@@ -1172,26 +1174,36 @@ static void qcom_camera_icp_bps_client_alias_unmap(
 }
 
 static int qcom_camera_icp_bps_client_session_prepare(
-	struct qcom_camera_icp_bps_session *session)
+	struct qcom_camera_icp_bps_session *session,
+	const struct qcom_camera_icp_bps_config *client_config)
 {
 	const struct firmware *striping_firmware;
 	struct qcom_camera_icp_hfi_bps_frame_payload *payload;
 	struct qcom_camera_icp_hfi_bps_config *config;
 	struct qcom_camera_icp *icp = session->icp;
+	char striping_name[64];
+	size_t cdm_offset;
 	int ret;
 
-	if (session->work_cpu)
-		return -EBUSY;
-	ret = request_firmware(&striping_firmware,
-			       CAMERA_ICP_BPS_STRIPING_FIRMWARE, icp->dev);
+	if (session->work_cpu || !client_config || !client_config->width ||
+	    !client_config->height || !client_config->input_stride ||
+	    !client_config->output_stride)
+		return -EINVAL;
+	snprintf(striping_name, sizeof(striping_name),
+		 CAMERA_ICP_BPS_STRIPING_FIRMWARE_FMT,
+		 client_config->width, client_config->height);
+	ret = request_firmware(&striping_firmware, striping_name, icp->dev);
 	if (ret)
 		return ret;
-	if (striping_firmware->size != CAMERA_ICP_BPS_FRAME_STRIPING_SIZE) {
+	if (!striping_firmware->size ||
+	    striping_firmware->size > CAMERA_ICP_BPS_FRAME_CDM_SIZE) {
 		ret = -EINVAL;
 		goto release_firmware;
 	}
 
-	session->work_size = CAMERA_ICP_BPS_FRAME_INPUT_OFFSET;
+	cdm_offset = PAGE_ALIGN(CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET +
+				striping_firmware->size);
+	session->work_size = cdm_offset + CAMERA_ICP_BPS_FRAME_CDM_SIZE;
 	session->work_cpu = dma_alloc_coherent(icp->dev, session->work_size,
 					       &session->work_iova,
 					       GFP_KERNEL | GFP_DMA32);
@@ -1207,12 +1219,12 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	memset(session->work_cpu, 0, session->work_size);
 	config = session->work_cpu + CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET;
 	payload = session->work_cpu + CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET;
-	qcom_camera_icp_init_bps_config(icp, config);
+	qcom_camera_icp_init_bps_config(icp, client_config, config);
 	memcpy(session->work_cpu + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
 	       striping_firmware->data, striping_firmware->size);
 	payload->frame.data.max_cores = cpu_to_le32(1);
-	payload->frame.data.cdm_iova = cpu_to_le32(session->work_iova +
-						    CAMERA_ICP_BPS_FRAME_CDM_OFFSET);
+	payload->frame.data.cdm_iova =
+		cpu_to_le32(session->work_iova + cdm_offset);
 	payload->frame.data.cdm_size = cpu_to_le32(CAMERA_ICP_BPS_FRAME_CDM_SIZE);
 	payload->frame.data.iq_iova = cpu_to_le32(session->work_iova +
 						   CAMERA_ICP_BPS_FRAME_IQ_OFFSET);
@@ -1293,6 +1305,7 @@ static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 
 static void
 qcom_camera_icp_init_bps_config(struct qcom_camera_icp *icp,
+				const struct qcom_camera_icp_bps_config *client_config,
 				struct qcom_camera_icp_hfi_bps_config *config)
 {
 	struct qcom_camera_icp_hfi_image_desc *input;
@@ -1302,35 +1315,42 @@ qcom_camera_icp_init_bps_config(struct qcom_camera_icp *icp,
 
 	input = &config->image[QCOM_CAMERA_ICP_HFI_BPS_INPUT_IMAGE];
 	output = &config->image[QCOM_CAMERA_ICP_HFI_BPS_OUTPUT_IMAGE_FULL];
-	input_stride = ALIGN(DIV_ROUND_UP(test_bps_width * 10, 8), 64);
-	output_stride = ALIGN(DIV_ROUND_UP(test_bps_width, 3) * 4, 128);
+	input_stride = client_config->input_stride;
+	output_stride = client_config->output_stride;
 
 	input->info.format =
 		cpu_to_le32(QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_MIPI_10);
-	input->info.width = cpu_to_le32(test_bps_width);
-	input->info.height = cpu_to_le32(test_bps_height);
+	input->info.width = cpu_to_le32(client_config->width);
+	input->info.height = cpu_to_le32(client_config->height);
 	input->plane[0].stride = cpu_to_le32(input_stride);
-	input->plane[0].height = cpu_to_le32(test_bps_height);
+	input->plane[0].height = cpu_to_le32(client_config->height);
 
 	output->info.format =
 		cpu_to_le32(QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_LINEAR_TP_10);
-	output->info.width = cpu_to_le32(test_bps_width);
-	output->info.height = cpu_to_le32(test_bps_height);
+	output->info.width = cpu_to_le32(client_config->width);
+	output->info.height = cpu_to_le32(client_config->height);
 	output->plane[0].stride = cpu_to_le32(output_stride);
-	output->plane[0].height = cpu_to_le32(test_bps_height);
+	output->plane[0].height = cpu_to_le32(client_config->height);
 	output->plane[1].stride = cpu_to_le32(output_stride);
-	output->plane[1].height = cpu_to_le32(test_bps_height / 2);
+	output->plane[1].height = cpu_to_le32(client_config->height / 2);
 	config->user_data =
 		cpu_to_le64(CAMERA_ICP_HFI_TEST_TOKEN_BASE +
 			    QCOM_CAMERA_ICP_HFI_BPS_CONFIG_IO);
 
 	dev_info(icp->dev,
 		 "BPS CONFIG_IO probe: %ux%u MIPI10 stride %u to linear TP10 stride %u\n",
-		 test_bps_width, test_bps_height, input_stride, output_stride);
+		 client_config->width, client_config->height,
+		 input_stride, output_stride);
 }
 
 static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 {
+	struct qcom_camera_icp_bps_config client_config = {
+		.width = test_bps_width,
+		.height = test_bps_height,
+		.input_stride = ALIGN(DIV_ROUND_UP(test_bps_width * 10, 8), 64),
+		.output_stride = ALIGN(DIV_ROUND_UP(test_bps_width, 3) * 4, 128),
+	};
 	struct qcom_camera_icp_bps_session session;
 	struct qcom_camera_icp_hfi_bps_config *config;
 	int cleanup_ret;
@@ -1357,7 +1377,7 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 
 	config = icp->bps_test_buffer.cpu;
 	memset(config, 0, icp->bps_test_buffer.size);
-	qcom_camera_icp_init_bps_config(icp, config);
+	qcom_camera_icp_init_bps_config(icp, &client_config, config);
 	dma_wmb();
 
 	ret = qcom_camera_icp_bps_session_open(icp, &session);
@@ -1391,6 +1411,12 @@ free_buffer:
 
 static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 {
+	struct qcom_camera_icp_bps_config client_config = {
+		.width = test_bps_width,
+		.height = test_bps_height,
+		.input_stride = ALIGN(DIV_ROUND_UP(test_bps_width * 10, 8), 64),
+		.output_stride = ALIGN(DIV_ROUND_UP(test_bps_width, 3) * 4, 128),
+	};
 	const struct firmware *striping_firmware;
 	struct qcom_camera_icp_bps_session session;
 	struct qcom_camera_icp_hfi_bps_frame_payload *payload;
@@ -1451,7 +1477,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 		return -EINVAL;
 
 	ret = request_firmware(&striping_firmware,
-			       CAMERA_ICP_BPS_STRIPING_FIRMWARE, icp->dev);
+			       CAMERA_ICP_BPS_TEST_STRIPING_FIRMWARE, icp->dev);
 	if (ret)
 		return ret;
 	if (striping_firmware->size != CAMERA_ICP_BPS_FRAME_STRIPING_SIZE) {
@@ -1482,7 +1508,7 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	output_c_2 = icp->bps_test_buffer.cpu +
 		CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET;
 
-	qcom_camera_icp_init_bps_config(icp, config);
+	qcom_camera_icp_init_bps_config(icp, &client_config, config);
 	memcpy(icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
 	       striping_firmware->data, striping_firmware->size);
 	payload->frame.data.max_cores = cpu_to_le32(1);

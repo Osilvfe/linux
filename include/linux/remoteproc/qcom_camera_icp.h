@@ -17,6 +17,13 @@ struct qcom_camera_icp_bps_job {
 	u64 request_id;
 };
 
+struct qcom_camera_icp_bps_config {
+	u32 width;
+	u32 height;
+	u32 input_stride;
+	u32 output_stride;
+};
+
 struct qcom_camera_icp_bps_ops {
 	int (*power_on)(struct qcom_camera_icp_bps *bps);
 	void (*power_off)(struct qcom_camera_icp_bps *bps);
@@ -32,7 +39,8 @@ struct qcom_camera_icp_bps_ops {
 			      dma_addr_t payload_iova);
 	int (*session_submit)(struct qcom_camera_icp_bps_session *session,
 			      dma_addr_t payload_iova, u64 request_id);
-	int (*session_prepare)(struct qcom_camera_icp_bps_session *session);
+	int (*session_prepare)(struct qcom_camera_icp_bps_session *session,
+			       const struct qcom_camera_icp_bps_config *config);
 	int (*session_process)(struct qcom_camera_icp_bps_session *session,
 			       const struct qcom_camera_icp_bps_job *job);
 	int (*alias_map)(struct qcom_camera_icp_bps *bps, dma_addr_t source_iova,
