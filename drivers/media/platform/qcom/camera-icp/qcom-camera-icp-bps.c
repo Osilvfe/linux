@@ -3,6 +3,7 @@
 
 #include <linux/auxiliary_bus.h>
 #include <linux/module.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/remoteproc/qcom_camera_icp.h>
 
@@ -14,6 +15,9 @@
 
 #define QCOM_CAMERA_ICP_BPS_NAME	"qcom-camera-icp-bps"
 #define V4L2_PIX_FMT_QCOM_TP10		v4l2_fourcc('Q', 'T', '1', '0')
+#define QCOM_CAMERA_ICP_BPS_INPUT_IOVA	0x08000000
+#define QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA 0x08100000
+#define QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA 0x08200000
 
 struct qcom_camera_icp_bps_fmt {
 	u32 pixelformat;
@@ -41,6 +45,7 @@ struct qcom_camera_icp_bps_ctx {
 	struct qcom_camera_icp_bps_fmt capture;
 	struct qcom_camera_icp_bps_session *session;
 	bool powered;
+	u64 request_id;
 };
 
 static void
@@ -320,6 +325,82 @@ static int qcom_camera_icp_bps_queue_init(void *priv,
 static void qcom_camera_icp_bps_device_run(void *priv)
 {
 	struct qcom_camera_icp_bps_ctx *ctx = priv;
+	struct qcom_camera_icp_bps *service = ctx->bps->service;
+	struct vb2_v4l2_buffer *src;
+	struct vb2_v4l2_buffer *dst;
+	struct qcom_camera_icp_bps_job job = {
+		.input_iova = QCOM_CAMERA_ICP_BPS_INPUT_IOVA,
+		.output_y_iova = QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA,
+		.output_c_iova = QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA,
+	};
+	dma_addr_t source_iova[3];
+	dma_addr_t alias_iova[3] = { job.input_iova, job.output_y_iova,
+				     job.output_c_iova };
+	size_t size[3] = { PAGE_ALIGN(832 * 480), PAGE_ALIGN(896 * 480),
+			   PAGE_ALIGN(896 * 240) };
+	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
+	unsigned int alias_count = 0;
+	unsigned int map_count = 0;
+	int cleanup_ret;
+	int ret;
+
+	src = v4l2_m2m_next_src_buf(ctx->m2m_ctx);
+	dst = v4l2_m2m_next_dst_buf(ctx->m2m_ctx);
+	if (!src || !dst || !ctx->session)
+		goto finish;
+
+	source_iova[0] = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+	source_iova[1] = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+	source_iova[2] = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 1);
+	for (alias_count = 0; alias_count < ARRAY_SIZE(alias_iova); alias_count++) {
+		ret = service->ops->alias_map(service, source_iova[alias_count],
+					      alias_iova[alias_count],
+					      size[alias_count]);
+		if (ret)
+			goto unmap_aliases;
+	}
+	for (map_count = 0; map_count < ARRAY_SIZE(alias_iova); map_count++) {
+		ret = service->ops->session_map(ctx->session, alias_iova[map_count],
+						size[map_count]);
+		if (ret)
+			goto unmap_session;
+	}
+	job.request_id = ++ctx->request_id;
+	ret = service->ops->session_process(ctx->session, &job);
+	if (!ret)
+		state = VB2_BUF_STATE_DONE;
+
+unmap_session:
+	while (map_count) {
+		map_count--;
+		cleanup_ret = service->ops->session_unmap(ctx->session,
+						 alias_iova[map_count],
+						 size[map_count]);
+		if (cleanup_ret) {
+			dev_warn(ctx->bps->dev,
+				 "failed to unmap BPS session buffer: %d\n",
+				 cleanup_ret);
+			state = VB2_BUF_STATE_ERROR;
+		}
+	}
+unmap_aliases:
+	while (alias_count) {
+		alias_count--;
+		service->ops->alias_unmap(service, alias_iova[alias_count],
+					  size[alias_count]);
+	}
+finish:
+	if (src) {
+		src = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
+	}
+	if (dst) {
+		dst = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx);
+		if (src)
+			v4l2_m2m_buf_copy_metadata(src, dst);
+		v4l2_m2m_buf_done(dst, state);
+	}
+	if (src)
+		v4l2_m2m_buf_done(src, state);
 
 	v4l2_m2m_job_finish(ctx->bps->m2m_dev, ctx->m2m_ctx);
 }
