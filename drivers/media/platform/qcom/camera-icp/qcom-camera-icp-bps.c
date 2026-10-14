@@ -4,6 +4,7 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/remoteproc/qcom_camera_icp.h>
 
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
@@ -25,6 +26,7 @@ struct qcom_camera_icp_bps_fmt {
 
 struct qcom_camera_icp_bps_dev {
 	struct device *dev;
+	struct qcom_camera_icp_bps *service;
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct v4l2_m2m_dev *m2m_dev;
@@ -37,6 +39,8 @@ struct qcom_camera_icp_bps_ctx {
 	struct v4l2_m2m_ctx *m2m_ctx;
 	struct qcom_camera_icp_bps_fmt output;
 	struct qcom_camera_icp_bps_fmt capture;
+	struct qcom_camera_icp_bps_session *session;
+	bool powered;
 };
 
 static void
@@ -213,13 +217,51 @@ static void qcom_camera_icp_bps_buf_queue(struct vb2_buffer *vb)
 static int qcom_camera_icp_bps_start_streaming(struct vb2_queue *vq,
 				       unsigned int count)
 {
-	return -EOPNOTSUPP;
+	struct qcom_camera_icp_bps_ctx *ctx = vb2_get_drv_priv(vq);
+	struct qcom_camera_icp_bps *service = ctx->bps->service;
+	struct vb2_queue *other;
+	int ret;
+
+	other = V4L2_TYPE_IS_OUTPUT(vq->type) ?
+		v4l2_m2m_get_dst_vq(ctx->m2m_ctx) :
+		v4l2_m2m_get_src_vq(ctx->m2m_ctx);
+	if (!vb2_is_streaming(other) || ctx->session)
+		return 0;
+
+	ret = service->ops->power_on(service);
+	if (ret)
+		return ret;
+	ctx->powered = true;
+	ctx->session = service->ops->session_open(service);
+	if (IS_ERR(ctx->session)) {
+		ret = PTR_ERR(ctx->session);
+		ctx->session = NULL;
+		service->ops->power_off(service);
+		ctx->powered = false;
+		return ret;
+	}
+
+	return 0;
 }
 
 static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
 {
 	struct qcom_camera_icp_bps_ctx *ctx = vb2_get_drv_priv(vq);
+	struct qcom_camera_icp_bps *service = ctx->bps->service;
 	struct vb2_v4l2_buffer *buf;
+	int ret;
+
+	if (ctx->session) {
+		ret = service->ops->session_close(ctx->session);
+		if (ret)
+			dev_warn(ctx->bps->dev, "failed to close BPS session: %d\n",
+				 ret);
+		ctx->session = NULL;
+	}
+	if (ctx->powered) {
+		service->ops->power_off(service);
+		ctx->powered = false;
+	}
 
 	for (;;) {
 		buf = V4L2_TYPE_IS_OUTPUT(vq->type) ?
@@ -364,6 +406,9 @@ static int qcom_camera_icp_bps_probe(struct auxiliary_device *auxdev,
 	if (!bps)
 		return -ENOMEM;
 	bps->dev = &auxdev->dev;
+	bps->service = dev_get_platdata(&auxdev->dev);
+	if (!bps->service || !bps->service->ops)
+		return -EINVAL;
 	mutex_init(&bps->lock);
 
 	ret = v4l2_device_register(&auxdev->dev, &bps->v4l2_dev);
