@@ -2,10 +2,12 @@
 /* Copyright (c) 2026 Osilvfe <osilvfe@gmail.com> */
 
 #include <linux/auxiliary_bus.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/remoteproc/qcom_camera_icp.h>
+#include <linux/workqueue.h>
 
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
@@ -46,10 +48,12 @@ struct qcom_camera_icp_bps_ctx {
 	struct qcom_camera_icp_bps_dev *bps;
 	struct v4l2_fh fh;
 	struct v4l2_m2m_ctx *m2m_ctx;
+	struct work_struct work;
 	struct qcom_camera_icp_bps_fmt output;
 	struct qcom_camera_icp_bps_fmt capture;
 	struct qcom_camera_icp_bps_session *session;
 	bool powered;
+	bool aborting;
 	u64 request_id;
 };
 
@@ -279,6 +283,7 @@ static int qcom_camera_icp_bps_start_streaming(struct vb2_queue *vq,
 	if (!vb2_is_streaming(other) || ctx->session)
 		return 0;
 
+	WRITE_ONCE(ctx->aborting, false);
 	return qcom_camera_icp_bps_open_session(ctx);
 }
 
@@ -347,9 +352,10 @@ static int qcom_camera_icp_bps_queue_init(void *priv,
 	return 0;
 }
 
-static void qcom_camera_icp_bps_device_run(void *priv)
+static void qcom_camera_icp_bps_device_work(struct work_struct *work)
 {
-	struct qcom_camera_icp_bps_ctx *ctx = priv;
+	struct qcom_camera_icp_bps_ctx *ctx =
+		container_of(work, struct qcom_camera_icp_bps_ctx, work);
 	struct qcom_camera_icp_bps *service = ctx->bps->service;
 	struct vb2_v4l2_buffer *src;
 	struct vb2_v4l2_buffer *dst;
@@ -372,7 +378,7 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 
 	src = v4l2_m2m_next_src_buf(ctx->m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->m2m_ctx);
-	if (!src || !dst || !ctx->session)
+	if (!src || !dst || !ctx->session || READ_ONCE(ctx->aborting))
 		goto finish;
 
 	sgt[0] = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
@@ -394,11 +400,13 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 			goto unmap_session;
 	}
 	job.request_id = ++ctx->request_id;
-	if (xchg(&test_timeout_once, false))
+	if (xchg(&test_timeout_once, false)) {
+		msleep(250);
 		ret = -ETIMEDOUT;
-	else
+	} else {
 		ret = service->ops->session_process(ctx->session, &job);
-	if (!ret)
+	}
+	if (!ret && !READ_ONCE(ctx->aborting))
 		state = VB2_BUF_STATE_DONE;
 	else if (ret == -ETIMEDOUT) {
 		dev_warn(ctx->bps->dev,
@@ -406,7 +414,7 @@ static void qcom_camera_icp_bps_device_run(void *priv)
 		/* Stop firmware before releasing buffers it may still access. */
 		qcom_camera_icp_bps_abort_session(ctx);
 		map_count = 0;
-		recover = true;
+		recover = !READ_ONCE(ctx->aborting);
 	}
 
 unmap_session:
@@ -435,6 +443,8 @@ unmap_aliases:
 				"failed to recover BPS session: %d\n", ret);
 	}
 finish:
+	if (READ_ONCE(ctx->aborting))
+		state = VB2_BUF_STATE_ERROR;
 	if (src) {
 		src = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
 	}
@@ -450,9 +460,20 @@ finish:
 	v4l2_m2m_job_finish(ctx->bps->m2m_dev, ctx->m2m_ctx);
 }
 
+static void qcom_camera_icp_bps_device_run(void *priv)
+{
+	struct qcom_camera_icp_bps_ctx *ctx = priv;
+
+	if (!schedule_work(&ctx->work))
+		dev_err(ctx->bps->dev, "failed to schedule BPS job\n");
+}
+
 static void qcom_camera_icp_bps_job_abort(void *priv)
 {
-	qcom_camera_icp_bps_device_run(priv);
+	struct qcom_camera_icp_bps_ctx *ctx = priv;
+
+	dev_dbg(ctx->bps->dev, "BPS job abort requested\n");
+	WRITE_ONCE(ctx->aborting, true);
 }
 
 static const struct v4l2_m2m_ops qcom_camera_icp_bps_m2m_ops = {
@@ -469,6 +490,7 @@ static int qcom_camera_icp_bps_open(struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->bps = bps;
+	INIT_WORK(&ctx->work, qcom_camera_icp_bps_device_work);
 	qcom_camera_icp_bps_default_formats(ctx);
 	v4l2_fh_init(&ctx->fh, &bps->vdev);
 	file->private_data = &ctx->fh;
@@ -496,6 +518,7 @@ static int qcom_camera_icp_bps_release(struct file *file)
 			   struct qcom_camera_icp_bps_ctx, fh);
 
 	v4l2_m2m_ctx_release(ctx->m2m_ctx);
+	cancel_work_sync(&ctx->work);
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	kfree(ctx);
