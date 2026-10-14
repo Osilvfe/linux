@@ -19,6 +19,8 @@
 #define QCOM_CAMERA_ICP_BPS_INPUT_IOVA	0x08000000
 #define QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA 0x08100000
 #define QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA 0x08200000
+#define QCOM_CAMERA_ICP_BPS_CAPS \
+	(V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING)
 
 static bool test_timeout_once;
 module_param(test_timeout_once, bool, 0600);
@@ -156,6 +158,8 @@ static int qcom_camera_icp_bps_querycap(struct file *file, void *fh,
 	strscpy(cap->card, "Qualcomm Camera ICP BPS", sizeof(cap->card));
 	strscpy(cap->bus_info, "platform:qcom-camera-icp",
 		sizeof(cap->bus_info));
+	cap->device_caps = QCOM_CAMERA_ICP_BPS_CAPS;
+	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 
 	return 0;
 }
