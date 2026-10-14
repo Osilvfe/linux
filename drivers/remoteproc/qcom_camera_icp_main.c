@@ -181,6 +181,7 @@ MODULE_PARM_DESC(test_bps_batch, "BPS frame sets per request (1-2)");
 #define CAMERA_ICP_IO_IOVA		0xf9500000
 #define CAMERA_ICP_IO_SIZE		0x06a00000
 #define CAMERA_ICP_MAX_MAPPINGS		6
+#define CAMERA_ICP_BPS_MAX_MAPPINGS	4
 
 struct qcom_camera_icp_mapping {
 	dma_addr_t iova;
@@ -189,6 +190,8 @@ struct qcom_camera_icp_mapping {
 
 struct qcom_camera_icp_bps_session {
 	struct qcom_camera_icp *icp;
+	struct qcom_camera_icp_mapping mapping[CAMERA_ICP_BPS_MAX_MAPPINGS];
+	unsigned int mapping_count;
 	u32 handle;
 	bool configured;
 };
@@ -714,6 +717,7 @@ qcom_camera_icp_bps_session_map(struct qcom_camera_icp_bps_session *session,
 				dma_addr_t iova, size_t size, bool map)
 {
 	struct qcom_camera_icp *icp = session->icp;
+	struct qcom_camera_icp_mapping *mapping;
 	const u32 opcode = map ? QCOM_CAMERA_ICP_HFI_MEM_MAP :
 				 QCOM_CAMERA_ICP_HFI_MEM_UNMAP;
 	const u64 token = CAMERA_ICP_HFI_TEST_TOKEN_BASE + opcode;
@@ -730,10 +734,57 @@ qcom_camera_icp_bps_session_map(struct qcom_camera_icp_bps_session *session,
 		.region_iova = cpu_to_le32(iova),
 		.region_size = cpu_to_le32(size),
 	};
+	unsigned int i;
+	int ret;
 
-	return qcom_camera_icp_send_sync(icp, &command, sizeof(command),
-			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_DIRECT_ACK, opcode,
-			token);
+	for (i = 0; i < session->mapping_count; i++) {
+		mapping = &session->mapping[i];
+		if (mapping->iova == iova && mapping->size == size)
+			break;
+	}
+	if (map && i != session->mapping_count)
+		return -EEXIST;
+	if (map && session->mapping_count == ARRAY_SIZE(session->mapping))
+		return -ENOSPC;
+	if (!map && i == session->mapping_count)
+		return -ENOENT;
+
+	ret = qcom_camera_icp_send_sync(icp, &command, sizeof(command),
+					CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_DIRECT_ACK,
+					opcode, token);
+	if (ret)
+		return ret;
+
+	if (map) {
+		mapping = &session->mapping[session->mapping_count++];
+		mapping->iova = iova;
+		mapping->size = size;
+	} else {
+		session->mapping_count--;
+		if (i != session->mapping_count)
+			session->mapping[i] =
+				session->mapping[session->mapping_count];
+		session->configured = false;
+	}
+
+	return 0;
+}
+
+static int
+qcom_camera_icp_bps_session_unmap_all(struct qcom_camera_icp_bps_session *session)
+{
+	struct qcom_camera_icp_mapping *mapping;
+	int ret;
+
+	while (session->mapping_count) {
+		mapping = &session->mapping[session->mapping_count - 1];
+		ret = qcom_camera_icp_bps_session_map(session, mapping->iova,
+					      mapping->size, false);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int qcom_camera_icp_test_map(struct qcom_camera_icp_bps_session *session,
@@ -830,6 +881,8 @@ qcom_camera_icp_bps_session_destroy(struct qcom_camera_icp_bps_session *session)
 
 	if (!session->handle)
 		return 0;
+	if (session->mapping_count)
+		return -EBUSY;
 
 	ret = qcom_camera_icp_send_sync(icp, &command, sizeof(command),
 			CAMERA_ICP_HFI_MSG_IPEBPS_ASYNC_DIRECT_ACK,
@@ -930,7 +983,7 @@ static int qcom_camera_icp_test_bps_config(struct qcom_camera_icp *icp)
 	if (ret == -ETIMEDOUT)
 		return ret;
 
-	cleanup_ret = qcom_camera_icp_test_map(&session, false);
+	cleanup_ret = qcom_camera_icp_bps_session_unmap_all(&session);
 	if (cleanup_ret)
 		return cleanup_ret;
 
@@ -1174,15 +1227,8 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	if (ret == -ETIMEDOUT)
 		goto release_firmware;
 unmap_buffer:
-	if (alias_mapped) {
-		cleanup_ret = qcom_camera_icp_bps_session_map(&session,
-				     icp->hfi_test_fw_iova,
-				     icp->hfi_test_fw_iova_size, false);
-		if (!ret)
-			ret = cleanup_ret;
-	}
-	if (mapped) {
-		cleanup_ret = qcom_camera_icp_test_map(&session, false);
+	if (alias_mapped || mapped) {
+		cleanup_ret = qcom_camera_icp_bps_session_unmap_all(&session);
 		if (!ret)
 			ret = cleanup_ret;
 	}
