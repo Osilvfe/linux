@@ -99,7 +99,9 @@ static int qcom_camera_icp_bps_open_session(
 	if (!ret)
 		return 0;
 
-	service->ops->session_close(ctx->session);
+	ret = service->ops->session_close(ctx->session);
+	if (ret)
+		service->ops->session_abort(ctx->session);
 	ctx->session = NULL;
 power_off:
 	service->ops->power_off(service);
@@ -112,13 +114,13 @@ static void qcom_camera_icp_bps_abort_session(
 {
 	struct qcom_camera_icp_bps *service = ctx->bps->service;
 
-	if (ctx->powered) {
-		service->ops->power_off(service);
-		ctx->powered = false;
-	}
 	if (ctx->session) {
 		service->ops->session_abort(ctx->session);
 		ctx->session = NULL;
+	}
+	if (ctx->powered) {
+		service->ops->power_off(service);
+		ctx->powered = false;
 	}
 }
 
@@ -360,6 +362,8 @@ static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
 		if (ret)
 			dev_warn(ctx->bps->dev, "failed to close BPS session: %d\n",
 				 ret);
+		if (ret)
+			service->ops->session_abort(ctx->session);
 		ctx->session = NULL;
 	}
 	if (ctx->powered) {
