@@ -571,8 +571,9 @@ static int qcom_camera_icp_bps_release(struct file *file)
 	ctx = container_of(file->private_data,
 			   struct qcom_camera_icp_bps_ctx, fh);
 
+	/* The work item dereferences m2m_ctx and must finish first. */
+	flush_work(&ctx->work);
 	v4l2_m2m_ctx_release(ctx->m2m_ctx);
-	cancel_work_sync(&ctx->work);
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	kfree(ctx);
