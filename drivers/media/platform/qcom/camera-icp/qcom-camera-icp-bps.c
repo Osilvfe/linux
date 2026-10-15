@@ -54,11 +54,11 @@ static const struct qcom_camera_icp_bps_profile qcom_camera_icp_bps_profiles[] =
 			.num_planes = 1,
 		},
 		.capture = {
-			.pixelformat = V4L2_PIX_FMT_TP10,
+			.pixelformat = V4L2_PIX_FMT_NV12M,
 			.width = 640,
 			.height = 480,
-			.bytesperline = { 896, 896 },
-			.sizeimage = { 896 * 480, 896 * 240 },
+			.bytesperline = { 640, 640 },
+			.sizeimage = { 640 * 480, 640 * 240 },
 			.colorspace = V4L2_COLORSPACE_DEFAULT,
 			.num_planes = 2,
 		},
@@ -73,11 +73,11 @@ static const struct qcom_camera_icp_bps_profile qcom_camera_icp_bps_profiles[] =
 			.num_planes = 1,
 		},
 		.capture = {
-			.pixelformat = V4L2_PIX_FMT_TP10,
+			.pixelformat = V4L2_PIX_FMT_NV12M,
 			.width = 4208,
 			.height = 3120,
-			.bytesperline = { 5632, 5632 },
-			.sizeimage = { 5632 * 3120, 5632 * 1560 },
+			.bytesperline = { 4224, 4224 },
+			.sizeimage = { 4224 * 3120, 4224 * 1560 },
 			.colorspace = V4L2_COLORSPACE_DEFAULT,
 			.num_planes = 2,
 		},
@@ -92,11 +92,11 @@ static const struct qcom_camera_icp_bps_profile qcom_camera_icp_bps_profiles[] =
 			.num_planes = 1,
 		},
 		.capture = {
-			.pixelformat = V4L2_PIX_FMT_TP10,
+			.pixelformat = V4L2_PIX_FMT_NV12M,
 			.width = 3264,
 			.height = 2448,
-			.bytesperline = { 4352, 4352 },
-			.sizeimage = { 4352 * 2448, 4352 * 1224 },
+			.bytesperline = { 3328, 3328 },
+			.sizeimage = { 3328 * 2448, 3328 * 1224 },
 			.colorspace = V4L2_COLORSPACE_DEFAULT,
 			.num_planes = 2,
 		},
@@ -125,6 +125,22 @@ struct qcom_camera_icp_bps_ctx {
 	u64 request_id;
 	u32 sequence;
 };
+
+static void qcom_camera_icp_bps_abort_session(
+	struct qcom_camera_icp_bps_ctx *ctx)
+{
+	struct qcom_camera_icp_bps *service = ctx->bps->service;
+
+	/* Quiesce firmware before releasing memory it may still access. */
+	if (ctx->powered) {
+		service->ops->power_off(service);
+		ctx->powered = false;
+	}
+	if (ctx->session) {
+		service->ops->session_abort(ctx->session);
+		ctx->session = NULL;
+	}
+}
 
 static int qcom_camera_icp_bps_open_session(
 	struct qcom_camera_icp_bps_ctx *ctx)
@@ -163,28 +179,15 @@ static int qcom_camera_icp_bps_open_session(
 
 close_session:
 	cleanup_ret = service->ops->session_close(ctx->session);
-	if (cleanup_ret)
-		service->ops->session_abort(ctx->session);
+	if (cleanup_ret) {
+		qcom_camera_icp_bps_abort_session(ctx);
+		return ret;
+	}
 	ctx->session = NULL;
 power_off:
 	service->ops->power_off(service);
 	ctx->powered = false;
 	return ret;
-}
-
-static void qcom_camera_icp_bps_abort_session(
-	struct qcom_camera_icp_bps_ctx *ctx)
-{
-	struct qcom_camera_icp_bps *service = ctx->bps->service;
-
-	if (ctx->session) {
-		service->ops->session_abort(ctx->session);
-		ctx->session = NULL;
-	}
-	if (ctx->powered) {
-		service->ops->power_off(service);
-		ctx->powered = false;
-	}
 }
 
 static void
@@ -252,9 +255,7 @@ static int qcom_camera_icp_bps_enum_fmt(struct file *file, void *fh,
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 		f->pixelformat = V4L2_PIX_FMT_SBGGR10P;
 	else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		f->pixelformat = V4L2_PIX_FMT_TP10;
-		strscpy(f->description, "Qualcomm TP10",
-			sizeof(f->description));
+		f->pixelformat = V4L2_PIX_FMT_NV12M;
 	}
 	else
 		return -EINVAL;
@@ -270,7 +271,7 @@ static int qcom_camera_icp_bps_enum_framesizes(
 	if (fsize->index >= ARRAY_SIZE(qcom_camera_icp_bps_profiles))
 		return -EINVAL;
 	if (fsize->pixel_format != V4L2_PIX_FMT_SBGGR10P &&
-	    fsize->pixel_format != V4L2_PIX_FMT_TP10)
+	    fsize->pixel_format != V4L2_PIX_FMT_NV12M)
 		return -EINVAL;
 	profile = &qcom_camera_icp_bps_profiles[fsize->index];
 
@@ -491,12 +492,13 @@ static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
 
 	if (ctx->session) {
 		ret = service->ops->session_close(ctx->session);
-		if (ret)
+		if (ret) {
 			dev_warn(ctx->bps->dev, "failed to close BPS session: %d\n",
 				 ret);
-		if (ret)
-			service->ops->session_abort(ctx->session);
-		ctx->session = NULL;
+			qcom_camera_icp_bps_abort_session(ctx);
+		} else {
+			ctx->session = NULL;
+		}
 	}
 	if (ctx->powered) {
 		service->ops->power_off(service);
@@ -630,6 +632,8 @@ unmap_session:
 			dev_warn(ctx->bps->dev,
 				 "failed to unmap BPS session buffer: %d\n",
 				 cleanup_ret);
+			if (!ret)
+				ret = cleanup_ret;
 			state = VB2_BUF_STATE_ERROR;
 		}
 	}
