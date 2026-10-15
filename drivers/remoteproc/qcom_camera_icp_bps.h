@@ -15,13 +15,16 @@
 #define QCOM_CAMERA_ICP_HFI_MEM_UNMAP		0xf
 
 #define QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_MIPI_10	2
-#define QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_LINEAR_TP_10	18
+#define QCOM_CAMERA_ICP_HFI_IMAGE_FORMAT_LINEAR_NV12	20
+#define QCOM_CAMERA_ICP_HFI_BAYER_FIRST_PIXEL_B		2
 #define QCOM_CAMERA_ICP_HFI_BPS_IMAGE_COUNT		12
 #define QCOM_CAMERA_ICP_HFI_BPS_INPUT_IMAGE		0
 #define QCOM_CAMERA_ICP_HFI_BPS_OUTPUT_IMAGE_FULL	1
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_FRAME_SETS		16
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_CDM_PROGRAMS	17
 #define QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT		8
+#define QCOM_CAMERA_ICP_HFI_BPS_PROGRAM_GENERIC		72
+#define QCOM_CAMERA_ICP_HFI_BPS_CDM_LENGTH_SHIFT	12
 
 static inline int qcom_camera_icp_bps_validate_region(u64 iova, u64 size)
 {
@@ -43,6 +46,7 @@ static inline bool qcom_camera_icp_bps_region_contains(u64 base, u64 size,
 
 static inline int qcom_camera_icp_bps_encode_buffer(u64 iova, __le32 *encoded)
 {
+	/* BPS expands FrameBufferPtr values in 256-byte address units. */
 	if (iova & ((1U << QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT) - 1))
 		return -EINVAL;
 	if (iova >> QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT > U32_MAX)
@@ -182,11 +186,32 @@ struct qcom_camera_icp_hfi_bps_frame {
 } __packed;
 
 struct qcom_camera_icp_hfi_bps_cdm_program {
-	__le64 base_length;
+	__le32 base;
+	__le32 length;
 	__le32 type;
 	__le32 uid;
 	__le32 single_register;
 	__le32 internally_allocated;
+} __packed;
+
+/*
+ * Only the fields needed by the initial RAW-to-NV12 path are named here.
+ * The reserved ranges preserve the complete SM8650 BpsIQSettings ABI.
+ */
+struct qcom_camera_icp_hfi_bps_iq_settings {
+	u8 reserved_0[492];
+	__le32 demosaic_enable;
+	u8 reserved_496[172];
+	__le32 chroma_horizontal_rounding;
+	__le32 chroma_vertical_rounding;
+	u8 reserved_676[100];
+	__le32 full_luma_clamp_min;
+	__le32 full_luma_clamp_max;
+	__le32 full_chroma_clamp_min;
+	__le32 full_chroma_clamp_max;
+	__le32 full_luma_rounding_pattern;
+	__le32 full_chroma_rounding_pattern;
+	u8 reserved_800[476];
 } __packed;
 
 struct qcom_camera_icp_hfi_bps_frame_payload {
