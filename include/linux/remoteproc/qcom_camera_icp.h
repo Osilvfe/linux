@@ -10,10 +10,16 @@ struct qcom_camera_icp_bps;
 struct qcom_camera_icp_bps_session;
 struct sg_table;
 
+#define QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10	512
+#define QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10	2048
+#define QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10	1024
+
 struct qcom_camera_icp_bps_job {
 	dma_addr_t input_iova;
 	dma_addr_t output_y_iova;
 	dma_addr_t output_c_iova;
+	u32 red_balance_q10;
+	u32 blue_balance_q10;
 	u64 request_id;
 };
 

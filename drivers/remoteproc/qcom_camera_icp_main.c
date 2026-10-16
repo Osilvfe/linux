@@ -278,13 +278,10 @@ static u32 qcom_camera_icp_bps_pack_coeff(int b, int g)
 	return ((u32)b & 0x1fff) << 16 | ((u32)g & 0x1fff);
 }
 
-/*
- * The BPS firmware has no statistics or per-frame IQ interface exposed by
- * this driver yet.  Keep the calibrated white balance in the hardware color
- * transform for now.  The two sensors have sufficiently different channel
- * responses that one matrix cannot serve both profiles.
- */
-static void qcom_camera_icp_bps_color_xform_for_size(u32 width, u32 *config)
+static void qcom_camera_icp_bps_color_xform_for_size(u32 width,
+						     u32 red_balance_q10,
+						     u32 blue_balance_q10,
+						     u32 *config)
 {
 	int red_gain_q10;
 	int blue_gain_q10;
@@ -298,6 +295,10 @@ static void qcom_camera_icp_bps_color_xform_for_size(u32 width, u32 *config)
 		red_gain_q10 = 1587;
 		blue_gain_q10 = 1382;
 	}
+	red_gain_q10 = red_gain_q10 * red_balance_q10 /
+			QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10;
+	blue_gain_q10 = blue_gain_q10 * blue_balance_q10 /
+			 QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10;
 
 	/* BT.601 full-range matrix, with the input columns white-balanced. */
 	config[0] = qcom_camera_icp_bps_pack_coeff(117 * blue_gain_q10 / 1024, 601);
@@ -322,17 +323,34 @@ static __le32 *qcom_camera_icp_bps_write_reg_cont(__le32 *command, u32 reg,
 	return command;
 }
 
-static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
-						     dma_addr_t iova)
+static __le32 *qcom_camera_icp_bps_write_xform(void *cpu, __le32 *command,
+					       u32 red_balance_q10,
+					       u32 blue_balance_q10)
 {
 	struct qcom_camera_icp_hfi_bps_config *bps_config;
 	struct qcom_camera_icp_hfi_image_desc *input;
+	u32 config[ARRAY_SIZE(qcom_camera_icp_bps_color_xform_config)];
+	u32 width;
+
+	bps_config = cpu + CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET;
+	input = &bps_config->image[QCOM_CAMERA_ICP_HFI_BPS_INPUT_IMAGE];
+	width = le32_to_cpu(input->info.width);
+	memcpy(config, qcom_camera_icp_bps_color_xform_config, sizeof(config));
+	qcom_camera_icp_bps_color_xform_for_size(width, red_balance_q10,
+						 blue_balance_q10, config);
+
+	return qcom_camera_icp_bps_write_reg_cont(command,
+		CAMERA_ICP_BPS_COLOR_XFORM_REG, config, ARRAY_SIZE(config));
+}
+
+static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
+						    dma_addr_t iova)
+{
 	struct qcom_camera_icp_hfi_bps_frame_payload *payload;
 	struct qcom_camera_icp_hfi_bps_cdm_program *program;
 	struct qcom_camera_icp_hfi_bps_iq_settings *iq;
 	__le32 *command;
 	__le32 *end;
-	u32 color_xform_config[ARRAY_SIZE(qcom_camera_icp_bps_color_xform_config)];
 	size_t command_size;
 
 	BUILD_BUG_ON(sizeof(struct qcom_camera_icp_hfi_bps_iq_settings) !=
@@ -358,12 +376,6 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	payload = cpu + CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET;
 	iq = cpu + CAMERA_ICP_BPS_FRAME_IQ_OFFSET;
 	command = cpu + CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET;
-	bps_config = cpu + CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET;
-	input = &bps_config->image[QCOM_CAMERA_ICP_HFI_BPS_INPUT_IMAGE];
-	memcpy(color_xform_config, qcom_camera_icp_bps_color_xform_config,
-	       sizeof(color_xform_config));
-	qcom_camera_icp_bps_color_xform_for_size(le32_to_cpu(input->info.width),
-						 color_xform_config);
 
 	iq->demosaic_enable = cpu_to_le32(1);
 	iq->color_xform_enable = cpu_to_le32(1);
@@ -377,10 +389,9 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 					 CAMERA_ICP_BPS_DEMOSAIC_REG,
 					 qcom_camera_icp_bps_demosaic_config,
 					 ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config));
-	end = qcom_camera_icp_bps_write_reg_cont(end,
-					 CAMERA_ICP_BPS_COLOR_XFORM_REG,
-					 color_xform_config,
-					 ARRAY_SIZE(color_xform_config));
+	end = qcom_camera_icp_bps_write_xform(cpu, end,
+					      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10,
+					      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10);
 	command_size = (u8 *)end - (u8 *)command;
 
 	payload->cdm_allocator = 0;
@@ -1451,9 +1462,14 @@ static int qcom_camera_icp_bps_client_session_process(
 	const struct qcom_camera_icp_bps_job *job)
 {
 	struct qcom_camera_icp_hfi_bps_frame_payload *payload;
+	__le32 *color_xform_command;
 	int ret;
 
-	if (!session->work_cpu || !session->configured)
+	if (!session->work_cpu || !session->configured || !job ||
+	    job->red_balance_q10 < QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10 ||
+	    job->red_balance_q10 > QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10 ||
+	    job->blue_balance_q10 < QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10 ||
+	    job->blue_balance_q10 > QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10)
 		return -EINVAL;
 	payload = session->work_cpu + CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET;
 	payload->frame.data.request_id = cpu_to_le32(job->request_id);
@@ -1465,6 +1481,14 @@ static int qcom_camera_icp_bps_client_session_process(
 		 &payload->frame.data.frame_set[0].buffer[1].buffer[1]);
 	if (ret)
 		return ret;
+	color_xform_command = session->work_cpu +
+		CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET;
+	color_xform_command += 2 +
+		ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config);
+	qcom_camera_icp_bps_write_xform(session->work_cpu,
+					color_xform_command,
+					job->red_balance_q10,
+					job->blue_balance_q10);
 	dma_wmb();
 
 	return qcom_camera_icp_bps_session_submit(session, session->work_iova +

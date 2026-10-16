@@ -9,6 +9,7 @@
 #include <linux/remoteproc/qcom_camera_icp.h>
 #include <linux/workqueue.h>
 
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
@@ -115,6 +116,9 @@ struct qcom_camera_icp_bps_dev {
 struct qcom_camera_icp_bps_ctx {
 	struct qcom_camera_icp_bps_dev *bps;
 	struct v4l2_fh fh;
+	struct v4l2_ctrl_handler ctrl_handler;
+	struct v4l2_ctrl *red_balance;
+	struct v4l2_ctrl *blue_balance;
 	struct v4l2_m2m_ctx *m2m_ctx;
 	struct work_struct work;
 	struct qcom_camera_icp_bps_fmt output;
@@ -580,6 +584,10 @@ static void qcom_camera_icp_bps_device_work(struct work_struct *work)
 	dst = v4l2_m2m_next_dst_buf(ctx->m2m_ctx);
 	if (!src || !dst || !ctx->session || READ_ONCE(ctx->aborting))
 		goto finish;
+	v4l2_ctrl_lock(ctx->red_balance);
+	job.red_balance_q10 = ctx->red_balance->val;
+	job.blue_balance_q10 = ctx->blue_balance->val;
+	v4l2_ctrl_unlock(ctx->red_balance);
 
 	sgt[0] = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
 	sgt[1] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 0);
@@ -704,6 +712,7 @@ static int qcom_camera_icp_bps_open(struct file *file)
 {
 	struct qcom_camera_icp_bps_dev *bps = video_drvdata(file);
 	struct qcom_camera_icp_bps_ctx *ctx;
+	int ret;
 
 	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
@@ -712,15 +721,35 @@ static int qcom_camera_icp_bps_open(struct file *file)
 	INIT_WORK(&ctx->work, qcom_camera_icp_bps_device_work);
 	qcom_camera_icp_bps_default_formats(ctx);
 	v4l2_fh_init(&ctx->fh, &bps->vdev);
+	v4l2_ctrl_handler_init(&ctx->ctrl_handler, 2);
+	ctx->red_balance = v4l2_ctrl_new_std(&ctx->ctrl_handler, NULL,
+					     V4L2_CID_RED_BALANCE,
+					     QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10,
+					     QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10, 1,
+					     QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10);
+	ctx->blue_balance = v4l2_ctrl_new_std(&ctx->ctrl_handler, NULL,
+					      V4L2_CID_BLUE_BALANCE,
+					      QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10,
+					      QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10, 1,
+					      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10);
+	if (ctx->ctrl_handler.error) {
+		ret = ctx->ctrl_handler.error;
+		v4l2_ctrl_handler_free(&ctx->ctrl_handler);
+		v4l2_fh_exit(&ctx->fh);
+		kfree(ctx);
+		return ret;
+	}
+	ctx->fh.ctrl_handler = &ctx->ctrl_handler;
 	file->private_data = &ctx->fh;
 	v4l2_fh_add(&ctx->fh, file);
 	ctx->m2m_ctx = v4l2_m2m_ctx_init(bps->m2m_dev, ctx,
 					 qcom_camera_icp_bps_queue_init);
 	if (IS_ERR(ctx->m2m_ctx)) {
-		int ret = PTR_ERR(ctx->m2m_ctx);
+		ret = PTR_ERR(ctx->m2m_ctx);
 
 		v4l2_fh_del(&ctx->fh, file);
 		v4l2_fh_exit(&ctx->fh);
+		v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 		kfree(ctx);
 		return ret;
 	}
@@ -741,6 +770,7 @@ static int qcom_camera_icp_bps_release(struct file *file)
 	v4l2_m2m_ctx_release(ctx->m2m_ctx);
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
+	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 	kfree(ctx);
 
 	return 0;
