@@ -201,7 +201,8 @@ struct qcom_camera_icp_hfi_bps_cdm_program {
 struct qcom_camera_icp_hfi_bps_iq_settings {
 	u8 reserved_0[492];
 	__le32 demosaic_enable;
-	u8 reserved_496[172];
+	u8 reserved_496[168];
+	__le32 color_xform_enable;
 	__le32 chroma_horizontal_rounding;
 	__le32 chroma_vertical_rounding;
 	u8 reserved_676[100];

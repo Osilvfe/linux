@@ -240,7 +240,7 @@ struct qcom_camera_icp_hfi_ping {
 #define CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET	0
 #define CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET	SZ_4K
 #define CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET	0x2800
-#define CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE	24
+#define CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE	104
 #define CAMERA_ICP_BPS_FRAME_IQ_OFFSET		0x3000
 #define CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET	0x4000
 #define CAMERA_ICP_BPS_FRAME_CDM_OFFSET		0x6000
@@ -258,9 +258,19 @@ struct qcom_camera_icp_hfi_ping {
 
 #define CAMERA_ICP_CDM_CMD_REG_CONT		3
 #define CAMERA_ICP_BPS_DEMOSAIC_REG		0x4968
+#define CAMERA_ICP_BPS_COLOR_XFORM_REG		0x5268
 
 static const u32 qcom_camera_icp_bps_demosaic_config[] = {
 	0x00000000, 0x00000080, 0x01000000, 0x00000066,
+};
+
+/* SM8650 Titan880 RGB-to-YUV matrix with full-range 12-bit clamps. */
+static const u32 qcom_camera_icp_bps_color_xform_config[] = {
+	0x00750259, 0x00000132, 0x00000000, 0x00000000,
+	0x00000000, 0xfff00000, 0x01fe1eae, 0x00001f54,
+	0x40000000, 0x00000000, 0x00000000, 0xfff00000,
+	0x1fad1e55, 0x000001fe, 0x40000000, 0x00000000,
+	0x00000000, 0xfff00000,
 };
 
 static __le32 *qcom_camera_icp_bps_write_reg_cont(__le32 *command, u32 reg,
@@ -292,6 +302,8 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
 			      demosaic_enable) != 0x1ec);
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
+			      color_xform_enable) != 0x298);
+	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
 			      chroma_horizontal_rounding) != 0x29c);
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
 			      full_luma_clamp_min) != 0x308);
@@ -301,7 +313,8 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET +
 		     CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE >
 		     CAMERA_ICP_BPS_FRAME_IQ_OFFSET);
-	BUILD_BUG_ON((2 + ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config)) *
+	BUILD_BUG_ON((2 + ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config) +
+		      2 + ARRAY_SIZE(qcom_camera_icp_bps_color_xform_config)) *
 		     sizeof(*command) != CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE);
 
 	payload = cpu + CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET;
@@ -309,6 +322,7 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	command = cpu + CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET;
 
 	iq->demosaic_enable = cpu_to_le32(1);
+	iq->color_xform_enable = cpu_to_le32(1);
 	iq->chroma_horizontal_rounding = cpu_to_le32(1);
 	iq->chroma_vertical_rounding = cpu_to_le32(2);
 	/* NV12 is an 8-bit output, so both full-path channels clamp to 255. */
@@ -319,6 +333,10 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 					 CAMERA_ICP_BPS_DEMOSAIC_REG,
 					 qcom_camera_icp_bps_demosaic_config,
 					 ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config));
+	end = qcom_camera_icp_bps_write_reg_cont(end,
+					 CAMERA_ICP_BPS_COLOR_XFORM_REG,
+					 qcom_camera_icp_bps_color_xform_config,
+					 ARRAY_SIZE(qcom_camera_icp_bps_color_xform_config));
 	command_size = (u8 *)end - (u8 *)command;
 
 	payload->cdm_allocator = 0;
