@@ -23,6 +23,7 @@
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_FRAME_SETS		16
 #define QCOM_CAMERA_ICP_HFI_BPS_MAX_CDM_PROGRAMS	17
 #define QCOM_CAMERA_ICP_HFI_BPS_BUFFER_SHIFT		8
+#define QCOM_CAMERA_ICP_HFI_BPS_PROGRAM_DMI		0
 #define QCOM_CAMERA_ICP_HFI_BPS_PROGRAM_GENERIC		72
 #define QCOM_CAMERA_ICP_HFI_BPS_CDM_LENGTH_SHIFT	12
 
@@ -201,7 +202,8 @@ struct qcom_camera_icp_hfi_bps_cdm_program {
 struct qcom_camera_icp_hfi_bps_iq_settings {
 	u8 reserved_0[492];
 	__le32 demosaic_enable;
-	u8 reserved_496[168];
+	u8 reserved_496[164];
+	__le32 gamma_enable;
 	__le32 color_xform_enable;
 	__le32 chroma_horizontal_rounding;
 	__le32 chroma_vertical_rounding;

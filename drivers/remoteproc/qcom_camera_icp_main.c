@@ -251,17 +251,52 @@ struct qcom_camera_icp_hfi_ping {
 #define CAMERA_ICP_BPS_FRAME_INPUT_2_OFFSET	0x186000
 #define CAMERA_ICP_BPS_FRAME_OUTPUT_Y_2_OFFSET	0x1e8000
 #define CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET	0x251000
+#define CAMERA_ICP_BPS_FRAME_GAMMA_OFFSET	0x280000
+/* Keep host DMI commands outside the firmware-owned CDM scratch region. */
+#define CAMERA_ICP_BPS_FRAME_DMI_OFFSET	0x2900
 #define CAMERA_ICP_BPS_FRAME_BUFFER_SIZE	0x286000
 #define CAMERA_ICP_BPS_FRAME_IOVA		0x08000000
 #define CAMERA_ICP_BPS_FRAME_IQ_SIZE		1276
 #define CAMERA_ICP_BPS_FRAME_STRIPING_SIZE	6432
 
+#define CAMERA_ICP_CDM_CMD_DMI			1
 #define CAMERA_ICP_CDM_CMD_REG_CONT		3
 #define CAMERA_ICP_BPS_DEMOSAIC_REG		0x4968
+#define CAMERA_ICP_BPS_GAMMA_DMI_REG		0x5008
 #define CAMERA_ICP_BPS_COLOR_XFORM_REG		0x5268
+#define CAMERA_ICP_BPS_GAMMA_LUT_ENTRIES	256
+#define CAMERA_ICP_BPS_GAMMA_LUT_BANK_SIZE	SZ_1K
+#define CAMERA_ICP_BPS_GAMMA_LUT_SIZE		(3 * SZ_1K)
+#define CAMERA_ICP_BPS_GAMMA_BASE_MASK		GENMASK(11, 0)
+#define CAMERA_ICP_BPS_GAMMA_DELTA_MASK		GENMASK(11, 0)
+#define CAMERA_ICP_BPS_GAMMA_DELTA_SHIFT	12
 
 static const u32 qcom_camera_icp_bps_demosaic_config[] = {
 	0x00000000, 0x00000080, 0x01000000, 0x00000066,
+};
+
+/* Default 257-point Qualcomm gamma15 curve from gamma_1_5_0.xsd. */
+static const u16 qcom_camera_icp_bps_gamma_curve[] = {
+	0, 18, 30, 42, 54, 66, 78, 92, 106, 118, 133, 147, 159, 171, 183,
+	195, 207, 217, 227, 239, 249, 259, 269, 277, 287, 297, 305, 313,
+	321, 329, 337, 345, 351, 357, 365, 373, 381, 388, 394, 400, 406,
+	414, 420, 426, 434, 440, 444, 450, 458, 464, 468, 474, 480, 486,
+	492, 496, 502, 508, 512, 518, 524, 528, 534, 538, 542, 548, 552,
+	558, 564, 568, 572, 576, 580, 584, 588, 592, 598, 602, 606, 610,
+	614, 618, 622, 626, 630, 632, 636, 640, 645, 649, 653, 657, 661,
+	665, 669, 672, 675, 679, 681, 685, 688, 691, 695, 699, 701, 704,
+	707, 711, 713, 716, 719, 723, 725, 728, 731, 735, 737, 741, 744,
+	747, 749, 752, 755, 757, 760, 763, 765, 768, 771, 773, 776, 779,
+	781, 784, 787, 789, 792, 795, 797, 800, 803, 805, 808, 811, 813,
+	816, 819, 821, 823, 825, 827, 829, 831, 833, 836, 839, 841, 844,
+	846, 848, 851, 853, 855, 857, 859, 861, 864, 866, 868, 870, 872,
+	874, 876, 878, 880, 882, 884, 886, 888, 890, 892, 894, 896, 898,
+	900, 903, 905, 907, 909, 911, 913, 915, 916, 918, 920, 922, 923,
+	925, 927, 929, 931, 932, 934, 935, 937, 939, 941, 943, 945, 947,
+	948, 950, 952, 954, 955, 957, 959, 961, 963, 964, 966, 967, 969,
+	971, 972, 974, 975, 976, 978, 980, 982, 983, 985, 987, 988, 990,
+	992, 994, 995, 997, 999, 1001, 1003, 1004, 1005, 1007, 1008,
+	1010, 1011, 1013, 1015, 1016, 1017, 1019, 1020, 1022, 1023,
 };
 
 /* SM8650 Titan880 RGB-to-YUV matrix with full-range 12-bit clamps. */
@@ -361,6 +396,39 @@ static __le32 *qcom_camera_icp_bps_write_reg_cont(__le32 *command, u32 reg,
 	return command;
 }
 
+static __le32 *qcom_camera_icp_bps_write_dmi(__le32 *command, u32 reg,
+					     u8 bank, dma_addr_t lut_iova)
+{
+	*command++ = cpu_to_le32(CAMERA_ICP_CDM_CMD_DMI << 24 |
+				 CAMERA_ICP_BPS_GAMMA_LUT_BANK_SIZE - 1);
+	*command++ = cpu_to_le32(lower_32_bits(lut_iova));
+	*command++ = cpu_to_le32((u32)bank << 24 | reg);
+
+	return command;
+}
+
+static void qcom_camera_icp_bps_init_gamma_lut(void *cpu)
+{
+	__le32 *lut = cpu;
+	unsigned int channel;
+	unsigned int i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(qcom_camera_icp_bps_gamma_curve) !=
+		     CAMERA_ICP_BPS_GAMMA_LUT_ENTRIES + 1);
+	for (channel = 0; channel < 3; channel++) {
+		for (i = 0; i < CAMERA_ICP_BPS_GAMMA_LUT_ENTRIES; i++) {
+			u16 base = qcom_camera_icp_bps_gamma_curve[i] << 2;
+			int delta =
+				(qcom_camera_icp_bps_gamma_curve[i + 1] << 2) - base;
+
+			lut[channel * CAMERA_ICP_BPS_GAMMA_LUT_ENTRIES + i] =
+				cpu_to_le32((base & CAMERA_ICP_BPS_GAMMA_BASE_MASK) |
+					    ((delta & CAMERA_ICP_BPS_GAMMA_DELTA_MASK) <<
+					     CAMERA_ICP_BPS_GAMMA_DELTA_SHIFT));
+		}
+	}
+}
+
 static __le32 *qcom_camera_icp_bps_write_xform(void *cpu, __le32 *command,
 					       u32 red_balance_q10,
 					       u32 blue_balance_q10)
@@ -382,19 +450,25 @@ static __le32 *qcom_camera_icp_bps_write_xform(void *cpu, __le32 *command,
 }
 
 static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
-						    dma_addr_t iova)
+						    dma_addr_t iova,
+						    size_t gamma_offset)
 {
 	struct qcom_camera_icp_hfi_bps_frame_payload *payload;
 	struct qcom_camera_icp_hfi_bps_cdm_program *program;
 	struct qcom_camera_icp_hfi_bps_iq_settings *iq;
 	__le32 *command;
 	__le32 *end;
-	size_t command_size;
+	__le32 *dmi_command;
+	__le32 *dmi_end;
+	size_t generic_size;
+	size_t dmi_size;
 
 	BUILD_BUG_ON(sizeof(struct qcom_camera_icp_hfi_bps_iq_settings) !=
 		     CAMERA_ICP_BPS_FRAME_IQ_SIZE);
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
 			      demosaic_enable) != 0x1ec);
+	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
+			      gamma_enable) != 0x294);
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
 			      color_xform_enable) != 0x298);
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
@@ -406,6 +480,8 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 		     CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET);
 	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET +
 		     CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE >
+		     CAMERA_ICP_BPS_FRAME_DMI_OFFSET);
+	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_DMI_OFFSET + 3 * 3 * sizeof(*command) >
 		     CAMERA_ICP_BPS_FRAME_IQ_OFFSET);
 	BUILD_BUG_ON((2 + ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config) +
 		      2 + ARRAY_SIZE(qcom_camera_icp_bps_color_xform_config)) *
@@ -416,6 +492,7 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	command = cpu + CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET;
 
 	iq->demosaic_enable = cpu_to_le32(1);
+	iq->gamma_enable = cpu_to_le32(1);
 	iq->color_xform_enable = cpu_to_le32(1);
 	iq->chroma_horizontal_rounding = cpu_to_le32(1);
 	iq->chroma_vertical_rounding = cpu_to_le32(2);
@@ -430,16 +507,39 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	end = qcom_camera_icp_bps_write_xform(cpu, end,
 					      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10,
 					      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10);
-	command_size = (u8 *)end - (u8 *)command;
+	qcom_camera_icp_bps_init_gamma_lut(cpu + gamma_offset);
+	generic_size = (u8 *)end - (u8 *)command;
+	dmi_command = cpu + CAMERA_ICP_BPS_FRAME_DMI_OFFSET;
+	dmi_end = qcom_camera_icp_bps_write_dmi(dmi_command,
+						CAMERA_ICP_BPS_GAMMA_DMI_REG, 1,
+						iova + gamma_offset);
+	dmi_end = qcom_camera_icp_bps_write_dmi(dmi_end,
+						CAMERA_ICP_BPS_GAMMA_DMI_REG, 2,
+						iova + gamma_offset +
+						CAMERA_ICP_BPS_GAMMA_LUT_BANK_SIZE);
+	dmi_end = qcom_camera_icp_bps_write_dmi(dmi_end,
+						CAMERA_ICP_BPS_GAMMA_DMI_REG, 3,
+						iova + gamma_offset +
+						2 * CAMERA_ICP_BPS_GAMMA_LUT_BANK_SIZE);
+	dmi_size = (u8 *)dmi_end - (u8 *)dmi_command;
 
 	payload->cdm_allocator = 0;
-	payload->cdm_num_programs = cpu_to_le32(1);
+	payload->cdm_num_programs = cpu_to_le32(2);
 	program = &payload->program[0];
 	program->base = cpu_to_le32(lower_32_bits(iova +
 				 CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET));
-	program->length = cpu_to_le32((command_size - 1) <<
-				       QCOM_CAMERA_ICP_HFI_BPS_CDM_LENGTH_SHIFT);
+	program->length = cpu_to_le32((generic_size - 1) <<
+				      QCOM_CAMERA_ICP_HFI_BPS_CDM_LENGTH_SHIFT);
 	program->type = cpu_to_le32(QCOM_CAMERA_ICP_HFI_BPS_PROGRAM_GENERIC);
+	program->uid = 0;
+	program->single_register = 0;
+	program->internally_allocated = 0;
+	program = &payload->program[1];
+	program->base = cpu_to_le32(lower_32_bits(iova +
+				 CAMERA_ICP_BPS_FRAME_DMI_OFFSET));
+	program->length = cpu_to_le32((dmi_size - 1) <<
+				      QCOM_CAMERA_ICP_HFI_BPS_CDM_LENGTH_SHIFT);
+	program->type = cpu_to_le32(QCOM_CAMERA_ICP_HFI_BPS_PROGRAM_DMI);
 	program->uid = 0;
 	program->single_register = 0;
 	program->internally_allocated = 0;
@@ -1415,6 +1515,7 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	struct qcom_camera_icp *icp = session->icp;
 	char striping_name[64];
 	size_t cdm_offset;
+	size_t gamma_offset;
 	int ret;
 
 	if (session->work_cpu || !client_config || !client_config->width ||
@@ -1435,7 +1536,9 @@ static int qcom_camera_icp_bps_client_session_prepare(
 
 	cdm_offset = PAGE_ALIGN(CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET +
 				striping_firmware->size);
-	session->work_size = cdm_offset + CAMERA_ICP_BPS_FRAME_CDM_SIZE;
+	gamma_offset = cdm_offset + CAMERA_ICP_BPS_FRAME_CDM_SIZE;
+	session->work_size = PAGE_ALIGN(gamma_offset +
+					CAMERA_ICP_BPS_GAMMA_LUT_SIZE);
 	session->work_cpu = dma_alloc_coherent(icp->dev, session->work_size,
 					       &session->work_iova,
 					       GFP_KERNEL | GFP_DMA32);
@@ -1455,7 +1558,8 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	memcpy(session->work_cpu + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
 	       striping_firmware->data, striping_firmware->size);
 	qcom_camera_icp_init_bps_frame_settings(session->work_cpu,
-						 session->work_iova);
+						 session->work_iova,
+						 gamma_offset);
 	payload->frame.data.max_cores = cpu_to_le32(1);
 	payload->frame.data.cdm_iova =
 		cpu_to_le32(session->work_iova + cdm_offset);
@@ -1778,6 +1882,9 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_OUTPUT_Y_2_OFFSET + 640 * 480 >
 		     CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET);
 	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_OUTPUT_C_2_OFFSET + 640 * 240 >
+		     CAMERA_ICP_BPS_FRAME_GAMMA_OFFSET);
+	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_GAMMA_OFFSET +
+		     CAMERA_ICP_BPS_GAMMA_LUT_SIZE >
 		     CAMERA_ICP_BPS_FRAME_BUFFER_SIZE);
 	BUILD_BUG_ON(U32_MAX - (CAMERA_ICP_BPS_FRAME_BUFFER_SIZE - 1) <
 		     CAMERA_ICP_BPS_FRAME_IOVA);
@@ -1823,7 +1930,8 @@ static int qcom_camera_icp_test_frame_bps(struct qcom_camera_icp *icp)
 	memcpy(icp->bps_test_buffer.cpu + CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET,
 	       striping_firmware->data, striping_firmware->size);
 	qcom_camera_icp_init_bps_frame_settings(icp->bps_test_buffer.cpu,
-						 fw_base);
+						 fw_base,
+						 CAMERA_ICP_BPS_FRAME_GAMMA_OFFSET);
 	payload->frame.data.max_cores = cpu_to_le32(1);
 	payload->frame.data.cdm_iova =
 		cpu_to_le32(fw_base + CAMERA_ICP_BPS_FRAME_CDM_OFFSET);
