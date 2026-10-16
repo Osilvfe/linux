@@ -273,6 +273,36 @@ static const u32 qcom_camera_icp_bps_color_xform_config[] = {
 	0x00000000, 0xfff00000,
 };
 
+struct qcom_camera_icp_bps_color_profile {
+	int red_gain_q10;
+	int blue_gain_q10;
+	int matrix_q10[3][3];
+};
+
+/* SC1320CS vendor CCM at 5100 K, premultiplied by BT.601 full range. */
+static const struct qcom_camera_icp_bps_color_profile
+qcom_camera_icp_bps_sc1320cs_color = {
+	.red_gain_q10 = 2099,
+	.blue_gain_q10 = 1536,
+	.matrix_q10 = {
+		{ 464, 646, -86 },
+		{ -181, -772, 953 },
+		{ 884, -808, -76 },
+	},
+};
+
+/* SC820CS vendor CCM at 5200 K, premultiplied by BT.601 full range. */
+static const struct qcom_camera_icp_bps_color_profile
+qcom_camera_icp_bps_sc820cs_color = {
+	.red_gain_q10 = 1587,
+	.blue_gain_q10 = 1382,
+	.matrix_q10 = {
+		{ 536, 436, 52 },
+		{ -225, -769, 994 },
+		{ 1044, -943, -101 },
+	},
+};
+
 static u32 qcom_camera_icp_bps_pack_coeff(int b, int g)
 {
 	return ((u32)b & 0x1fff) << 16 | ((u32)g & 0x1fff);
@@ -283,30 +313,38 @@ static void qcom_camera_icp_bps_color_xform_for_size(u32 width,
 						     u32 blue_balance_q10,
 						     u32 *config)
 {
+	const struct qcom_camera_icp_bps_color_profile *profile;
+	int matrix_q10[3][3];
 	int red_gain_q10;
 	int blue_gain_q10;
+	unsigned int row;
 
-	/* Rear SC1320CS: approximately 2.05x red and 1.50x blue. */
-	if (width >= 4000) {
-		red_gain_q10 = 2099;
-		blue_gain_q10 = 1536;
-	} else {
-		/* Front SC820CS: approximately 1.55x red and 1.35x blue. */
-		red_gain_q10 = 1587;
-		blue_gain_q10 = 1382;
-	}
+	profile = width >= 4000 ? &qcom_camera_icp_bps_sc1320cs_color :
+				  &qcom_camera_icp_bps_sc820cs_color;
+	red_gain_q10 = profile->red_gain_q10;
+	blue_gain_q10 = profile->blue_gain_q10;
 	red_gain_q10 = red_gain_q10 * red_balance_q10 /
 			QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10;
 	blue_gain_q10 = blue_gain_q10 * blue_balance_q10 /
 			 QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10;
 
-	/* BT.601 full-range matrix, with the input columns white-balanced. */
-	config[0] = qcom_camera_icp_bps_pack_coeff(117 * blue_gain_q10 / 1024, 601);
-	config[1] = 306 * red_gain_q10 / 1024;
-	config[6] = qcom_camera_icp_bps_pack_coeff(510 * blue_gain_q10 / 1024, -338);
-	config[7] = (u32)(-172 * red_gain_q10 / 1024) & 0x1fff;
-	config[12] = qcom_camera_icp_bps_pack_coeff(-83 * blue_gain_q10 / 1024, -427);
-	config[13] = 510 * red_gain_q10 / 1024;
+	/* Apply white balance to the input columns of the calibrated matrix. */
+	for (row = 0; row < ARRAY_SIZE(matrix_q10); row++) {
+		matrix_q10[row][0] =
+			DIV_ROUND_CLOSEST(profile->matrix_q10[row][0] * red_gain_q10,
+					  1024);
+		matrix_q10[row][1] = profile->matrix_q10[row][1];
+		matrix_q10[row][2] =
+			DIV_ROUND_CLOSEST(profile->matrix_q10[row][2] * blue_gain_q10,
+					  1024);
+	}
+
+	config[0] = qcom_camera_icp_bps_pack_coeff(matrix_q10[0][2], matrix_q10[0][1]);
+	config[1] = (u32)matrix_q10[0][0] & 0x1fff;
+	config[6] = qcom_camera_icp_bps_pack_coeff(matrix_q10[1][2], matrix_q10[1][1]);
+	config[7] = (u32)matrix_q10[1][0] & 0x1fff;
+	config[12] = qcom_camera_icp_bps_pack_coeff(matrix_q10[2][2], matrix_q10[2][1]);
+	config[13] = (u32)matrix_q10[2][0] & 0x1fff;
 }
 
 static __le32 *qcom_camera_icp_bps_write_reg_cont(__le32 *command, u32 reg,
