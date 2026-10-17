@@ -202,7 +202,9 @@ struct qcom_camera_icp_hfi_bps_cdm_program {
 struct qcom_camera_icp_hfi_bps_iq_settings {
 	u8 reserved_0[492];
 	__le32 demosaic_enable;
-	u8 reserved_496[164];
+	u8 reserved_496[156];
+	__le32 color_correction_enable;
+	u8 reserved_656[4];
 	__le32 gamma_enable;
 	__le32 color_xform_enable;
 	__le32 chroma_horizontal_rounding;
@@ -214,7 +216,9 @@ struct qcom_camera_icp_hfi_bps_iq_settings {
 	__le32 full_chroma_clamp_max;
 	__le32 full_luma_rounding_pattern;
 	__le32 full_chroma_rounding_pattern;
-	u8 reserved_800[476];
+	u8 reserved_800[188];
+	__le32 white_balance_enable;
+	u8 reserved_992[284];
 } __packed;
 
 struct qcom_camera_icp_hfi_bps_frame_payload {
