@@ -271,6 +271,14 @@ struct qcom_camera_icp_hfi_ping {
 #define CAMERA_ICP_BPS_GAMMA_DELTA_MASK		GENMASK(11, 0)
 #define CAMERA_ICP_BPS_GAMMA_DELTA_SHIFT	12
 
+/*
+ * BPS gamma precedes the color transform, where the sensor white-balance
+ * gains are currently applied.  A non-linear curve at that point changes
+ * the channel ratios before calibration.  Keep the DMI plumbing available,
+ * but leave the block disabled until white balance moves ahead of gamma.
+ */
+#define CAMERA_ICP_BPS_GAMMA_ENABLE		0
+
 static const u32 qcom_camera_icp_bps_demosaic_config[] = {
 	0x00000000, 0x00000080, 0x01000000, 0x00000066,
 };
@@ -492,7 +500,7 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	command = cpu + CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET;
 
 	iq->demosaic_enable = cpu_to_le32(1);
-	iq->gamma_enable = cpu_to_le32(1);
+	iq->gamma_enable = cpu_to_le32(CAMERA_ICP_BPS_GAMMA_ENABLE);
 	iq->color_xform_enable = cpu_to_le32(1);
 	iq->chroma_horizontal_rounding = cpu_to_le32(1);
 	iq->chroma_vertical_rounding = cpu_to_le32(2);
@@ -524,7 +532,7 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	dmi_size = (u8 *)dmi_end - (u8 *)dmi_command;
 
 	payload->cdm_allocator = 0;
-	payload->cdm_num_programs = cpu_to_le32(2);
+	payload->cdm_num_programs = cpu_to_le32(CAMERA_ICP_BPS_GAMMA_ENABLE ? 2 : 1);
 	program = &payload->program[0];
 	program->base = cpu_to_le32(lower_32_bits(iova +
 				 CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET));
