@@ -4296,6 +4296,9 @@ static int qmp_combo_usb_init(struct phy *phy)
 	if (ret)
 		goto out_unlock;
 
+	if (qmp->qmpphy_mode == QMPPHY_MODE_DP_ONLY)
+		goto out_unlock;
+
 	ret = qmp_combo_usb_power_on(phy);
 	if (ret) {
 		qmp_combo_com_exit(qmp, false);
@@ -4315,6 +4318,11 @@ static int qmp_combo_usb_exit(struct phy *phy)
 	int ret;
 
 	mutex_lock(&qmp->phy_mutex);
+	if (qmp->qmpphy_mode == QMPPHY_MODE_DP_ONLY) {
+		ret = qmp_combo_com_exit(qmp, false);
+		goto out_unlock;
+	}
+
 	ret = qmp_combo_usb_power_off(phy);
 	if (ret)
 		goto out_unlock;
