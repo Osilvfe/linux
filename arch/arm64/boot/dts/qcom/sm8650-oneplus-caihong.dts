@@ -979,6 +979,12 @@
 	};
 };
 
+&iris {
+	firmware-name = "qcom/sm8650/Oneplus/caihong/vpu33_4v.mbn";
+
+	status = "okay";
+};
+
 &gpu {
 	status = "okay";
 };
