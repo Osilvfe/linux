@@ -5475,9 +5475,13 @@ static void ufshcd_lu_init(struct ufs_hba *hba, struct scsi_device *sdev)
 	kfree(desc_buf);
 set_qdepth:
 	/*
-	 * For WLUNs that don't support unit descriptor, queue depth is set to 1. For LUs whose
-	 * bLUQueueDepth == 0, the queue depth is set to a maximum value that host can queue.
+	 * For WLUNs that don't support unit descriptor, queue depth is set to 1.
+	 * For LUs whose bLUQueueDepth == 0, use the UFS device-wide queue depth
+	 * when valid; some firmware reports a working global bQueueDepth while
+	 * leaving the unit descriptor field zero.
 	 */
+	if (!lun_qdepth && hba->dev_info.bqueuedepth)
+		lun_qdepth = hba->dev_info.bqueuedepth;
 	dev_dbg(hba->dev, "Set LU %x queue depth %d\n", lun, lun_qdepth);
 	scsi_change_queue_depth(sdev, lun_qdepth);
 }
