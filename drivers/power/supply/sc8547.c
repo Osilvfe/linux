@@ -933,6 +933,7 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 	u8 requested, active;
 	bool full;
 	bool reduce_active;
+	u8 previous_active;
 	bool advance = false;
 	int ret;
 
@@ -1010,8 +1011,8 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 	active = min_t(u8, requested, point->target_ibus_code);
 	if (active < SC8547_VOOC_MIN_CURRENT_CODE)
 		active = SC8547_VOOC_MIN_CURRENT_CODE;
-	reduce_active = sc->vooc_initialized &&
-		active < sc->vooc_active_current_code;
+	previous_active = sc->vooc_active_current_code;
+	reduce_active = sc->vooc_initialized && active < previous_active;
 
 	if (sc->vooc_active_current_code != active ||
 	    sc->vooc_policy_clamped != (active < requested))
@@ -1023,15 +1024,10 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 			 sc->vooc_curve_confirm_count);
 	sc->vooc_active_current_code = active;
 	sc->vooc_policy_clamped = active < requested;
-	if (reduce_active) {
-		/* The adapter may not issue another ASK_CURRENT frame promptly.
-		 * End this exchange and let the bounded retry re-handshake with the
-		 * lower official curve point instead of carrying the old current. */
-		dev_warn(sc->dev,
-			 "VOOC battery policy reduced current %u -> %u; restarting handshake\n",
-			 requested, active);
-		return -EAGAIN;
-	}
+	if (reduce_active)
+		dev_info(sc->dev,
+			 "VOOC battery policy reduced current %u -> %u; applying on next request\n",
+			 previous_active, active);
 	return 0;
 }
 
