@@ -163,6 +163,7 @@
  * source that jumps past the 100 mV lower edge is loaded before it can
  * overshoot the 10.5-V software ceiling. */
 #define SC8547_VOOC_CP_START_LOW_DELTA_UV	50000
+#define SC8547_VOOC_CP_START_HIGH_DELTA_UV	205000
 #define SC8547_VOOC_CP_MIN_VBUS_UV	6500000
 #define SC8547_VOOC_CP_MAX_IBUS_UA	3500000
 #define SC8547_VOOC_TOTAL_MAX_IBUS_UA	6500000
@@ -3058,7 +3059,7 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 					    vbus_uv - 2 * vbat_now_uv >=
 						SC8547_VOOC_CP_START_LOW_DELTA_UV &&
 					     vbus_uv - 2 * vbat_now_uv <=
-						SC8547_VOOC_VBUS_HIGH_DELTA_UV) {
+						SC8547_VOOC_CP_START_HIGH_DELTA_UV) {
 						/* The upstream SC8547A primary path asserts REG07
 						 * directly.  REG0C=0x02 is the downstream slave
 						 * CP_ENABLE precondition; forcing it on the primary
