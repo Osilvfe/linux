@@ -85,6 +85,20 @@ properties:
 
   operating-points-v2: true
 
+  qcom,domain-performance-state-floors:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 25
+    items:
+      items:
+        - description: Power domain index
+        - description: Minimum RPMh performance level
+    description:
+      Tuples describing the minimum performance level to maintain for a power
+      domain across the active, wake and sleep RPMh state sets. The level is
+      rounded up to the next corner supported by the resource's command DB
+      mapping.
+
   opp-table:
     type: object
 
