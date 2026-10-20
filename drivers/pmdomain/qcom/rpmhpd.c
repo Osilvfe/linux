@@ -41,6 +41,7 @@
  * @addr:		Resource address as looped up using resource name from
  *			cmd-db
  * @state_synced:	Indicator that sync_state has been invoked for the rpmhpd resource
+ * @floor_corner:	Lowest corner maintained across all RPMh state sets
  */
 struct rpmhpd {
 	struct device	*dev;
@@ -57,6 +58,7 @@ struct rpmhpd {
 	const char	*res_name;
 	u32		addr;
 	bool		state_synced;
+	unsigned int	floor_corner;
 };
 
 struct rpmhpd_desc {
@@ -980,6 +982,7 @@ static int rpmhpd_aggregate_corner(struct rpmhpd *pd, unsigned int corner)
 	}
 
 	active_corner = max(this_active_corner, peer_active_corner);
+	active_corner = max(active_corner, pd->floor_corner);
 
 	ret = rpmhpd_send_corner(pd, RPMH_ACTIVE_ONLY_STATE, active_corner,
 				 active_corner > pd->active_corner);
@@ -997,6 +1000,7 @@ static int rpmhpd_aggregate_corner(struct rpmhpd *pd, unsigned int corner)
 			return ret;
 
 		sleep_corner = max(this_sleep_corner, peer_sleep_corner);
+		sleep_corner = max(sleep_corner, pd->floor_corner);
 
 		return rpmhpd_send_corner(pd, RPMH_SLEEP_STATE, sleep_corner,
 					  false);
@@ -1121,6 +1125,58 @@ static int rpmhpd_update_level_mapping(struct rpmhpd *rpmhpd)
 	return 0;
 }
 
+static int rpmhpd_parse_floor_levels(struct device *dev, const struct rpmhpd_desc *desc)
+{
+	const char *prop = "qcom,domain-performance-state-floors";
+	struct device_node *node = dev->of_node;
+	struct rpmhpd *pd;
+	unsigned int corner;
+	int count, i, ret;
+	u32 domain, level;
+
+	if (!of_property_present(node, prop))
+		return 0;
+
+	count = of_property_count_u32_elems(node, prop);
+	if (count < 0)
+		return count;
+
+	if (count % 2)
+		return dev_err_probe(dev, -EINVAL,
+				     "invalid performance state floor tuples\n");
+
+	for (i = 0; i < count; i += 2) {
+		ret = of_property_read_u32_index(node, prop, i, &domain);
+		if (ret)
+			return ret;
+
+		ret = of_property_read_u32_index(node, prop, i + 1, &level);
+		if (ret)
+			return ret;
+
+		if (domain >= desc->num_pds || !desc->rpmhpds[domain])
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid power domain %u in floor tuple\n",
+					     domain);
+
+		pd = desc->rpmhpds[domain];
+		for (corner = 0; corner < pd->level_count; corner++)
+			if (level <= pd->level[corner])
+				break;
+
+		if (corner == pd->level_count)
+			return dev_err_probe(dev, -EINVAL,
+					     "unsupported floor level %u for %s\n",
+					     level, pd->res_name);
+
+		pd->floor_corner = max(pd->floor_corner, corner);
+		if (pd->peer && corner > pd->peer->floor_corner)
+			pd->peer->floor_corner = corner;
+	}
+
+	return 0;
+}
+
 static int rpmhpd_probe(struct platform_device *pdev)
 {
 	int i, ret;
@@ -1177,6 +1233,10 @@ static int rpmhpd_probe(struct platform_device *pdev)
 
 		data->domains[i] = &rpmhpds[i]->pd;
 	}
+
+	ret = rpmhpd_parse_floor_levels(dev, desc);
+	if (ret)
+		return ret;
 
 	/* Add subdomains */
 	for (i = 0; i < num_pds; i++) {
