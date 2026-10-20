@@ -1249,6 +1249,11 @@
 	status = "okay";
 };
 
+&rpmhpd {
+	qcom,domain-performance-state-floors =
+		<RPMHPD_MMCX RPMH_REGULATOR_LEVEL_SVS>;
+};
+
 &sleep_clk {
 	clock-frequency = <32000>;
 };
