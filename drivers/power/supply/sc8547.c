@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/pm.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/random.h>
@@ -408,6 +409,7 @@ struct sc8547_device {
 	bool pps_capable;
 	bool vooc_capable;
 	bool vooc_auto_retry;
+	bool vooc_resume_retry;
 	bool vooc_cable_online;
 	bool vooc_cable_state_known;
 	u8 vooc_cable_absent_count;
@@ -4797,6 +4799,45 @@ static int sc8547_probe(struct i2c_client *client)
 	return 0;
 }
 
+static int sc8547_suspend(struct device *dev)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+
+	if (!sc || !sc->vooc_capable)
+		return 0;
+
+	sc->vooc_resume_retry = sc->vooc_initialized ||
+		READ_ONCE(sc->vooc_auto_retry);
+	WRITE_ONCE(sc->vooc_auto_retry, false);
+	atomic_set(&sc->policy_cancel, 1);
+	cancel_delayed_work_sync(&sc->vooc_cable_work);
+	cancel_delayed_work_sync(&sc->vooc_retry_work);
+	if (sc->vooc_resume_retry)
+		dev_info(sc->dev, "VOOC session stopped for system suspend\n");
+
+	return 0;
+}
+
+static int sc8547_resume(struct device *dev)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+
+	if (!sc || !sc->vooc_capable || !sc->vooc_resume_retry)
+		return 0;
+
+	sc->vooc_resume_retry = false;
+	atomic_set(&sc->policy_cancel, 0);
+	WRITE_ONCE(sc->vooc_auto_retry, true);
+	sc->vooc_auto_retry_count = 0;
+	sc8547_queue_vooc_retry(sc, msecs_to_jiffies(1000));
+	dev_info(sc->dev, "VOOC session retry queued after system resume\n");
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sc8547_pm_ops, sc8547_suspend,
+				 sc8547_resume);
+
 static void sc8547_shutdown(struct i2c_client *client)
 {
 	struct sc8547_device *sc = i2c_get_clientdata(client);
@@ -4850,6 +4891,7 @@ static struct i2c_driver sc8547_driver = {
 	.driver = {
 		.name = "sc8547",
 		.of_match_table = sc8547_of_match,
+		.pm = pm_sleep_ptr(&sc8547_pm_ops),
 	},
 	.probe = sc8547_probe,
 	.remove = sc8547_remove,
