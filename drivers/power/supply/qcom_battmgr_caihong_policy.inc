@@ -5673,7 +5673,7 @@ out_unlock:
 	if (stop)
 		qcom_battmgr_oneplus_dual_request_stop(battmgr);
 	if (reschedule && READ_ONCE(battmgr->oneplus_dual_auto_enabled))
-		mod_delayed_work(system_long_wq,
+		mod_delayed_work(system_freezable_wq,
 			&battmgr->oneplus_dual_auto_watch_work,
 			msecs_to_jiffies(BATTMGR_ONEPLUS_DUAL_AUTO_CHECK_MS));
 }
@@ -5768,7 +5768,7 @@ static ssize_t qcom_battmgr_oneplus_dual_auto_store(
 			battmgr->oneplus_dual_auto_last_rc = ret;
 		}
 		mutex_unlock(&battmgr->oneplus_lock);
-		mod_delayed_work(system_long_wq,
+		mod_delayed_work(system_freezable_wq,
 			&battmgr->oneplus_dual_auto_watch_work, 0);
 		return count;
 	}
@@ -6448,7 +6448,7 @@ static void qcom_battmgr_caihong_service_event(struct qcom_battmgr *battmgr,
 		mod_delayed_work(system_long_wq, &battmgr->oneplus_ffc_work, 0);
 
 	if (READ_ONCE(battmgr->oneplus_dual_auto_enabled))
-		mod_delayed_work(system_long_wq,
+		mod_delayed_work(system_freezable_wq,
 				 &battmgr->oneplus_dual_auto_watch_work, 0);
 
 	if (service_up && READ_ONCE(battmgr->oneplus_policy_auto_start))
@@ -6646,7 +6646,7 @@ static int qcom_battmgr_caihong_register(struct qcom_battmgr *battmgr)
 				   msecs_to_jiffies(
 					   BATTMGR_ONEPLUS_POLICY_AUTO_CHECK_MS));
 	if (battmgr->oneplus_dual_auto_enabled)
-		queue_delayed_work(system_long_wq,
+		queue_delayed_work(system_freezable_wq,
 				   &battmgr->oneplus_dual_auto_watch_work, 0);
 	if (battmgr->oneplus_ffc_policy)
 		mod_delayed_work(system_long_wq, &battmgr->oneplus_ffc_work,
