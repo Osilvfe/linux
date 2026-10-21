@@ -1167,7 +1167,8 @@ static int setup_fifos(struct qcom_geni_serial_port *port)
 
 static void qcom_geni_serial_shutdown(struct uart_port *uport)
 {
-	disable_irq(uport->irq);
+	if (!uport->suspended)
+		disable_irq(uport->irq);
 
 	uart_port_lock_irq(uport);
 	qcom_geni_serial_stop_tx(uport);
@@ -1976,6 +1977,8 @@ static int qcom_geni_serial_suspend(struct device *dev)
 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
 	struct uart_port *uport = &port->uport;
 	struct qcom_geni_private_data *private_data = uport->private_data;
+	bool irq_disabled = false;
+	int ret;
 
 	/*
 	 * This is done so we can hit the lowest possible state in suspend
@@ -1985,7 +1988,17 @@ static int qcom_geni_serial_suspend(struct device *dev)
 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
 		geni_icc_set_bw(&port->se);
 	}
-	return uart_suspend_port(private_data->drv, uport);
+
+	if (tty_port_initialized(&uport->state->port)) {
+		disable_irq(uport->irq);
+		irq_disabled = true;
+	}
+
+	ret = uart_suspend_port(private_data->drv, uport);
+	if (irq_disabled && (ret || !uport->suspended))
+		enable_irq(uport->irq);
+
+	return ret;
 }
 
 static int qcom_geni_serial_resume(struct device *dev)
