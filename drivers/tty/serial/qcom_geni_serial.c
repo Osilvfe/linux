@@ -1320,7 +1320,8 @@ static void qcom_geni_serial_shutdown(struct uart_port *uport)
 	/* Atomic console output queues tx_kick without taking the port lock. */
 	WRITE_ONCE(port->tx_kick_enabled, false);
 	irq_work_sync(&port->tx_kick);
-	disable_irq(uport->irq);
+	if (!uport->suspended)
+		disable_irq(uport->irq);
 
 	uart_port_lock_irq(uport);
 	qcom_geni_serial_stop_tx(uport);
@@ -2088,6 +2089,7 @@ static int qcom_geni_serial_suspend(struct device *dev)
 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
 	struct uart_port *uport = &port->uport;
 	struct qcom_geni_private_data *private_data = uport->private_data;
+	bool irq_disabled = false;
 	int ret;
 
 	/*
@@ -2099,7 +2101,15 @@ static int qcom_geni_serial_suspend(struct device *dev)
 		geni_icc_set_bw(&port->se);
 	}
 
+	if (tty_port_initialized(&uport->state->port)) {
+		disable_irq(uport->irq);
+		irq_disabled = true;
+	}
+
 	ret = uart_suspend_port(private_data->drv, uport);
+	if (irq_disabled && (ret || !uport->suspended)) {
+		enable_irq(uport->irq);
+	}
 	if (ret)
 		return ret;
 
