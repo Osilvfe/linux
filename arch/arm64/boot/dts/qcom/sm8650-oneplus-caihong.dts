@@ -1157,7 +1157,6 @@
 		led-max-microamp = <500000>;
 		flash-max-microamp = <1500000>;
 		flash-max-timeout-us = <1280000>;
-		function-enumerator = <1>;
 	};
 };
 
