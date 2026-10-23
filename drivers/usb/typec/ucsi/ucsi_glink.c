@@ -77,6 +77,7 @@ struct pmic_glink_ucsi {
 	spinlock_t state_lock;
 	bool ucsi_registered;
 	bool pd_running;
+	bool suspended;
 
 	u8 read_buf[UCSI_BUF_V2_SIZE];
 };
@@ -333,6 +334,7 @@ static void pmic_glink_ucsi_callback(const void *data, size_t len, void *priv)
 {
 	struct pmic_glink_ucsi *ucsi = priv;
 	const struct pmic_glink_hdr *hdr = data;
+	unsigned long flags;
 
 	switch (le32_to_cpu(hdr->opcode)) {
 	case UC_UCSI_READ_BUF_REQ:
@@ -342,7 +344,10 @@ static void pmic_glink_ucsi_callback(const void *data, size_t len, void *priv)
 		pmic_glink_ucsi_write_ack(ucsi, data, len);
 		break;
 	case UC_UCSI_USBC_NOTIFY_IND:
-		schedule_work(&ucsi->notify_work);
+		spin_lock_irqsave(&ucsi->state_lock, flags);
+		if (!ucsi->suspended)
+			schedule_work(&ucsi->notify_work);
+		spin_unlock_irqrestore(&ucsi->state_lock, flags);
 		break;
 	}
 }
@@ -482,6 +487,41 @@ static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 	}
 }
 
+static int pmic_glink_ucsi_suspend(struct device *dev)
+{
+	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ucsi->state_lock, flags);
+	ucsi->suspended = true;
+	spin_unlock_irqrestore(&ucsi->state_lock, flags);
+	cancel_work_sync(&ucsi->notify_work);
+	if (!ucsi->ucsi_registered)
+		return 0;
+
+	return ucsi_suspend(ucsi->ucsi);
+}
+
+static int pmic_glink_ucsi_resume(struct device *dev)
+{
+	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret = 0;
+
+	if (ucsi->ucsi_registered)
+		ret = ucsi_resume(ucsi->ucsi);
+
+	spin_lock_irqsave(&ucsi->state_lock, flags);
+	ucsi->suspended = false;
+	spin_unlock_irqrestore(&ucsi->state_lock, flags);
+
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(pmic_glink_ucsi_pm_ops,
+				 pmic_glink_ucsi_suspend,
+				 pmic_glink_ucsi_resume);
+
 static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {
 	{ .name = "pmic_glink.ucsi", },
 	{},
@@ -492,6 +532,7 @@ static struct auxiliary_driver pmic_glink_ucsi_driver = {
 	.name = "pmic_glink_ucsi",
 	.probe = pmic_glink_ucsi_probe,
 	.remove = pmic_glink_ucsi_remove,
+	.driver.pm = pm_sleep_ptr(&pmic_glink_ucsi_pm_ops),
 	.id_table = pmic_glink_ucsi_id_table,
 };
 
