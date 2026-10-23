@@ -180,7 +180,7 @@
 #define SC8547_VOOC_POLL_MAX_US	200
 #define SC8547_VOOC_ADC_SAMPLE_US	5000
 #define SC8547_VOOC_BATTERY_SAMPLE_US	1000000
-#define SC8547_VOOC_BATTERY_MAX_TEMP_DECIC	450
+#define SC8547_VOOC_BATTERY_MAX_TEMP_DECIC	510
 #define SC8547_VOOC_BATTERY_MIN_TEMP_DECIC	0
 #define SC8547_VOOC_BATTERY_MAX_VOLTAGE_UV	4480000 /* stock one-/n-time full threshold */
 #define SC8547_VOOC_BATTERY_FULL_CAPACITY	100
@@ -216,6 +216,11 @@
 #define SC8547_VOOC_TEMP_LITTLE_COOL_DECIC	160
 #define SC8547_VOOC_TEMP_NORMAL_LOW_DECIC	350
 #define SC8547_VOOC_TEMP_NORMAL_HIGH_DECIC	440
+#define SC8547_VOOC_TEMP_HIGH_ENTER_DECIC	420
+#define SC8547_VOOC_TEMP_HIGH_EXIT_DECIC	385
+#define SC8547_VOOC_TEMP_WARM_EXIT_DECIC	420
+#define SC8547_VOOC_TEMP_HIGH_CURRENT_CODE	40
+#define SC8547_VOOC_TEMP_WARM_CURRENT_CODE	20
 #define SC8547_VOOC_PRE_SVOOC		0x2002
 
 #define SC8547_VOOC_HEAD_VOOC20		0x05
@@ -393,6 +398,12 @@ struct sc8547_pps_run_state {
 
 struct sc8547_vooc_curve;
 
+enum sc8547_vooc_temp_state {
+	SC8547_VOOC_TEMP_STATE_NORMAL,
+	SC8547_VOOC_TEMP_STATE_HIGH,
+	SC8547_VOOC_TEMP_STATE_WARM,
+};
+
 struct sc8547_device {
 	struct device *dev;
 	struct regmap *regmap;
@@ -419,6 +430,7 @@ struct sc8547_device {
 	u8 vooc_curve_confirm_count;
 	u32 vooc_curve_elapsed_s;
 	bool vooc_curve_initialized;
+	enum sc8547_vooc_temp_state vooc_temp_state;
 	int vooc_policy_capacity;
 	int vooc_policy_vbat_uv;
 	int vooc_policy_temp_decic;
@@ -890,6 +902,53 @@ static void sc8547_vooc_reset_curve(struct sc8547_device *sc)
 	sc->vooc_curve_confirm_count = 0;
 	sc->vooc_curve_elapsed_s = 0;
 	sc->vooc_curve_initialized = false;
+	sc->vooc_temp_state = SC8547_VOOC_TEMP_STATE_NORMAL;
+}
+
+static u8 sc8547_vooc_temp_current_limit(struct sc8547_device *sc,
+					 int temp_decic)
+{
+	enum sc8547_vooc_temp_state previous = sc->vooc_temp_state;
+	u8 limit;
+
+	switch (sc->vooc_temp_state) {
+	case SC8547_VOOC_TEMP_STATE_NORMAL:
+		if (temp_decic > SC8547_VOOC_TEMP_NORMAL_HIGH_DECIC)
+			sc->vooc_temp_state = SC8547_VOOC_TEMP_STATE_WARM;
+		else if (temp_decic > SC8547_VOOC_TEMP_HIGH_ENTER_DECIC)
+			sc->vooc_temp_state = SC8547_VOOC_TEMP_STATE_HIGH;
+		break;
+	case SC8547_VOOC_TEMP_STATE_HIGH:
+		if (temp_decic > SC8547_VOOC_TEMP_NORMAL_HIGH_DECIC)
+			sc->vooc_temp_state = SC8547_VOOC_TEMP_STATE_WARM;
+		else if (temp_decic < SC8547_VOOC_TEMP_HIGH_EXIT_DECIC)
+			sc->vooc_temp_state = SC8547_VOOC_TEMP_STATE_NORMAL;
+		break;
+	case SC8547_VOOC_TEMP_STATE_WARM:
+		if (temp_decic < SC8547_VOOC_TEMP_WARM_EXIT_DECIC)
+			sc->vooc_temp_state = SC8547_VOOC_TEMP_STATE_HIGH;
+		break;
+	}
+
+	switch (sc->vooc_temp_state) {
+	case SC8547_VOOC_TEMP_STATE_WARM:
+		limit = SC8547_VOOC_TEMP_WARM_CURRENT_CODE;
+		break;
+	case SC8547_VOOC_TEMP_STATE_HIGH:
+		limit = SC8547_VOOC_TEMP_HIGH_CURRENT_CODE;
+		break;
+	case SC8547_VOOC_TEMP_STATE_NORMAL:
+	default:
+		limit = SC8547_VOOC_MAX_CURRENT_CODE;
+		break;
+	}
+
+	if (previous != sc->vooc_temp_state)
+		dev_info(sc->dev,
+			 "VOOC temperature state %u->%u temp=%d current_limit=%u\n",
+			 previous, sc->vooc_temp_state, temp_decic, limit);
+
+	return limit;
 }
 
 static int sc8547_vooc_initialize_curve(
@@ -934,6 +993,7 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 	struct sc8547_vooc_battery_state state;
 	const struct sc8547_vooc_curve_point *point;
 	u8 requested, active;
+	u8 temp_limit;
 	bool full;
 	bool reduce_active;
 	u8 previous_active;
@@ -971,6 +1031,13 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 		return -EINVAL;
 
 	point = &sc->vooc_curve->points[sc->vooc_curve_index];
+	if (point->exit && state.voltage_uv >= point->target_vbat_uv) {
+		dev_info(sc->dev,
+			 "VOOC curve terminal threshold reached curve=%s index=%u vbat=%d target=%u\n",
+			 sc->vooc_curve->name, sc->vooc_curve_index,
+			 state.voltage_uv, point->target_vbat_uv);
+		return -EALREADY;
+	}
 	/* Match oplus_voocphy_request_fastchg_curv(): inspect the real terminal
 	 * voltage once per second, require four consecutive qualifying samples,
 	 * and retain the curve across the lower-current re-handshake.  target_time
@@ -1011,7 +1078,8 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 	requested = clamp_t(u8, SC8547_VOOC_DEFAULT_CURRENT_CODE,
 				SC8547_VOOC_MIN_CURRENT_CODE,
 				SC8547_VOOC_MAX_CURRENT_CODE);
-	active = min_t(u8, requested, point->target_ibus_code);
+	temp_limit = sc8547_vooc_temp_current_limit(sc, state.temp_decic);
+	active = min3(requested, point->target_ibus_code, temp_limit);
 	if (active < SC8547_VOOC_MIN_CURRENT_CODE)
 		active = SC8547_VOOC_MIN_CURRENT_CODE;
 	previous_active = sc->vooc_active_current_code;
