@@ -143,6 +143,8 @@
 #define SC8547_VOOC_HANDSHAKE_TIMEOUT_MS	9000
 #define SC8547_VOOC_AUTO_RETRY_MAX	3
 #define SC8547_VOOC_AUTO_RETRY_DELAY_MS	2000
+#define SC8547_VOOC_PRE_MODEL_RETRY_MAX	5
+#define SC8547_VOOC_PRE_MODEL_RETRY_DELAY_MS	5000
 #define SC8547_VOOC_USB_SUSPEND_MS	1500
 #define SC8547_VOOC_USB_SETTLE_MS	700
 #define SC8547_VOOC_REACTIVE_SETTLE_MS	350
@@ -413,6 +415,7 @@ struct sc8547_device {
 	const char *role;
 	enum sc8547_variant variant;
 	struct mutex lock;
+	struct mutex psy_lock;
 	struct sc8547_raw_profile profile;
 	struct sc8547_enable_window window;
 	atomic_t policy_cancel;
@@ -421,6 +424,7 @@ struct sc8547_device {
 	bool vooc_capable;
 	bool vooc_auto_retry;
 	bool vooc_resume_retry;
+	bool suspended;
 	bool vooc_cable_online;
 	bool vooc_cable_state_known;
 	u8 vooc_cable_absent_count;
@@ -1183,9 +1187,9 @@ static enum power_supply_property sc8547_psy_props[] = {
 	POWER_SUPPLY_PROP_CALIBRATE,
 };
 
-static int sc8547_psy_get_property(struct power_supply *psy,
-				   enum power_supply_property psp,
-				   union power_supply_propval *val)
+static int sc8547_psy_get_property_unlocked(struct power_supply *psy,
+					    enum power_supply_property psp,
+					    union power_supply_propval *val)
 {
 	struct sc8547_device *sc = power_supply_get_drvdata(psy);
 	unsigned int reg;
@@ -1252,6 +1256,23 @@ static int sc8547_psy_get_property(struct power_supply *psy,
 	default:
 		return -EINVAL;
 	}
+}
+
+static int sc8547_psy_get_property(struct power_supply *psy,
+				   enum power_supply_property psp,
+				   union power_supply_propval *val)
+{
+	struct sc8547_device *sc = power_supply_get_drvdata(psy);
+	int ret;
+
+	mutex_lock(&sc->psy_lock);
+	if (sc->suspended)
+		ret = -EAGAIN;
+	else
+		ret = sc8547_psy_get_property_unlocked(psy, psp, val);
+	mutex_unlock(&sc->psy_lock);
+
+	return ret;
 }
 
 /*
@@ -3621,6 +3642,8 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 						struct sc8547_device, vooc_retry_work);
 	int online;
 	int ret;
+	unsigned int retry_delay_ms;
+	unsigned int retry_max;
 	bool dpdm_normalized = false;
 	bool dpdm_preselected = false;
 	bool session_started = false;
@@ -3703,6 +3726,11 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	}
 	if ((dpdm_normalized || dpdm_preselected) && !session_started)
 		wcd939x_usbss_set_vooc_dpdm(false);
+	retry_max = ret == -EAGAIN ? SC8547_VOOC_PRE_MODEL_RETRY_MAX :
+		SC8547_VOOC_AUTO_RETRY_MAX;
+	retry_delay_ms = ret == -EAGAIN ?
+		SC8547_VOOC_PRE_MODEL_RETRY_DELAY_MS :
+		SC8547_VOOC_AUTO_RETRY_DELAY_MS;
 	if (!ret) {
 		sc->vooc_auto_retry_count = 0;
 		WRITE_ONCE(sc->vooc_auto_retry, false);
@@ -3726,16 +3754,15 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 		}
 		dev_info(sc->dev,
 			 "VOOC session reached terminal threshold; normal charging resumed\n");
-	} else if (sc->vooc_auto_retry_count + 1 <
-			   SC8547_VOOC_AUTO_RETRY_MAX &&
+	} else if (sc->vooc_auto_retry_count + 1 < retry_max &&
 			   sc->vooc_last_vbus_uv <= SC8547_VOOC_MAX_VBUS_UV) {
 		sc->vooc_auto_retry_count++;
 		dev_warn(sc->dev,
-			 "VOOC automatic session failed rc=%d; retry %u/%u\n",
+			 "VOOC automatic session failed rc=%d; retry %u/%u in %u ms\n",
 			 ret, sc->vooc_auto_retry_count,
-			 SC8547_VOOC_AUTO_RETRY_MAX - 1);
+			 retry_max - 1, retry_delay_ms);
 		sc8547_queue_vooc_retry(sc,
-			msecs_to_jiffies(SC8547_VOOC_AUTO_RETRY_DELAY_MS));
+			msecs_to_jiffies(retry_delay_ms));
 	} else {
 		dev_warn(sc->dev,
 			 "VOOC automatic session stopped after rc=%d\n", ret);
@@ -4750,6 +4777,7 @@ static int sc8547_probe(struct i2c_client *client)
 	sc->dev = &client->dev;
 	sc->match_info = device_get_match_data(&client->dev);
 	mutex_init(&sc->lock);
+	mutex_init(&sc->psy_lock);
 	atomic_set(&sc->policy_cancel, 0);
 	atomic_set(&sc->pps_running, 0);
 	atomic_set(&sc->vooc_retry_running, 0);
@@ -4871,7 +4899,13 @@ static int sc8547_suspend(struct device *dev)
 {
 	struct sc8547_device *sc = dev_get_drvdata(dev);
 
-	if (!sc || !sc->vooc_capable)
+	if (!sc)
+		return 0;
+
+	mutex_lock(&sc->psy_lock);
+	sc->suspended = true;
+	mutex_unlock(&sc->psy_lock);
+	if (!sc->vooc_capable)
 		return 0;
 
 	sc->vooc_resume_retry = sc->vooc_initialized ||
@@ -4890,7 +4924,13 @@ static int sc8547_resume(struct device *dev)
 {
 	struct sc8547_device *sc = dev_get_drvdata(dev);
 
-	if (!sc || !sc->vooc_capable || !sc->vooc_resume_retry)
+	if (!sc)
+		return 0;
+
+	mutex_lock(&sc->psy_lock);
+	sc->suspended = false;
+	mutex_unlock(&sc->psy_lock);
+	if (!sc->vooc_capable || !sc->vooc_resume_retry)
 		return 0;
 
 	sc->vooc_resume_retry = false;
