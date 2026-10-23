@@ -774,6 +774,9 @@ static int audioreach_widget_audio_if_module_load(struct audioreach_module *mod,
 	while (tkn_count < le32_to_cpu(mod_array->num_elems)) {
 		val = le32_to_cpu(mod_elem->value);
 		switch (le32_to_cpu(mod_elem->token)) {
+		case AR_TKN_U32_MODULE_HW_IF_TYPE:
+			mod->hw_interface_type = val;
+			break;
 		case AR_TKN_U32_MODULE_HW_IF_IDX:
 			mod->hw_interface_idx = val;
 			break;
@@ -914,6 +917,8 @@ static int audioreach_widget_load_buffer(struct snd_soc_component *component,
 		break;
 	case MODULE_ID_AUDIO_IF_SINK:
 	case MODULE_ID_AUDIO_IF_SOURCE:
+	case MODULE_ID_TDM_SINK:
+	case MODULE_ID_TDM_SOURCE:
 		ret = audioreach_widget_audio_if_module_load(mod, mod_array);
 		if (ret)
 			return ret;
