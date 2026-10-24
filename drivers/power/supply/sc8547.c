@@ -143,6 +143,8 @@
 #define SC8547_VOOC_HANDSHAKE_TIMEOUT_MS	9000
 #define SC8547_VOOC_AUTO_RETRY_MAX	3
 #define SC8547_VOOC_AUTO_RETRY_DELAY_MS	2000
+#define SC8547_VOOC_RECOVERY_RETRY_DELAY_MS	30000
+#define SC8547_VOOC_RECOVERY_RETRY_MAX	3
 #define SC8547_VOOC_PRE_MODEL_RETRY_MAX	5
 #define SC8547_VOOC_PRE_MODEL_RETRY_DELAY_MS	5000
 #define SC8547_VOOC_USB_SUSPEND_MS	1500
@@ -423,6 +425,7 @@ struct sc8547_device {
 	bool pps_capable;
 	bool vooc_capable;
 	bool vooc_auto_retry;
+	unsigned int vooc_recovery_retry_count;
 	bool vooc_resume_retry;
 	bool suspended;
 	bool vooc_cable_online;
@@ -3763,6 +3766,17 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 			 retry_max - 1, retry_delay_ms);
 		sc8547_queue_vooc_retry(sc,
 			msecs_to_jiffies(retry_delay_ms));
+	} else if (sc->vooc_recovery_retry_count <
+		   SC8547_VOOC_RECOVERY_RETRY_MAX &&
+		   sc->vooc_last_vbus_uv >= SC8547_VOOC_CABLE_PRESENT_UV &&
+		   sc->vooc_last_vbus_uv <= SC8547_VOOC_MAX_VBUS_UV) {
+		sc->vooc_recovery_retry_count++;
+		retry_delay_ms = SC8547_VOOC_RECOVERY_RETRY_DELAY_MS;
+		dev_warn(sc->dev,
+			 "VOOC automatic session failed rc=%d; scheduling recovery attempt %u/%u in %u ms\n",
+			 ret, sc->vooc_recovery_retry_count,
+			 SC8547_VOOC_RECOVERY_RETRY_MAX, retry_delay_ms);
+		sc8547_queue_vooc_retry(sc, msecs_to_jiffies(retry_delay_ms));
 	} else {
 		dev_warn(sc->dev,
 			 "VOOC automatic session stopped after rc=%d\n", ret);
@@ -3819,6 +3833,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		}
 		WRITE_ONCE(sc->vooc_cable_online, false);
 		sc->vooc_cable_absent_count = 0;
+		sc->vooc_recovery_retry_count = 0;
 		sc8547_vooc_reset_curve(sc);
 		WRITE_ONCE(sc->vooc_auto_retry, false);
 		atomic_set(&sc->policy_cancel, 1);
@@ -3839,6 +3854,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	atomic_set(&sc->policy_cancel, 0);
 	WRITE_ONCE(sc->vooc_auto_retry, true);
 	sc->vooc_auto_retry_count = 0;
+	sc->vooc_recovery_retry_count = 0;
 	retry_delay = initial_check ?
 		msecs_to_jiffies(SC8547_VOOC_BOOT_SETTLE_MS) : 0;
 	dev_info(sc->dev,
@@ -4937,6 +4953,7 @@ static int sc8547_resume(struct device *dev)
 	atomic_set(&sc->policy_cancel, 0);
 	WRITE_ONCE(sc->vooc_auto_retry, true);
 	sc->vooc_auto_retry_count = 0;
+	sc->vooc_recovery_retry_count = 0;
 	sc8547_queue_vooc_retry(sc, msecs_to_jiffies(1000));
 	dev_info(sc->dev, "VOOC session retry queued after system resume\n");
 
