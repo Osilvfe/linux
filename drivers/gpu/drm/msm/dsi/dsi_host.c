@@ -186,6 +186,7 @@ struct msm_dsi_host {
 	bool registered;
 	bool power_on;
 	bool enabled;
+	bool timing_db_enabled;
 	int irq;
 };
 
@@ -636,7 +637,8 @@ static unsigned long dsi_get_pclk_rate(const struct drm_display_mode *mode,
 	pclk_rate = mode->clock * 1000u;
 
 	if (dsc)
-		pclk_rate = dsi_adjust_pclk_for_compression(mode, dsc, is_bonded_dsi);
+		pclk_rate = dsi_adjust_pclk_for_compression(mode, dsc,
+							   is_bonded_dsi);
 
 	/*
 	 * For bonded DSI mode, the current DRM mode has the complete width of the
@@ -656,7 +658,8 @@ unsigned long dsi_byte_clk_get_rate(struct mipi_dsi_host *host, bool is_bonded_d
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 	u8 lanes = msm_host->lanes;
 	u32 bpp = mipi_dsi_pixel_format_to_bpp(msm_host->format);
-	unsigned long pclk_rate = dsi_get_pclk_rate(mode, msm_host->dsc, is_bonded_dsi);
+	unsigned long pclk_rate = dsi_get_pclk_rate(mode, msm_host->dsc,
+						     is_bonded_dsi);
 	unsigned long pclk_bpp;
 
 	if (lanes == 0) {
@@ -675,7 +678,8 @@ unsigned long dsi_byte_clk_get_rate(struct mipi_dsi_host *host, bool is_bonded_d
 
 static void dsi_calc_pclk(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 {
-	msm_host->pixel_clk_rate = dsi_get_pclk_rate(msm_host->mode, msm_host->dsc, is_bonded_dsi);
+	msm_host->pixel_clk_rate = dsi_get_pclk_rate(msm_host->mode, msm_host->dsc,
+						     is_bonded_dsi);
 	msm_host->byte_clk_rate = dsi_byte_clk_get_rate(&msm_host->base, is_bonded_dsi,
 							msm_host->mode);
 
@@ -2584,19 +2588,135 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 				  const struct drm_display_mode *mode)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	struct drm_display_mode *new_mode;
+	bool installed = false;
 
+	mutex_lock(&msm_host->dev_mutex);
 	if (msm_host->mode) {
-		drm_mode_destroy(msm_host->dev, msm_host->mode);
-		msm_host->mode = NULL;
+		drm_mode_copy(msm_host->mode, mode);
+		mutex_unlock(&msm_host->dev_mutex);
+		return 0;
 	}
+	mutex_unlock(&msm_host->dev_mutex);
 
-	msm_host->mode = drm_mode_duplicate(msm_host->dev, mode);
-	if (!msm_host->mode) {
+	new_mode = drm_mode_duplicate(msm_host->dev, mode);
+	if (!new_mode) {
 		pr_err("%s: cannot duplicate mode\n", __func__);
 		return -ENOMEM;
 	}
 
+	mutex_lock(&msm_host->dev_mutex);
+	if (msm_host->mode) {
+		drm_mode_copy(msm_host->mode, mode);
+	} else {
+		msm_host->mode = new_mode;
+		installed = true;
+	}
+	mutex_unlock(&msm_host->dev_mutex);
+
+	if (!installed)
+		drm_mode_destroy(msm_host->dev, new_mode);
+
 	return 0;
+}
+
+int msm_dsi_host_get_display_mode(struct mipi_dsi_host *host,
+				  struct drm_display_mode *mode)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (msm_host->mode)
+		drm_mode_init(mode, msm_host->mode);
+	else
+		ret = -ENODEV;
+	mutex_unlock(&msm_host->dev_mutex);
+
+	return ret;
+}
+
+static bool dsi_clk_rates_match(long old_rate, long new_rate)
+{
+	unsigned long delta, tolerance;
+
+	if (old_rate < 0 || new_rate < 0)
+		return false;
+
+	delta = old_rate > new_rate ? old_rate - new_rate :
+					new_rate - old_rate;
+	tolerance = (old_rate > new_rate ? old_rate : new_rate) / 1000000;
+
+	return delta <= max(tolerance, 1UL);
+}
+
+bool msm_dsi_host_is_seamless_mode_switch(struct mipi_dsi_host *host,
+					  const struct drm_display_mode *mode,
+					  bool is_bonded_dsi)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	unsigned long old_byte_clk, new_byte_clk;
+	unsigned long old_pixel_clk, new_pixel_clk;
+	bool seamless = false;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_dsi_host_version_geq(msm_host, MSM_DSI_VER_MAJOR_6G,
+					MSM_DSI_6G_VER_MINOR_V2_0_0) ||
+	    !msm_host->power_on || !msm_host->enabled || !msm_host->mode ||
+	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
+		goto out;
+
+	old_byte_clk = dsi_byte_clk_get_rate(host, is_bonded_dsi,
+					     msm_host->mode);
+	new_byte_clk = dsi_byte_clk_get_rate(host, is_bonded_dsi, mode);
+	if (!dsi_clk_rates_match(old_byte_clk, new_byte_clk))
+		goto out;
+
+	old_pixel_clk = dsi_get_pclk_rate(msm_host->mode, msm_host->dsc,
+					  is_bonded_dsi);
+	new_pixel_clk = dsi_get_pclk_rate(mode, msm_host->dsc,
+					  is_bonded_dsi);
+	seamless = dsi_clk_rates_match(old_pixel_clk, new_pixel_clk);
+
+out:
+	mutex_unlock(&msm_host->dev_mutex);
+	return seamless;
+}
+
+int msm_dsi_host_update_timing(struct mipi_dsi_host *host,
+			       bool is_bonded_dsi)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+
+	if (!msm_host->power_on || !msm_host->enabled || !msm_host->mode) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, DSI_TIMING_DB_MODE_EN);
+	msm_host->timing_db_enabled = true;
+	dsi_timing_setup(msm_host, is_bonded_dsi);
+	wmb(); /* Ensure timing DB and shadow timing registers are committed. */
+
+out:
+	mutex_unlock(&msm_host->dev_mutex);
+	return ret;
+}
+
+void msm_dsi_host_disable_timing_db(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (msm_host->power_on && msm_host->timing_db_enabled) {
+		dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 0);
+		wmb(); /* Ensure the timing DB update is latched. */
+	}
+	msm_host->timing_db_enabled = false;
+	mutex_unlock(&msm_host->dev_mutex);
 }
 
 enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,

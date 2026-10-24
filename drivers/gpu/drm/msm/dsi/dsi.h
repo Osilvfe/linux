@@ -55,6 +55,11 @@ bool msm_dsi_manager_cmd_xfer_trigger(int id, u32 dma_base, u32 len);
 int msm_dsi_manager_register(struct msm_dsi *msm_dsi);
 void msm_dsi_manager_unregister(struct msm_dsi *msm_dsi);
 void msm_dsi_manager_tpg_enable(void);
+bool msm_dsi_manager_is_seamless_mode_switch(
+				struct drm_encoder *encoder,
+				const struct drm_display_mode *old_mode,
+				const struct drm_display_mode *new_mode);
+void msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder);
 
 /* dsi host */
 struct msm_dsi_host;
@@ -78,6 +83,15 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 int msm_dsi_host_power_off(struct mipi_dsi_host *host);
 int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 				  const struct drm_display_mode *mode);
+int msm_dsi_host_get_display_mode(struct mipi_dsi_host *host,
+				  struct drm_display_mode *mode);
+bool msm_dsi_host_is_seamless_mode_switch(
+				  struct mipi_dsi_host *host,
+				  const struct drm_display_mode *mode,
+				  bool is_bonded_dsi);
+int msm_dsi_host_update_timing(struct mipi_dsi_host *host,
+			       bool is_bonded_dsi);
+void msm_dsi_host_disable_timing_db(struct mipi_dsi_host *host);
 enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,
 					    const struct drm_display_mode *mode);
 unsigned long msm_dsi_host_get_mode_flags(struct mipi_dsi_host *host);
@@ -152,4 +166,3 @@ void msm_dsi_phy_snapshot(struct msm_disp_state *disp_state, struct msm_dsi_phy 
 bool msm_dsi_phy_set_continuous_clock(struct msm_dsi_phy *phy, bool enable);
 
 #endif /* __DSI_CONNECTOR_H__ */
-

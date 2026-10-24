@@ -170,6 +170,7 @@ enum dpu_enc_rc_states {
  * @idle_timeout:		idle timeout duration in milliseconds
  * @wide_bus_en:		wide bus is enabled on this interface
  * @dsc:			drm_dsc_config pointer, for DSC-enabled encoders
+ * @seamless_mode_switch: reprogram timing after stale flush bits are cleared
  */
 struct dpu_encoder_virt {
 	struct drm_encoder base;
@@ -215,6 +216,8 @@ struct dpu_encoder_virt {
 
 	/* DSC configuration */
 	struct drm_dsc_config *dsc;
+
+	bool seamless_mode_switch;
 };
 
 #define to_dpu_encoder_virt(x) container_of(x, struct dpu_encoder_virt, base)
@@ -1165,6 +1168,7 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 	bool is_cwb_encoder;
 	unsigned int dsc_mask = 0;
 	unsigned int cwb_mask = 0;
+	bool seamless;
 	int i;
 
 	if (!drm_enc) {
@@ -1174,6 +1178,8 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 
 	dpu_enc = to_dpu_encoder_virt(drm_enc);
 	DPU_DEBUG_ENC(dpu_enc, "\n");
+	seamless = msm_dsi_manager_is_seamless_mode_switch(
+				drm_enc, NULL, &crtc_state->adjusted_mode);
 
 	priv = drm_enc->dev->dev_private;
 	dpu_kms = to_dpu_kms(priv->kms);
@@ -1270,6 +1276,8 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 		if (phys->ops.atomic_mode_set)
 			phys->ops.atomic_mode_set(phys, crtc_state, conn_state);
 	}
+
+	dpu_enc->seamless_mode_switch = seamless;
 }
 
 static void _dpu_encoder_virt_enable_helper(struct drm_encoder *drm_enc)
@@ -1862,6 +1870,17 @@ void dpu_encoder_trigger_kickoff_pending(struct drm_encoder *drm_enc)
 		    && ctl->ops.trigger_pending)
 			ctl->ops.trigger_pending(ctl);
 	}
+
+	if (!dpu_enc->seamless_mode_switch)
+		return;
+
+	for (i = 0; i < dpu_enc->num_phys_encs; i++) {
+		phys = dpu_enc->phys_encs[i];
+		if (phys->ops.enable)
+			phys->ops.enable(phys);
+	}
+
+	dpu_enc->seamless_mode_switch = false;
 }
 
 static u32 _dpu_encoder_calculate_linetime(struct dpu_encoder_virt *dpu_enc,

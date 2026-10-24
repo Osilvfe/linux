@@ -303,6 +303,11 @@ bool msm_dsi_is_master_dsi(struct msm_dsi *msm_dsi);
 bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
 struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
 const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi);
+bool msm_dsi_manager_is_seamless_mode_switch(
+				struct drm_encoder *encoder,
+				const struct drm_display_mode *old_mode,
+				const struct drm_display_mode *new_mode);
+void msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder);
 #else
 static inline void __init msm_dsi_register(void)
 {
@@ -344,6 +349,19 @@ static inline struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_
 static inline const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi)
 {
 	return NULL;
+}
+
+static inline bool msm_dsi_manager_is_seamless_mode_switch(
+				struct drm_encoder *encoder,
+				const struct drm_display_mode *old_mode,
+				const struct drm_display_mode *new_mode)
+{
+	return false;
+}
+
+static inline void
+msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder)
+{
 }
 #endif
 

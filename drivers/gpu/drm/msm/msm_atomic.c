@@ -181,6 +181,71 @@ static unsigned get_crtc_mask(struct drm_atomic_commit *state)
 	return mask;
 }
 
+static bool msm_atomic_is_seamless_mode_switch(
+		struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *old_conn_state, *new_conn_state;
+	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	struct drm_connector *connector;
+	struct drm_crtc *crtc;
+	bool has_modeset = false;
+	int i, j;
+
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
+				      new_crtc_state, i) {
+		bool has_connector = false;
+
+		if (!drm_atomic_crtc_needs_modeset(new_crtc_state))
+			continue;
+
+		has_modeset = true;
+		if (!new_crtc_state->mode_changed ||
+		    new_crtc_state->active_changed ||
+		    new_crtc_state->connectors_changed ||
+		    !old_crtc_state->active || !new_crtc_state->active ||
+		    !old_crtc_state->enable || !new_crtc_state->enable)
+			return false;
+
+		for_each_oldnew_connector_in_state(state, connector,
+						   old_conn_state,
+						   new_conn_state, j) {
+			if (new_conn_state->crtc != crtc)
+				continue;
+
+			has_connector = true;
+			if (old_conn_state->crtc != crtc ||
+			    !new_conn_state->best_encoder ||
+			    old_conn_state->best_encoder !=
+					new_conn_state->best_encoder ||
+			    !msm_dsi_manager_is_seamless_mode_switch(
+					new_conn_state->best_encoder,
+					&old_crtc_state->adjusted_mode,
+					&new_crtc_state->adjusted_mode))
+				return false;
+		}
+
+		if (!has_connector)
+			return false;
+	}
+
+	return has_modeset;
+}
+
+static void msm_atomic_disable_timing_db(struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *new_conn_state;
+	struct drm_connector *connector;
+	int i;
+
+	for_each_new_connector_in_state(state, connector, new_conn_state, i) {
+		if (!new_conn_state->crtc || !new_conn_state->best_encoder ||
+		    !new_conn_state->crtc->state->mode_changed)
+			continue;
+
+		msm_dsi_manager_disable_timing_db(new_conn_state->best_encoder);
+	}
+}
+
 int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 {
 	struct msm_drm_private *priv = dev->dev_private;
@@ -218,6 +283,7 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 	struct drm_crtc *async_crtc = NULL;
 	unsigned crtc_mask = get_crtc_mask(state);
 	bool async = can_do_async(state, &async_crtc);
+	bool seamless = msm_atomic_is_seamless_mode_switch(state);
 
 	trace_msm_atomic_commit_tail_start(async, crtc_mask);
 
@@ -244,9 +310,16 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 	/*
 	 * Push atomic updates down to hardware:
 	 */
-	drm_atomic_helper_commit_modeset_disables(dev, state);
+	if (seamless) {
+		drm_atomic_helper_update_legacy_modeset_state(dev, state);
+		drm_atomic_helper_calc_timestamping_constants(state);
+		drm_atomic_helper_commit_crtc_set_mode(dev, state);
+	} else {
+		drm_atomic_helper_commit_modeset_disables(dev, state);
+	}
 	drm_atomic_helper_commit_planes(dev, state, 0);
-	drm_atomic_helper_commit_modeset_enables(dev, state);
+	if (!seamless)
+		drm_atomic_helper_commit_modeset_enables(dev, state);
 
 	if (async) {
 		struct msm_pending_timer *timer =
@@ -309,6 +382,8 @@ fallback:
 	trace_msm_atomic_wait_flush_start(crtc_mask);
 	kms->funcs->wait_flush(kms, crtc_mask);
 	trace_msm_atomic_wait_flush_finish(crtc_mask);
+	if (seamless)
+		msm_atomic_disable_timing_db(state);
 
 	vblank_put(kms, crtc_mask);
 
