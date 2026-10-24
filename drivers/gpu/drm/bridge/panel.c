@@ -233,6 +233,39 @@ bool drm_bridge_is_panel(const struct drm_bridge *bridge)
 }
 EXPORT_SYMBOL(drm_bridge_is_panel);
 
+bool drm_panel_bridge_mode_switch_is_seamless(
+		struct drm_bridge *bridge,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	struct panel_bridge *panel_bridge;
+
+	if (!drm_bridge_is_panel(bridge))
+		return false;
+
+	panel_bridge = drm_bridge_to_panel_bridge(bridge);
+
+	return drm_panel_mode_switch_is_seamless(panel_bridge->panel,
+						 old_mode, new_mode);
+}
+EXPORT_SYMBOL(drm_panel_bridge_mode_switch_is_seamless);
+
+int drm_panel_bridge_mode_switch(
+		struct drm_bridge *bridge,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	struct panel_bridge *panel_bridge;
+
+	if (!drm_bridge_is_panel(bridge))
+		return -EINVAL;
+
+	panel_bridge = drm_bridge_to_panel_bridge(bridge);
+
+	return drm_panel_mode_switch(panel_bridge->panel, old_mode, new_mode);
+}
+EXPORT_SYMBOL(drm_panel_bridge_mode_switch);
+
 /**
  * drm_panel_bridge_add - Creates a &drm_bridge and &drm_connector that
  * just calls the appropriate functions from &drm_panel.

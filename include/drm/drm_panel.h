@@ -34,6 +34,7 @@ struct backlight_device;
 struct dentry;
 struct device_node;
 struct drm_connector;
+struct drm_display_mode;
 struct drm_panel_follower;
 struct drm_panel;
 struct display_timing;
@@ -117,6 +118,29 @@ struct drm_panel_funcs {
 	 */
 	int (*get_modes)(struct drm_panel *panel,
 			 struct drm_connector *connector);
+
+	/**
+	 * @mode_switch_is_seamless:
+	 *
+	 * Check whether the panel can switch between two modes without being
+	 * disabled or unprepared.
+	 *
+	 * This function is optional.
+	 */
+	bool (*mode_switch_is_seamless)(struct drm_panel *panel,
+					const struct drm_display_mode *old_mode,
+					const struct drm_display_mode *new_mode);
+
+	/**
+	 * @mode_switch:
+	 *
+	 * Program the panel for a seamless switch between two modes.
+	 *
+	 * This function is optional.
+	 */
+	int (*mode_switch)(struct drm_panel *panel,
+			   const struct drm_display_mode *old_mode,
+			   const struct drm_display_mode *new_mode);
 
 	/**
 	 * @get_orientation:
@@ -334,6 +358,12 @@ void drm_panel_enable(struct drm_panel *panel);
 void drm_panel_disable(struct drm_panel *panel);
 
 int drm_panel_get_modes(struct drm_panel *panel, struct drm_connector *connector);
+bool drm_panel_mode_switch_is_seamless(struct drm_panel *panel,
+				       const struct drm_display_mode *old_mode,
+				       const struct drm_display_mode *new_mode);
+int drm_panel_mode_switch(struct drm_panel *panel,
+			  const struct drm_display_mode *old_mode,
+			  const struct drm_display_mode *new_mode);
 
 #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
 struct drm_panel *of_drm_find_panel(const struct device_node *np);

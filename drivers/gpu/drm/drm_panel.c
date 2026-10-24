@@ -370,6 +370,28 @@ int drm_panel_get_modes(struct drm_panel *panel,
 }
 EXPORT_SYMBOL(drm_panel_get_modes);
 
+bool drm_panel_mode_switch_is_seamless(struct drm_panel *panel,
+				       const struct drm_display_mode *old_mode,
+				       const struct drm_display_mode *new_mode)
+{
+	if (!panel || !panel->funcs || !panel->funcs->mode_switch_is_seamless)
+		return false;
+
+	return panel->funcs->mode_switch_is_seamless(panel, old_mode, new_mode);
+}
+EXPORT_SYMBOL(drm_panel_mode_switch_is_seamless);
+
+int drm_panel_mode_switch(struct drm_panel *panel,
+			  const struct drm_display_mode *old_mode,
+			  const struct drm_display_mode *new_mode)
+{
+	if (!panel || !panel->funcs || !panel->funcs->mode_switch)
+		return -EINVAL;
+
+	return panel->funcs->mode_switch(panel, old_mode, new_mode);
+}
+EXPORT_SYMBOL(drm_panel_mode_switch);
+
 static void __drm_panel_free(struct kref *kref)
 {
 	struct drm_panel *panel = container_of(kref, struct drm_panel, refcount);

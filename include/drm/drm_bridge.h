@@ -1489,6 +1489,14 @@ struct drm_bridge *devm_drm_panel_bridge_add_typed(struct device *dev,
 struct drm_bridge *drmm_panel_bridge_add(struct drm_device *drm,
 					     struct drm_panel *panel);
 struct drm_connector *drm_panel_bridge_connector(struct drm_bridge *bridge);
+bool drm_panel_bridge_mode_switch_is_seamless(
+		struct drm_bridge *bridge,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode);
+int drm_panel_bridge_mode_switch(
+		struct drm_bridge *bridge,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode);
 #else
 static inline bool drm_bridge_is_panel(const struct drm_bridge *bridge)
 {
@@ -1500,6 +1508,23 @@ static inline int drm_panel_bridge_set_orientation(struct drm_connector *connect
 {
 	return -EINVAL;
 }
+
+static inline bool drm_panel_bridge_mode_switch_is_seamless(
+		struct drm_bridge *bridge,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	return false;
+}
+
+static inline int drm_panel_bridge_mode_switch(
+		struct drm_bridge *bridge,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	return -EINVAL;
+}
+
 #endif
 
 #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL_BRIDGE)
