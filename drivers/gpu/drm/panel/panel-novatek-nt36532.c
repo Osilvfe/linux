@@ -18,6 +18,8 @@
 
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
@@ -25,6 +27,7 @@
 
 struct nt36532 {
 	struct drm_panel panel;
+	struct drm_connector *connector;
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_info *panel_info;
 	struct drm_dsc_config dsc;
@@ -32,12 +35,19 @@ struct nt36532 {
 	struct regulator_bulk_data *supplies;
 };
 
+struct nt36532_panel_mode {
+	const struct drm_display_mode mode;
+	u8 refresh_b2;
+	u8 refresh_b3;
+};
+
 struct panel_info {
 	unsigned int lanes;
 	enum mipi_dsi_pixel_format format;
 	unsigned long mode_flags;
 
-	const struct drm_display_mode display_mode;
+	const struct nt36532_panel_mode *modes;
+	unsigned int num_modes;
 
 	const struct drm_dsc_config *dsc_cfg;
 
@@ -45,6 +55,9 @@ struct panel_info {
 
 	bool is_dual_dsi;
 };
+
+#define CSOT_BASE_CLOCK_KHZ \
+	((1500 + 118 + 20 + 100) * 2 * (2120 + 26 + 2 + 208) * 120 / 1000)
 
 static const struct regulator_bulk_data nt36532_supplies[] = {
 	{ .supply = "vddio" }, /* 1.8v */
@@ -128,22 +141,116 @@ static int nt36532_get_modes(struct drm_panel *panel,
 {
 	struct nt36532 *ctx = to_nt36532(panel);
 	const struct panel_info *panel_info = ctx->panel_info;
+	struct drm_display_mode *mode;
+	unsigned int i;
 
-	return drm_connector_helper_get_modes_fixed(connector,
-						    &panel_info->display_mode);
+	ctx->connector = connector;
+
+	for (i = 0; i < panel_info->num_modes; i++) {
+		mode = drm_mode_duplicate(connector->dev,
+					  &panel_info->modes[i].mode);
+		if (!mode)
+			return -ENOMEM;
+
+		mode->type = DRM_MODE_TYPE_DRIVER;
+		if (!i)
+			mode->type |= DRM_MODE_TYPE_PREFERRED;
+
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+	}
+
+	connector->display_info.bpc = 8;
+	connector->display_info.width_mm = panel_info->modes[0].mode.width_mm;
+	connector->display_info.height_mm = panel_info->modes[0].mode.height_mm;
+
+	return panel_info->num_modes;
+}
+
+static int nt36532_find_mode(struct nt36532 *ctx,
+			     const struct drm_display_mode *mode)
+{
+	unsigned int i;
+
+	for (i = 0; i < ctx->panel_info->num_modes; i++) {
+		if (drm_mode_match(mode, &ctx->panel_info->modes[i].mode,
+				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK))
+			return i;
+	}
+
+	return -EINVAL;
+}
+
+static unsigned int nt36532_get_current_mode(struct nt36532 *ctx)
+{
+	struct drm_crtc_state *crtc_state;
+	int mode;
+
+	if (!ctx->connector || !ctx->connector->state ||
+	    !ctx->connector->state->crtc)
+		return 0;
+
+	crtc_state = ctx->connector->state->crtc->state;
+	mode = nt36532_find_mode(ctx, &crtc_state->adjusted_mode);
+
+	return mode < 0 ? 0 : mode;
+}
+
+static bool nt36532_mode_switch_is_seamless(
+		struct drm_panel *panel,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	struct nt36532 *ctx = to_nt36532(panel);
+	int old_index, new_index;
+
+	old_index = nt36532_find_mode(ctx, old_mode);
+	new_index = nt36532_find_mode(ctx, new_mode);
+
+	return old_index >= 0 && new_index >= 0 && old_index != new_index;
+}
+
+static int nt36532_mode_switch(struct drm_panel *panel,
+			       const struct drm_display_mode *old_mode,
+			       const struct drm_display_mode *new_mode)
+{
+	struct nt36532 *ctx = to_nt36532(panel);
+	struct mipi_dsi_device *dsi = to_primary_dsi(ctx);
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	const struct nt36532_panel_mode *mode;
+	int old_index, new_index;
+
+	old_index = nt36532_find_mode(ctx, old_mode);
+	new_index = nt36532_find_mode(ctx, new_mode);
+	if (old_index < 0 || new_index < 0 || old_index == new_index)
+		return -EINVAL;
+
+	mode = &ctx->panel_info->modes[new_index];
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb2, mode->refresh_b2);
+	mipi_dsi_msleep(&dsi_ctx, 64);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb3, mode->refresh_b3);
+
+	return dsi_ctx.accum_err;
 }
 
 static const struct drm_panel_funcs nt36532_panel_funcs = {
 	.prepare = nt36532_prepare,
 	.unprepare = nt36532_unprepare,
 	.get_modes = nt36532_get_modes,
+	.mode_switch_is_seamless = nt36532_mode_switch_is_seamless,
+	.mode_switch = nt36532_mode_switch,
 };
 
 static int csot_init_sequence(struct nt36532 *ctx)
 {
 	struct mipi_dsi_device *dsi = to_primary_dsi(ctx);
+	const struct nt36532_panel_mode *mode;
 	struct drm_dsc_picture_parameter_set pps;
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	unsigned int mode_index;
+
+	mode_index = nt36532_get_current_mode(ctx);
+	mode = &ctx->panel_info->modes[mode_index];
 
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x22);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
@@ -274,9 +381,8 @@ static int csot_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9d, 0x01);
 
-	/* Program refresh rate control registers */
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x91);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x40);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb2, mode->refresh_b2);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb3, mode->refresh_b3);
 
 	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
 	mipi_dsi_msleep(&dsi_ctx, 120);
@@ -287,19 +393,33 @@ static int csot_init_sequence(struct nt36532 *ctx)
 	return dsi_ctx.accum_err;
 }
 
-static const struct drm_display_mode csot_display_mode = {
-	/* 120Hz, the typical value */
-	.clock = (1500 + 118 + 20 + 100) * 2 * (2120 + 26 + 2 + 208) * 120 / 1000,
-	.hdisplay = 1500 * 2,
-	.hsync_start = (1500 + 118) * 2,
-	.hsync_end = (1500 + 118 + 20) * 2,
-	.htotal = (1500 + 118 + 20 + 100) * 2,
-	.vdisplay = 2120,
-	.vsync_start = 2120 + 26,
-	.vsync_end = 2120 + 26 + 2,
-	.vtotal = 2120 + 26 + 2 + 208,
-	.width_mm = 250,
-	.height_mm = 177,
+/* The CSOT panel switches DFPS modes without changing the DSI link clock. */
+#define CSOT_DISPLAY_MODE(_clock, _hfront, _hback, _vfront, _b2, _b3) \
+	{ \
+		.mode = { \
+			.clock = (_clock), \
+			.hdisplay = 1500 * 2, \
+			.hsync_start = (1500 + (_hfront)) * 2, \
+			.hsync_end = (1500 + (_hfront) + 20) * 2, \
+			.htotal = (1500 + (_hfront) + 20 + (_hback)) * 2, \
+			.vdisplay = 2120, \
+			.vsync_start = 2120 + (_vfront), \
+			.vsync_end = 2120 + (_vfront) + 2, \
+			.vtotal = 2120 + (_vfront) + 2 + 208, \
+			.width_mm = 250, \
+			.height_mm = 177, \
+		}, \
+		.refresh_b2 = (_b2), \
+		.refresh_b3 = (_b3), \
+	}
+
+static const struct nt36532_panel_mode csot_modes[] = {
+	CSOT_DISPLAY_MODE(CSOT_BASE_CLOCK_KHZ, 118, 100, 26, 0x91, 0x40),
+	CSOT_DISPLAY_MODE(CSOT_BASE_CLOCK_KHZ, 118, 100, 811, 0x00, 0x80),
+	CSOT_DISPLAY_MODE(CSOT_BASE_CLOCK_KHZ, 118, 100, 2382, 0x91, 0x40),
+	CSOT_DISPLAY_MODE(CSOT_BASE_CLOCK_KHZ, 118, 100, 3324, 0x00, 0x80),
+	CSOT_DISPLAY_MODE(CSOT_BASE_CLOCK_KHZ, 118, 100, 3560, 0x00, 0x80),
+	CSOT_DISPLAY_MODE(CSOT_BASE_CLOCK_KHZ, 118, 100, 7094, 0x91, 0x40),
 };
 
 static const struct drm_dsc_config csot_dsc_cfg = {
@@ -405,7 +525,8 @@ static const struct panel_info csot_panel_info = {
 	.format = MIPI_DSI_FMT_RGB888,
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |
 		      MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT,
-	.display_mode = csot_display_mode,
+	.modes = csot_modes,
+	.num_modes = ARRAY_SIZE(csot_modes),
 	.dsc_cfg = &csot_dsc_cfg,
 	.init_sequence = csot_init_sequence,
 	.is_dual_dsi = true,
