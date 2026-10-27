@@ -1425,7 +1425,8 @@ static int qcom_camera_icp_bps_client_session_close(
 
 	ret = qcom_camera_icp_bps_session_close(session);
 	if (!ret) {
-		if (session->work_cpu)
+		if (session->work_cpu &&
+		    session->work_cpu != icp->bps_test_buffer.cpu)
 			dma_free_coherent(icp->dev, session->work_size,
 					  session->work_cpu, session->work_iova);
 		kfree(session);
@@ -1442,7 +1443,8 @@ static void qcom_camera_icp_bps_client_session_abort(
 {
 	struct qcom_camera_icp *icp = session->icp;
 
-	if (session->work_cpu)
+	if (session->work_cpu &&
+	    session->work_cpu != icp->bps_test_buffer.cpu)
 		dma_free_coherent(icp->dev, session->work_size,
 				  session->work_cpu, session->work_iova);
 	kfree(session);
@@ -1572,11 +1574,18 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	cdm_offset = PAGE_ALIGN(CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET +
 				striping_firmware->size);
 	gamma_offset = cdm_offset + CAMERA_ICP_BPS_FRAME_CDM_SIZE;
-	session->work_size = PAGE_ALIGN(gamma_offset +
-					CAMERA_ICP_BPS_GAMMA_LUT_SIZE);
-	session->work_cpu = dma_alloc_coherent(icp->dev, session->work_size,
-					       &session->work_iova,
-					       GFP_KERNEL | GFP_DMA32);
+	if (icp->bps_test_buffer.cpu && !test_bps_frame) {
+		session->work_cpu = icp->bps_test_buffer.cpu;
+		session->work_iova = icp->bps_test_buffer.iova;
+		session->work_size = icp->bps_test_buffer.size;
+	} else {
+		session->work_size = PAGE_ALIGN(gamma_offset +
+						CAMERA_ICP_BPS_GAMMA_LUT_SIZE);
+		session->work_cpu = dma_alloc_coherent(icp->dev,
+						       session->work_size,
+						       &session->work_iova,
+						       GFP_KERNEL | GFP_DMA32);
+	}
 	if (!session->work_cpu) {
 		ret = -ENOMEM;
 		goto release_firmware;
@@ -1615,20 +1624,26 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	ret = qcom_camera_icp_bps_session_map(session, session->work_iova,
 					      session->work_size, true);
 	if (ret)
-		goto free_work;
+		goto fail_unmap;
 	ret = qcom_camera_icp_bps_session_config(session, session->work_iova);
 	if (ret)
-		goto release_firmware;
+		goto fail_unmap;
 
 	release_firmware(striping_firmware);
 	return 0;
 
+fail_unmap:
+	qcom_camera_icp_bps_session_map(session, session->work_iova,
+					session->work_size, false);
+
 free_work:
-	dma_free_coherent(icp->dev, session->work_size, session->work_cpu,
-			  session->work_iova);
-	session->work_cpu = NULL;
-	session->work_iova = 0;
-	session->work_size = 0;
+	if (session->work_cpu != icp->bps_test_buffer.cpu) {
+		dma_free_coherent(icp->dev, session->work_size,
+				  session->work_cpu, session->work_iova);
+		session->work_cpu = NULL;
+		session->work_iova = 0;
+		session->work_size = 0;
+	}
 release_firmware:
 	release_firmware(striping_firmware);
 	return ret;
