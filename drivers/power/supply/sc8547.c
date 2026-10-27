@@ -19,6 +19,7 @@
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/pm.h>
+#include <linux/pm_qos.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/random.h>
@@ -1765,7 +1766,8 @@ static int sc8547_vooc_secondary_monitor(
 			 "VOOC secondary status rejected reg06=0x%02x reg07=0x%02x "
 			 "reg0e=0x%02x vbus=%d ibus=%d vout=%d tdie=%d\n",
 			 reg06, reg07, reg0e, vbus_uv, ibus_ua, vout_uv, tdie_mc);
-		return -EIO;
+		ret = -EIO;
+		goto disable_secondary;
 	}
 	if (vbus_uv < SC8547_VOOC_CP_MIN_VBUS_UV ||
 	    vbus_uv > SC8547_VOOC_MAX_VBUS_UV ||
@@ -1775,7 +1777,8 @@ static int sc8547_vooc_secondary_monitor(
 			 "VOOC secondary range rejected reg06=0x%02x reg07=0x%02x "
 			 "reg0e=0x%02x vbus=%d ibus=%d vout=%d tdie=%d\n",
 			 reg06, reg07, reg0e, vbus_uv, ibus_ua, vout_uv, tdie_mc);
-		return -ERANGE;
+		ret = -ERANGE;
+		goto disable_secondary;
 	}
 
 	/*
@@ -1840,6 +1843,11 @@ static int sc8547_vooc_secondary_monitor(
 
 	state->switching_confirmed = true;
 	return 0;
+
+disable_secondary:
+	sc8547_vooc_secondary_disable(state);
+	state->reenable_needed = true;
+	return ret;
 }
 
 static int sc8547_vooc_secondary_enable(
@@ -2205,19 +2213,29 @@ static void sc8547_vooc_select_tx_head(struct sc8547_device *sc, u8 rx)
 }
 
 static int sc8547_vooc_send_data(struct sc8547_device *sc, u8 data,
-					 u8 *tx_h, u8 *tx_l)
+				 bool refresh_predata, u8 *tx_h, u8 *tx_l)
 {
 	u16 source = sc->vooc_tx_head | ((u16)(data & 0x7f) << 3);
 	u16 wire = 0;
 	int bit;
+	int ret;
 
 	for (bit = 0; bit < 10; bit++)
 		wire |= ((source >> bit) & 0x1) << (9 - bit);
 
 	*tx_h = wire & 0xff;
 	*tx_l = (wire >> 8) & 0x03;
-	return sc8547_vooc_write_word(sc, SC8547_REG_VOOC_TX_DATA_H,
+	ret = sc8547_vooc_write_word(sc, SC8547_REG_VOOC_TX_DATA_H,
+				     (*tx_h << 8) | *tx_l);
+	if (ret)
+		return ret;
+
+	/* Match the vendor SC8547A TX preload on every battery-voltage frame. */
+	if (refresh_predata)
+		return sc8547_vooc_write_word(sc,
+					      SC8547_REG_VOOC_PRE_DATA_H,
 					      (*tx_h << 8) | *tx_l);
+	return 0;
 }
 
 static void sc8547_vooc_identification(struct sc8547_device *sc, u8 *data)
@@ -2465,7 +2483,10 @@ static int sc8547_vooc_send_safe_reply(struct sc8547_device *sc, u8 rx,
 		break;
 	}
 
-	ret = sc8547_vooc_send_data(sc, data, tx_h, tx_l);
+	ret = sc8547_vooc_send_data(sc, data,
+				    fast_entry &&
+				    command == SC8547_VOOC_CMD_GET_BATT_VOL,
+				    tx_h, tx_l);
 	if (ret)
 		return ret;
 	dev_dbg(sc->dev,
@@ -2523,6 +2544,7 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 	int saved_input_current_limit = -1;
 	bool charger_suspended = false;
 	bool dpdm_switched = false;
+	struct pm_qos_request vooc_qos;
 	struct sc8547_vooc_secondary_state secondary_state = { };
 	int ret, cleanup_ret, restore_ret, reg07_restore_ret;
 	int secondary_restore_ret, secondary_disable_ret;
@@ -2535,53 +2557,57 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 	continuous_session = READ_ONCE(sc->vooc_cable_online);
 	/* Reset session state before arming the PHY. */
 	sc->vooc_last_cp_started = false;
+	cpu_latency_qos_add_request(&vooc_qos, 400);
 
 	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg07 = reg;
 	if (reg & SC8547_CHG_EN)
-		return -EBUSY;
+	{
+		ret = -EBUSY;
+		goto out_qos;
+	}
 
 	ret = regmap_read(sc->regmap, SC8547_REG_LOOSE_DET, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_loose = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_VOOCPHY_TIMING, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_timing = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg09 = reg;
 	ret = regmap_read(sc->regmap, SC8547A_REG_OTG_CTRL, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg3b = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_INT_MASK, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg10 = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_PROT, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg05 = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_CTRL, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg0c = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_SS_CTRL, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg08 = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_PMID2OUT, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg0d = reg;
 	ret = regmap_read(sc->regmap, SC8547_REG_ADC_CTRL, &reg);
 	if (ret)
-		return ret;
+		goto out_qos;
 	saved_reg11 = reg;
 	ret = sc8547_update_vooc_current_policy(sc);
 	if (ret) {
@@ -2589,16 +2615,13 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 			 "VOOC fast session refused by battery policy: %d full=%u capacity=%d vbat=%d temp=%d\n",
 			 ret, sc->vooc_policy_full, sc->vooc_policy_capacity,
 			 sc->vooc_policy_vbat_uv, sc->vooc_policy_temp_decic);
-		return ret;
+		goto out_qos;
 	}
 
-	/* The vendor init_vooc entry always resets the SC8547A PHY first.  This
-	 * clears a latched ERR_TRANS/TX state left by a previous session while the
-	 * charge pump remains disabled. */
 	ret = regmap_update_bits(sc->regmap, SC8547_REG_CHG_CTRL,
 				 SC8547_REG_RESET, SC8547_REG_RESET);
 	if (ret)
-		return ret;
+		goto out_qos;
 	msleep(SC8547_RESET_SETTLE_MS);
 	sc->vooc_last_total_ibus_ua = -ENODATA;
 
@@ -2801,11 +2824,6 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 			rx = reg;
 			if (rx_count < U8_MAX)
 				rx_count++;
-			/* The stock voocphy treats a write failure on the first
-			 * post-model ASK_CURRENT frame as an adapter-state failure.  It
-			 * consumes the combined 0x0f interrupt without overwriting TXDATA,
-			 * then reports the failure on the following GET_BATT_VOL frame so
-			 * the outer state machine can perform a clean handshake restart. */
 			if (fast_entry_sent && sc->vooc_batt_model_done &&
 			    !sc->vooc_commu_remaining &&
 			    !sc->vooc_model_remaining &&
@@ -3033,7 +3051,12 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 					ret = sc8547_vooc_secondary_monitor(
 						&secondary_state, ibus_ua,
 						&secondary_total_ibus_ua);
-					if (ret) {
+					if ((ret == -EIO || ret == -ERANGE) &&
+					    !secondary_state.enabled) {
+						secondary_total_ibus_ua = ibus_ua;
+						sc->vooc_last_total_ibus_ua = ibus_ua;
+						ret = 0;
+					} else if (ret) {
 						dev_warn(sc->dev,
 							 "VOOC secondary CP monitor failed: %d\n", ret);
 						break;
@@ -3097,7 +3120,11 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 				       SC8547_VOOC_NINTH_CLK_ERR))) {
 				if (!vooc_tx_fail_seen) {
 					dev_warn(sc->dev,
-						 "VOOC TXDATA_WR_FAIL during fast entry; continuing bounded monitor\n");
+						 "VOOC TXDATA_WR_FAIL flags=0x%02x rx=0x%02x frames=%u code=%u fast=%d cp=%d elapsed_ms=%lld; continuing bounded monitor\n",
+						 flags, rx, rx_count,
+						 sc->vooc_active_current_code,
+						 fast_entry_sent, vooc_cp_enabled,
+						 elapsed_us / USEC_PER_MSEC);
 					vooc_tx_fail_seen = true;
 				}
 				/* Continue with the normal ADC and CP status checks below. */
@@ -3309,7 +3336,12 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 						ret = sc8547_vooc_secondary_monitor(
 							&secondary_state, ibus_ua,
 							&secondary_total_ibus_ua);
-						if (ret) {
+						if ((ret == -EIO || ret == -ERANGE) &&
+						    !secondary_state.enabled) {
+							secondary_total_ibus_ua = ibus_ua;
+							sc->vooc_last_total_ibus_ua = ibus_ua;
+							ret = 0;
+						} else if (ret) {
 							dev_warn(sc->dev,
 								 "VOOC secondary CP monitor failed: %d\n", ret);
 							break;
@@ -3385,6 +3417,10 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 			 rx_count, sc->vooc_last_vbus_uv);
 		ret = -ETIMEDOUT;
 	}
+
+out_qos:
+	cpu_latency_qos_remove_request(&vooc_qos);
+	return ret;
 
 out_cleanup:
 	secondary_disable_ret = sc8547_vooc_secondary_disable(&secondary_state);
