@@ -853,7 +853,7 @@
 		clocks = <&camcc CAM_CC_MCLK4_CLK>;
 		clock-names = "xvclk";
 		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
-		assigned-clock-rates = <19200000>;
+		assigned-clock-rates = <24000000>;
 		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
 
 		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
@@ -870,7 +870,7 @@
 			caihong_front_cam_ep: endpoint {
 				clock-lanes = <7>;
 				data-lanes = <0 1 2 3>;
-				link-frequencies = /bits/ 64 <366000000>;
+				link-frequencies = /bits/ 64 <457500000>;
 				remote-endpoint = <&caihong_csiphy4_ep>;
 			};
 		};
@@ -899,7 +899,7 @@
 		clocks = <&camcc CAM_CC_MCLK1_CLK>;
 		clock-names = "xvclk";
 		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
-		assigned-clock-rates = <19200000>;
+		assigned-clock-rates = <24000000>;
 		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
 
 		reset-gpios = <&tlmm 82 GPIO_ACTIVE_LOW>;
@@ -915,7 +915,7 @@
 			caihong_rear_cam_ep: endpoint {
 				clock-lanes = <7>;
 				data-lanes = <0 1 2 3>;
-				link-frequencies = /bits/ 64 <600000000>;
+				link-frequencies = /bits/ 64 <750000000>;
 				remote-endpoint = <&caihong_csiphy1_ep>;
 			};
 		};

@@ -28,7 +28,7 @@
 
 #include "sc1320cs-caihong-regs.h"
 
-#define SC1320CS_XVCLK_FREQ		19200000
+#define SC1320CS_XVCLK_FREQ		24000000
 #define SC1320CS_CHIP_ID_REG_H		0x3107
 #define SC1320CS_CHIP_ID_REG_L		0x3108
 #define SC1320CS_CHIP_ID			0xc658
@@ -37,9 +37,8 @@
 #define SC1320CS_NATIVE_WIDTH		4208
 #define SC1320CS_NATIVE_HEIGHT		3120
 #define SC1320CS_NUM_DATA_LANES		4
-#define SC1320CS_LINK_FREQ		600000000ULL
-/* The 5000 x 3200 vendor mode runs at 24 fps. */
-#define SC1320CS_PIXEL_RATE		384000000ULL
+#define SC1320CS_LINK_FREQ		750000000ULL
+#define SC1320CS_PIXEL_RATE		480000000ULL
 
 #define SC1320CS_HTS			5000
 #define SC1320CS_VTS			3200
@@ -77,6 +76,8 @@ struct sc1320cs {
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_mbus_framefmt active_fmt;
 	struct i2c_client *eeprom_client;
 	u8 *eeprom_data;
 	struct mutex mutex;
@@ -364,10 +365,16 @@ static int sc1320cs_write_mode(struct sc1320cs *sensor)
 		return ret;
 
 	usleep_range(5000, 6000);
-	return cci_multi_reg_write(sensor->regmap,
+	ret = cci_multi_reg_write(sensor->regmap,
 			&sc1320cs_caihong_4208x3120_regs[1],
 			ARRAY_SIZE(sc1320cs_caihong_4208x3120_regs) - 1,
 			NULL);
+	if (ret || sensor->active_fmt.width == SC1320CS_NATIVE_WIDTH)
+		return ret;
+
+	return cci_multi_reg_write(sensor->regmap,
+			sc1320cs_caihong_2104x1560_regs,
+			ARRAY_SIZE(sc1320cs_caihong_2104x1560_regs), NULL);
 }
 
 static int sc1320cs_write_exposure(struct sc1320cs *sensor,
@@ -410,7 +417,7 @@ static int sc1320cs_write_vblank(struct sc1320cs *sensor,
 				 unsigned int vblank)
 {
 	return cci_write(sensor->regmap, CCI_REG16(0x320e),
-			 SC1320CS_NATIVE_HEIGHT + vblank, NULL);
+			 sensor->active_fmt.height + vblank, NULL);
 }
 
 static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
@@ -420,7 +427,7 @@ static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
 	unsigned int exposure_max;
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
-		exposure_max = SC1320CS_NATIVE_HEIGHT + ctrl->val -
+		exposure_max = sensor->active_fmt.height + ctrl->val -
 			       SC1320CS_EXPOSURE_MARGIN;
 		__v4l2_ctrl_modify_range(sensor->exposure,
 					 SC1320CS_EXPOSURE_MIN,
@@ -506,6 +513,7 @@ static int sc1320cs_init_controls(struct sc1320cs *sensor)
 	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sensor->hblank = hblank;
 	sensor->sd.ctrl_handler = &sensor->ctrls;
 	return 0;
 
@@ -538,28 +546,17 @@ static int sc1320cs_enum_frame_size(struct v4l2_subdev *sd,
 				    struct v4l2_subdev_state *state,
 				    struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+	if (fse->index > 1 || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
 		return -EINVAL;
 
-	fse->min_width = SC1320CS_NATIVE_WIDTH;
-	fse->max_width = SC1320CS_NATIVE_WIDTH;
-	fse->min_height = SC1320CS_NATIVE_HEIGHT;
-	fse->max_height = SC1320CS_NATIVE_HEIGHT;
+	fse->min_width = SC1320CS_NATIVE_WIDTH / (fse->index + 1);
+	fse->max_width = fse->min_width;
+	fse->min_height = SC1320CS_NATIVE_HEIGHT / (fse->index + 1);
+	fse->max_height = fse->min_height;
 	return 0;
 }
 
 static int sc1320cs_get_fmt(struct v4l2_subdev *sd,
-			    struct v4l2_subdev_state *state,
-			    struct v4l2_subdev_format *fmt)
-{
-	if (fmt->pad)
-		return -EINVAL;
-
-	sc1320cs_fill_format(&fmt->format);
-	return 0;
-}
-
-static int sc1320cs_set_fmt(struct v4l2_subdev *sd,
 			    struct v4l2_subdev_state *state,
 			    struct v4l2_subdev_format *fmt)
 {
@@ -568,15 +565,52 @@ static int sc1320cs_set_fmt(struct v4l2_subdev *sd,
 	if (fmt->pad)
 		return -EINVAL;
 
-	sc1320cs_fill_format(&fmt->format);
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
-		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
-	else
-		return __v4l2_ctrl_s_ctrl(sensor->vblank,
-					    SC1320CS_VTS -
-					    SC1320CS_NATIVE_HEIGHT);
-
+	mutex_lock(&sensor->mutex);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		fmt->format = *v4l2_subdev_state_get_format(state, fmt->pad);
+		if (!fmt->format.width)
+			sc1320cs_fill_format(&fmt->format);
+	} else {
+		fmt->format = sensor->active_fmt;
+	}
+	mutex_unlock(&sensor->mutex);
 	return 0;
+}
+
+static int sc1320cs_set_fmt(struct v4l2_subdev *sd,
+			    struct v4l2_subdev_state *state,
+			    struct v4l2_subdev_format *fmt)
+{
+	struct sc1320cs *sensor = to_sc1320cs(sd);
+	unsigned int divisor = fmt->format.width <= SC1320CS_NATIVE_WIDTH / 2 &&
+		fmt->format.height <= SC1320CS_NATIVE_HEIGHT / 2 ? 2 : 1;
+	unsigned int vblank;
+	int ret = 0;
+
+	if (fmt->pad)
+		return -EINVAL;
+
+	sc1320cs_fill_format(&fmt->format);
+	fmt->format.width /= divisor;
+	fmt->format.height /= divisor;
+	mutex_lock(&sensor->mutex);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
+	} else if (sensor->streaming) {
+		ret = -EBUSY;
+	} else {
+		sensor->active_fmt = fmt->format;
+		vblank = SC1320CS_VTS - fmt->format.height;
+		__v4l2_ctrl_modify_range(sensor->hblank,
+			SC1320CS_HTS - fmt->format.width,
+			SC1320CS_HTS - fmt->format.width, 1,
+			SC1320CS_HTS - fmt->format.width);
+		__v4l2_ctrl_modify_range(sensor->vblank, vblank,
+			SC1320CS_VTS_MAX - fmt->format.height, 1, vblank);
+		ret = __v4l2_ctrl_s_ctrl(sensor->vblank, vblank);
+	}
+	mutex_unlock(&sensor->mutex);
+	return ret;
 }
 
 static int sc1320cs_get_selection(struct v4l2_subdev *sd,
@@ -659,7 +693,8 @@ static int sc1320cs_set_stream(struct v4l2_subdev *sd, int enable)
 		goto power_off;
 
 	sensor->streaming = true;
-	dev_info(sensor->dev, "SC1320CS streaming 4208x3120 RAW10\n");
+	dev_info(sensor->dev, "SC1320CS streaming %ux%u RAW10\n",
+		 sensor->active_fmt.width, sensor->active_fmt.height);
 	goto unlock;
 
 power_off:
@@ -706,11 +741,13 @@ static int sc1320cs_get_resources(struct sc1320cs *sensor)
 		return dev_err_probe(sensor->dev, PTR_ERR(sensor->xvclk),
 				     "failed to get MCLK1\n");
 
+	ret = clk_set_rate(sensor->xvclk, SC1320CS_XVCLK_FREQ);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret, "failed to set xvclk\n");
 	rate = clk_get_rate(sensor->xvclk);
 	if (rate != SC1320CS_XVCLK_FREQ)
-		dev_warn(sensor->dev,
-			 "xvclk is %lu Hz; Caihong downstream uses %u Hz\n",
-			 rate, SC1320CS_XVCLK_FREQ);
+		return dev_err_probe(sensor->dev, -EINVAL,
+				     "unsupported xvclk rate %lu\n", rate);
 
 	sensor->reset_gpio = devm_gpiod_get(sensor->dev, "reset",
 					     GPIOD_OUT_HIGH);
@@ -759,6 +796,7 @@ static int sc1320cs_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	sensor->dev = &client->dev;
+	sc1320cs_fill_format(&sensor->active_fmt);
 	mutex_init(&sensor->mutex);
 	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
 	if (IS_ERR(sensor->regmap))

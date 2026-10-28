@@ -29,7 +29,7 @@
 
 #include "sc820cs-caihong-regs.h"
 
-#define SC820CS_XVCLK_FREQ		19200000
+#define SC820CS_XVCLK_FREQ		24000000
 
 #define SC820CS_REG_CHIP_ID_H		0x3107
 #define SC820CS_REG_CHIP_ID_L		0x3108
@@ -38,9 +38,8 @@
 #define SC820CS_NATIVE_WIDTH		3264
 #define SC820CS_NATIVE_HEIGHT		2448
 #define SC820CS_NUM_DATA_LANES		4
-#define SC820CS_LINK_FREQ		366000000ULL
-/* The 3888 x 2500 vendor mode runs at 24 fps. */
-#define SC820CS_PIXEL_RATE		233280000ULL
+#define SC820CS_LINK_FREQ		457500000ULL
+#define SC820CS_PIXEL_RATE		291600000ULL
 
 #define SC820CS_HTS			3888
 #define SC820CS_VTS			2500
@@ -77,6 +76,8 @@ struct sc820cs {
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_mbus_framefmt active_fmt;
 	u8 *otp_data;
 	struct mutex mutex;
 	bool otp_valid;
@@ -440,9 +441,15 @@ static int sc820cs_write_mode(struct sc820cs *sc820cs)
 		return ret;
 	usleep_range(5000, 6000);
 
-	return cci_multi_reg_write(sc820cs->regmap,
+	ret = cci_multi_reg_write(sc820cs->regmap,
 			&sc820cs_caihong_3264x2448_regs[1],
 			ARRAY_SIZE(sc820cs_caihong_3264x2448_regs) - 1, NULL);
+	if (ret || sc820cs->active_fmt.width == SC820CS_NATIVE_WIDTH)
+		return ret;
+
+	return cci_multi_reg_write(sc820cs->regmap,
+			sc820cs_caihong_1632x1224_regs,
+			ARRAY_SIZE(sc820cs_caihong_1632x1224_regs), NULL);
 }
 
 static int sc820cs_write_exposure(struct sc820cs *sc820cs,
@@ -485,7 +492,7 @@ static int sc820cs_write_vblank(struct sc820cs *sc820cs,
 				unsigned int vblank)
 {
 	return cci_write(sc820cs->regmap, CCI_REG16(0x320e),
-			 SC820CS_NATIVE_HEIGHT + vblank, NULL);
+			 sc820cs->active_fmt.height + vblank, NULL);
 }
 
 static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
@@ -495,7 +502,7 @@ static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 	unsigned int exposure_max;
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
-		exposure_max = SC820CS_NATIVE_HEIGHT + ctrl->val -
+		exposure_max = sc820cs->active_fmt.height + ctrl->val -
 			       SC820CS_EXPOSURE_MARGIN;
 		__v4l2_ctrl_modify_range(sc820cs->exposure,
 					 SC820CS_EXPOSURE_MIN,
@@ -580,6 +587,7 @@ static int sc820cs_init_controls(struct sc820cs *sc820cs)
 	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sc820cs->hblank = hblank;
 	sc820cs->sd.ctrl_handler = &sc820cs->ctrls;
 	return 0;
 
@@ -612,28 +620,17 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
 				   struct v4l2_subdev_state *state,
 				   struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+	if (fse->index > 1 || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
 		return -EINVAL;
 
-	fse->min_width = SC820CS_NATIVE_WIDTH;
-	fse->max_width = SC820CS_NATIVE_WIDTH;
-	fse->min_height = SC820CS_NATIVE_HEIGHT;
-	fse->max_height = SC820CS_NATIVE_HEIGHT;
+	fse->min_width = SC820CS_NATIVE_WIDTH / (fse->index + 1);
+	fse->max_width = fse->min_width;
+	fse->min_height = SC820CS_NATIVE_HEIGHT / (fse->index + 1);
+	fse->max_height = fse->min_height;
 	return 0;
 }
 
 static int sc820cs_get_fmt(struct v4l2_subdev *sd,
-			   struct v4l2_subdev_state *state,
-			   struct v4l2_subdev_format *fmt)
-{
-	if (fmt->pad)
-		return -EINVAL;
-
-	sc820cs_fill_format(&fmt->format);
-	return 0;
-}
-
-static int sc820cs_set_fmt(struct v4l2_subdev *sd,
 			   struct v4l2_subdev_state *state,
 			   struct v4l2_subdev_format *fmt)
 {
@@ -642,15 +639,52 @@ static int sc820cs_set_fmt(struct v4l2_subdev *sd,
 	if (fmt->pad)
 		return -EINVAL;
 
-	sc820cs_fill_format(&fmt->format);
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
-		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
-	else
-		return __v4l2_ctrl_s_ctrl(sc820cs->vblank,
-					    SC820CS_VTS -
-					    SC820CS_NATIVE_HEIGHT);
-
+	mutex_lock(&sc820cs->mutex);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		fmt->format = *v4l2_subdev_state_get_format(state, fmt->pad);
+		if (!fmt->format.width)
+			sc820cs_fill_format(&fmt->format);
+	} else {
+		fmt->format = sc820cs->active_fmt;
+	}
+	mutex_unlock(&sc820cs->mutex);
 	return 0;
+}
+
+static int sc820cs_set_fmt(struct v4l2_subdev *sd,
+			   struct v4l2_subdev_state *state,
+			   struct v4l2_subdev_format *fmt)
+{
+	struct sc820cs *sc820cs = to_sc820cs(sd);
+	unsigned int divisor = fmt->format.width <= SC820CS_NATIVE_WIDTH / 2 &&
+		fmt->format.height <= SC820CS_NATIVE_HEIGHT / 2 ? 2 : 1;
+	unsigned int vblank;
+	int ret = 0;
+
+	if (fmt->pad)
+		return -EINVAL;
+
+	sc820cs_fill_format(&fmt->format);
+	fmt->format.width /= divisor;
+	fmt->format.height /= divisor;
+	mutex_lock(&sc820cs->mutex);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
+	} else if (sc820cs->streaming) {
+		ret = -EBUSY;
+	} else {
+		sc820cs->active_fmt = fmt->format;
+		vblank = SC820CS_VTS - fmt->format.height;
+		__v4l2_ctrl_modify_range(sc820cs->hblank,
+			SC820CS_HTS - fmt->format.width,
+			SC820CS_HTS - fmt->format.width, 1,
+			SC820CS_HTS - fmt->format.width);
+		__v4l2_ctrl_modify_range(sc820cs->vblank, vblank,
+			SC820CS_VTS_MAX - fmt->format.height, 1, vblank);
+		ret = __v4l2_ctrl_s_ctrl(sc820cs->vblank, vblank);
+	}
+	mutex_unlock(&sc820cs->mutex);
+	return ret;
 }
 
 static int sc820cs_get_selection(struct v4l2_subdev *sd,
@@ -734,7 +768,8 @@ static int sc820cs_set_stream(struct v4l2_subdev *sd, int enable)
 		goto power_off;
 
 	sc820cs->streaming = true;
-	dev_info(sc820cs->dev, "SC820CS streaming 3264x2448 RAW10\n");
+	dev_info(sc820cs->dev, "SC820CS streaming %ux%u RAW10\n",
+		 sc820cs->active_fmt.width, sc820cs->active_fmt.height);
 	goto unlock;
 
 power_off:
@@ -781,11 +816,13 @@ static int sc820cs_get_resources(struct sc820cs *sc820cs)
 		return dev_err_probe(sc820cs->dev, PTR_ERR(sc820cs->xvclk),
 				     "failed to get xvclk\n");
 
+	ret = clk_set_rate(sc820cs->xvclk, SC820CS_XVCLK_FREQ);
+	if (ret)
+		return dev_err_probe(sc820cs->dev, ret, "failed to set xvclk\n");
 	rate = clk_get_rate(sc820cs->xvclk);
 	if (rate != SC820CS_XVCLK_FREQ)
-		dev_warn(sc820cs->dev,
-			 "xvclk is %lu Hz; Caihong downstream uses %u Hz\n",
-			 rate, SC820CS_XVCLK_FREQ);
+		return dev_err_probe(sc820cs->dev, -EINVAL,
+				     "unsupported xvclk rate %lu\n", rate);
 
 	sc820cs->reset_gpio = devm_gpiod_get_optional(sc820cs->dev, "reset",
 						       GPIOD_OUT_HIGH);
@@ -834,6 +871,7 @@ static int sc820cs_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	sc820cs->dev = &client->dev;
+	sc820cs_fill_format(&sc820cs->active_fmt);
 	mutex_init(&sc820cs->mutex);
 	sc820cs->regmap = devm_cci_regmap_init_i2c(client, 16);
 	if (IS_ERR(sc820cs->regmap))
