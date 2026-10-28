@@ -24,6 +24,13 @@
 #define CAMSS_FRAME_MAX_HEIGHT_RDI	8191
 #define CAMSS_FRAME_MAX_HEIGHT_PIX	4096
 
+struct camss_video_capture {
+	struct camss_video *video;
+	struct v4l2_format saved_format;
+	unsigned long held_buffers;
+	unsigned int buffer_count;
+};
+
 /* -----------------------------------------------------------------------------
  * Helper functions
  */
@@ -249,6 +256,29 @@ static int video_prepare_streaming(struct vb2_queue *q)
 	return ret;
 }
 
+static void video_stop_subdevs(struct camss_video *video, unsigned int count)
+{
+	struct media_entity *entity = &video->vdev.entity;
+	struct v4l2_subdev *subdev;
+	struct media_pad *pad;
+	int ret;
+
+	while (count--) {
+		pad = &entity->pads[0];
+		if (!(pad->flags & MEDIA_PAD_FL_SINK))
+			break;
+		pad = media_pad_remote_pad_first(pad);
+		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+			break;
+		entity = pad->entity;
+		subdev = media_entity_to_v4l2_subdev(entity);
+		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
+		if (ret && ret != -ENOIOCTLCMD)
+			dev_err(video->camss->dev, "Failed to stop %s: %d\n",
+				subdev->name, ret);
+	}
+}
+
 static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct camss_video *video = vb2_get_drv_priv(q);
@@ -256,6 +286,7 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct media_entity *entity;
 	struct media_pad *pad;
 	struct v4l2_subdev *subdev;
+	unsigned int started = 0;
 	int ret;
 
 	ret = video_device_pipeline_alloc_start(vdev);
@@ -283,11 +314,14 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 
 		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
 		if (ret < 0 && ret != -ENOIOCTLCMD)
-			goto error;
+			goto stop_subdevs;
+		started++;
 	}
 
 	return 0;
 
+stop_subdevs:
+	video_stop_subdevs(video, started);
 error:
 	video_device_pipeline_stop(vdev);
 
@@ -301,32 +335,8 @@ static void video_stop_streaming(struct vb2_queue *q)
 {
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
-	struct media_entity *entity;
-	struct media_pad *pad;
-	struct v4l2_subdev *subdev;
-	int ret;
 
-	entity = &vdev->entity;
-	while (1) {
-		pad = &entity->pads[0];
-		if (!(pad->flags & MEDIA_PAD_FL_SINK))
-			break;
-
-		pad = media_pad_remote_pad_first(pad);
-		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
-			break;
-
-		entity = pad->entity;
-		subdev = media_entity_to_v4l2_subdev(entity);
-
-		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
-
-		if (ret) {
-			dev_err(video->camss->dev, "Video pipeline stop failed: %d\n", ret);
-			return;
-		}
-	}
-
+	video_stop_subdevs(video, UINT_MAX);
 	video_device_pipeline_stop(vdev);
 
 	video->ops->flush_buffers(video, VB2_BUF_STATE_ERROR);
@@ -567,6 +577,171 @@ static int video_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	return 0;
 }
+
+struct camss_video_capture *
+camss_video_capture_start(struct camss_video *video, struct v4l2_format *format)
+{
+	struct vb2_queue *queue = &video->vb2_q;
+	struct camss_video_capture *capture;
+	unsigned int count = 4;
+	unsigned int index;
+	int ret;
+
+	if (!format || format->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		return ERR_PTR(-EINVAL);
+	capture = kzalloc_obj(*capture);
+	if (!capture)
+		return ERR_PTR(-ENOMEM);
+	capture->video = video;
+	mutex_lock(&video->lock);
+	mutex_lock(&video->q_lock);
+	if (!video_is_registered(&video->vdev)) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (queue->owner || vb2_is_busy(queue)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	ret = __video_try_fmt(video, format);
+	if (ret)
+		goto unlock;
+	if (format->fmt.pix_mp.num_planes != 1) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	capture->saved_format = video->active_fmt;
+	video->active_fmt = *format;
+	ret = video_check_format(video);
+	if (ret)
+		goto restore_format;
+	queue->owner = capture;
+	ret = vb2_core_reqbufs(queue, VB2_MEMORY_MMAP, 0, &count);
+	if (ret)
+		goto release_owner;
+	if (count < 2 || count > BITS_PER_LONG) {
+		ret = -ENOMEM;
+		goto release_buffers;
+	}
+	capture->buffer_count = count;
+	for (index = 0; index < count; index++) {
+		ret = vb2_core_qbuf(queue, vb2_get_buffer(queue, index), NULL, NULL);
+		if (ret)
+			goto release_buffers;
+	}
+	ret = vb2_core_streamon(queue, queue->type);
+	if (ret)
+		goto release_buffers;
+	mutex_unlock(&video->q_lock);
+	mutex_unlock(&video->lock);
+	return capture;
+
+release_buffers:
+	vb2_core_streamoff(queue, queue->type);
+	count = 0;
+	vb2_core_reqbufs(queue, VB2_MEMORY_MMAP, 0, &count);
+release_owner:
+	queue->owner = NULL;
+restore_format:
+	video->active_fmt = capture->saved_format;
+unlock:
+	mutex_unlock(&video->q_lock);
+	mutex_unlock(&video->lock);
+	kfree(capture);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(camss_video_capture_start);
+
+int camss_video_capture_next(struct camss_video_capture *capture,
+			     struct camss_capture_frame *frame)
+{
+	struct camss_video *video = capture->video;
+	struct vb2_queue *queue = &video->vb2_q;
+	struct v4l2_plane planes[VIDEO_MAX_PLANES];
+	struct v4l2_buffer completed = {
+		.type = queue->type,
+		.memory = VB2_MEMORY_MMAP,
+		.length = ARRAY_SIZE(planes),
+		.m.planes = planes,
+	};
+	struct vb2_v4l2_buffer *vbuf;
+	struct vb2_buffer *buffer;
+	unsigned int index;
+	int ret;
+
+	if (!frame)
+		return -EINVAL;
+	mutex_lock(&video->q_lock);
+	ret = vb2_core_dqbuf(queue, &index, &completed, true);
+	if (ret)
+		goto unlock;
+	buffer = vb2_get_buffer(queue, index);
+	vbuf = to_vb2_v4l2_buffer(buffer);
+	*frame = (struct camss_capture_frame) {
+		.sgt = vb2_dma_sg_plane_desc(buffer, 0),
+		.dev = queue->dev,
+		.size = vb2_plane_size(buffer, 0),
+		.timestamp = buffer->timestamp,
+		.sequence = vbuf->sequence,
+		.index = index,
+		.error = completed.flags & V4L2_BUF_FLAG_ERROR,
+	};
+	capture->held_buffers |= BIT(index);
+unlock:
+	mutex_unlock(&video->q_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(camss_video_capture_next);
+
+int camss_video_capture_requeue(struct camss_video_capture *capture,
+				unsigned int index)
+{
+	struct camss_video *video = capture->video;
+	struct vb2_queue *queue = &video->vb2_q;
+	int ret;
+
+	mutex_lock(&video->q_lock);
+	if (index >= capture->buffer_count || !(capture->held_buffers & BIT(index))) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	ret = vb2_core_qbuf(queue, vb2_get_buffer(queue, index), NULL, NULL);
+	capture->held_buffers &= ~BIT(index);
+unlock:
+	mutex_unlock(&video->q_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(camss_video_capture_requeue);
+
+int camss_video_capture_stop(struct camss_video_capture *capture)
+{
+	struct camss_video *video = capture->video;
+	struct vb2_queue *queue = &video->vb2_q;
+	unsigned int count = 0;
+	int ret;
+
+	mutex_lock(&video->lock);
+	mutex_lock(&video->q_lock);
+	if (capture->held_buffers) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	ret = vb2_core_streamoff(queue, queue->type);
+	if (ret)
+		goto unlock;
+	ret = vb2_core_reqbufs(queue, VB2_MEMORY_MMAP, 0, &count);
+	if (ret)
+		goto unlock;
+	queue->owner = NULL;
+	video->active_fmt = capture->saved_format;
+unlock:
+	mutex_unlock(&video->q_lock);
+	mutex_unlock(&video->lock);
+	if (!ret)
+		kfree(capture);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(camss_video_capture_stop);
 
 static int video_enum_input(struct file *file, void *fh,
 			    struct v4l2_input *input)

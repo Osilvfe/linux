@@ -26,6 +26,18 @@ struct camss_buffer {
 };
 
 struct camss_video;
+struct camss_video_capture;
+struct sg_table;
+
+struct camss_capture_frame {
+	struct sg_table *sgt;
+	struct device *dev;
+	size_t size;
+	u64 timestamp;
+	u32 sequence;
+	unsigned int index;
+	bool error;
+};
 
 struct camss_video_ops {
 	int (*queue_buffer)(struct camss_video *vid, struct camss_buffer *buf);
@@ -54,5 +66,13 @@ int msm_video_register(struct camss_video *video, struct v4l2_device *v4l2_dev,
 		       const char *name);
 
 void msm_video_unregister(struct camss_video *video);
+
+struct camss_video_capture *
+camss_video_capture_start(struct camss_video *video, struct v4l2_format *format);
+int camss_video_capture_next(struct camss_video_capture *capture,
+			     struct camss_capture_frame *frame);
+int camss_video_capture_requeue(struct camss_video_capture *capture,
+				unsigned int index);
+int camss_video_capture_stop(struct camss_video_capture *capture);
 
 #endif /* QC_MSM_CAMSS_VIDEO_H */

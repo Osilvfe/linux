@@ -9,3 +9,12 @@ config VIDEO_QCOM_CAMERA_ICP
 	help
 	  Expose the Qualcomm Camera ICP Bayer Processing System as a V4L2
 	  memory-to-memory image processor.
+
+config VIDEO_QCOM_CAMERA_NATIVE
+	tristate "Caihong native V4L2 camera capture (experimental)"
+	depends on VIDEO_DEV && VIDEO_QCOM_CAMSS && QCOM_CAMERA_ICP
+	select VIDEOBUF2_DMA_SG
+	help
+	  Connect Caihong sensors through CAMSS and Camera ICP BPS to ordinary
+	  NV12 capture nodes. This experimental driver shares the hardware with
+	  libcamera and requires exclusive access to each sensor pipeline.

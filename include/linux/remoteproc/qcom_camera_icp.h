@@ -8,6 +8,8 @@
 
 struct qcom_camera_icp_bps;
 struct qcom_camera_icp_bps_session;
+struct qcom_camera_icp_bps_client;
+struct device;
 struct sg_table;
 
 #define QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10	512
@@ -28,6 +30,16 @@ struct qcom_camera_icp_bps_config {
 	u32 height;
 	u32 input_stride;
 	u32 output_stride;
+};
+
+struct qcom_camera_icp_bps_frame {
+	struct sg_table *planes[3];
+	struct device *source_devs[3];
+	size_t size[3];
+	size_t offset[3];
+	u32 red_balance_q10;
+	u32 blue_balance_q10;
+	u64 request_id;
 };
 
 struct qcom_camera_icp_bps_ops {
@@ -56,6 +68,13 @@ struct qcom_camera_icp_bps_ops {
 			    size_t size);
 	void (*alias_unmap)(struct qcom_camera_icp_bps *bps, dma_addr_t bps_iova,
 			    size_t size);
+	struct qcom_camera_icp_bps_client *
+		(*client_open)(struct qcom_camera_icp_bps *bps,
+			       const struct qcom_camera_icp_bps_config *config);
+	int (*client_close)(struct qcom_camera_icp_bps_client *client);
+	int (*client_process)(struct qcom_camera_icp_bps_client *client,
+			      const struct qcom_camera_icp_bps_frame *frame);
+	void (*client_reset)(struct qcom_camera_icp_bps_client *client);
 };
 
 struct qcom_camera_icp_bps {

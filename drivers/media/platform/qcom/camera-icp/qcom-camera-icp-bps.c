@@ -17,9 +17,6 @@
 #include <media/videobuf2-dma-sg.h>
 
 #define QCOM_CAMERA_ICP_BPS_NAME	"qcom-camera-icp-bps"
-#define QCOM_CAMERA_ICP_BPS_INPUT_IOVA	0x10000000
-#define QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA 0x12000000
-#define QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA 0x14000000
 #define QCOM_CAMERA_ICP_BPS_CAPS \
 	(V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING)
 
@@ -101,6 +98,44 @@ static const struct qcom_camera_icp_bps_profile qcom_camera_icp_bps_profiles[] =
 			.colorspace = V4L2_COLORSPACE_DEFAULT,
 			.num_planes = 2,
 		},
+	}, {
+		.output = {
+			.pixelformat = V4L2_PIX_FMT_SBGGR10P,
+			.width = 1632,
+			.height = 1224,
+			.bytesperline = { 2048 },
+			.sizeimage = { 2048 * 1224 },
+			.colorspace = V4L2_COLORSPACE_RAW,
+			.num_planes = 1,
+		},
+		.capture = {
+			.pixelformat = V4L2_PIX_FMT_NV12M,
+			.width = 1632,
+			.height = 1224,
+			.bytesperline = { 1664, 1664 },
+			.sizeimage = { 1664 * 1224, 1664 * 612 },
+			.colorspace = V4L2_COLORSPACE_DEFAULT,
+			.num_planes = 2,
+		}
+	}, {
+		.output = {
+			.pixelformat = V4L2_PIX_FMT_SBGGR10P,
+			.width = 2104,
+			.height = 1560,
+			.bytesperline = { 2640 },
+			.sizeimage = { 2640 * 1560 },
+			.colorspace = V4L2_COLORSPACE_RAW,
+			.num_planes = 1,
+		},
+		.capture = {
+			.pixelformat = V4L2_PIX_FMT_NV12M,
+			.width = 2104,
+			.height = 1560,
+			.bytesperline = { 2176, 2176 },
+			.sizeimage = { 2176 * 1560, 2176 * 780 },
+			.colorspace = V4L2_COLORSPACE_DEFAULT,
+			.num_planes = 2,
+		}
 	},
 };
 
@@ -123,75 +158,35 @@ struct qcom_camera_icp_bps_ctx {
 	struct work_struct work;
 	struct qcom_camera_icp_bps_fmt output;
 	struct qcom_camera_icp_bps_fmt capture;
-	struct qcom_camera_icp_bps_session *session;
-	bool powered;
+	struct qcom_camera_icp_bps_client *client;
 	bool aborting;
 	u64 request_id;
 	u32 sequence;
 };
 
-static void qcom_camera_icp_bps_abort_session(
-	struct qcom_camera_icp_bps_ctx *ctx)
-{
-	struct qcom_camera_icp_bps *service = ctx->bps->service;
-
-	/* Quiesce firmware before releasing memory it may still access. */
-	if (ctx->powered) {
-		service->ops->power_off(service);
-		ctx->powered = false;
-	}
-	if (ctx->session) {
-		service->ops->session_abort(ctx->session);
-		ctx->session = NULL;
-	}
-}
-
 static int qcom_camera_icp_bps_open_session(
 	struct qcom_camera_icp_bps_ctx *ctx)
 {
 	struct qcom_camera_icp_bps *service = ctx->bps->service;
-	int ret, cleanup_ret;
+	const struct qcom_camera_icp_bps_config config = {
+		.width = ctx->output.width,
+		.height = ctx->output.height,
+		.input_stride = ctx->output.bytesperline[0],
+		.output_stride = ctx->capture.bytesperline[0],
+	};
+	int ret;
 
-	ret = service->ops->power_on(service);
-	if (ret)
-		return ret;
-	ctx->powered = true;
-	ctx->session = service->ops->session_open(service);
-	if (IS_ERR(ctx->session)) {
-		ret = PTR_ERR(ctx->session);
-		ctx->session = NULL;
-		goto power_off;
-	}
 	if (ctx->output.width != ctx->capture.width ||
 	    ctx->output.height != ctx->capture.height ||
-	    ctx->capture.bytesperline[0] != ctx->capture.bytesperline[1]) {
-		ret = -EINVAL;
-		goto close_session;
-	}
-	{
-		const struct qcom_camera_icp_bps_config config = {
-			.width = ctx->output.width,
-			.height = ctx->output.height,
-			.input_stride = ctx->output.bytesperline[0],
-			.output_stride = ctx->capture.bytesperline[0],
-		};
-
-		ret = service->ops->session_prepare(ctx->session, &config);
-	}
-	if (!ret)
-		return 0;
-
-close_session:
-	cleanup_ret = service->ops->session_close(ctx->session);
-	if (cleanup_ret) {
-		qcom_camera_icp_bps_abort_session(ctx);
+	    ctx->capture.bytesperline[0] != ctx->capture.bytesperline[1])
+		return -EINVAL;
+	ctx->client = service->ops->client_open(service, &config);
+	if (IS_ERR(ctx->client)) {
+		ret = PTR_ERR(ctx->client);
+		ctx->client = NULL;
 		return ret;
 	}
-	ctx->session = NULL;
-power_off:
-	service->ops->power_off(service);
-	ctx->powered = false;
-	return ret;
+	return 0;
 }
 
 static void
@@ -324,19 +319,16 @@ static int qcom_camera_icp_bps_g_fmt(struct file *file, void *fh,
 static int qcom_camera_icp_bps_try_fmt(struct file *file, void *fh,
 				      struct v4l2_format *f)
 {
-	struct qcom_camera_icp_bps_ctx *ctx;
 	const struct qcom_camera_icp_bps_profile *profile;
 	const struct qcom_camera_icp_bps_fmt *fmt;
 
-	ctx = container_of(file->private_data,
-			   struct qcom_camera_icp_bps_ctx, fh);
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		profile = qcom_camera_icp_bps_find_profile(f->fmt.pix_mp.width,
 							   f->fmt.pix_mp.height);
 		fmt = &profile->output;
 	} else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		profile = qcom_camera_icp_bps_find_profile(ctx->output.width,
-							   ctx->output.height);
+		profile = qcom_camera_icp_bps_find_profile(f->fmt.pix_mp.width,
+							   f->fmt.pix_mp.height);
 		fmt = &profile->capture;
 	} else {
 		return -EINVAL;
@@ -472,15 +464,18 @@ static int qcom_camera_icp_bps_start_streaming(struct vb2_queue *vq,
 {
 	struct qcom_camera_icp_bps_ctx *ctx = vb2_get_drv_priv(vq);
 	struct vb2_queue *other;
+	int ret = 0;
 
 	other = V4L2_TYPE_IS_OUTPUT(vq->type) ?
 		v4l2_m2m_get_dst_vq(ctx->m2m_ctx) :
 		v4l2_m2m_get_src_vq(ctx->m2m_ctx);
-	if (!vb2_is_streaming(other) || ctx->session)
+	if (!vb2_is_streaming(other))
 		return 0;
 
 	WRITE_ONCE(ctx->aborting, false);
-	return qcom_camera_icp_bps_open_session(ctx);
+	if (!ctx->client)
+		ret = qcom_camera_icp_bps_open_session(ctx);
+	return ret;
 }
 
 static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
@@ -494,19 +489,11 @@ static void qcom_camera_icp_bps_stop_streaming(struct vb2_queue *vq)
 	WRITE_ONCE(ctx->aborting, true);
 	flush_work(&ctx->work);
 
-	if (ctx->session) {
-		ret = service->ops->session_close(ctx->session);
-		if (ret) {
-			dev_warn(ctx->bps->dev, "failed to close BPS session: %d\n",
-				 ret);
-			qcom_camera_icp_bps_abort_session(ctx);
-		} else {
-			ctx->session = NULL;
-		}
-	}
-	if (ctx->powered) {
-		service->ops->power_off(service);
-		ctx->powered = false;
+	if (ctx->client) {
+		ret = service->ops->client_close(ctx->client);
+		if (ret)
+			dev_warn(ctx->bps->dev, "failed to close BPS client: %d\n", ret);
+		ctx->client = NULL;
 	}
 
 	for (;;) {
@@ -562,114 +549,49 @@ static void qcom_camera_icp_bps_device_work(struct work_struct *work)
 	struct qcom_camera_icp_bps *service = ctx->bps->service;
 	struct vb2_v4l2_buffer *src;
 	struct vb2_v4l2_buffer *dst;
-	struct qcom_camera_icp_bps_job job = {
-		.input_iova = QCOM_CAMERA_ICP_BPS_INPUT_IOVA,
-		.output_y_iova = QCOM_CAMERA_ICP_BPS_OUTPUT_Y_IOVA,
-		.output_c_iova = QCOM_CAMERA_ICP_BPS_OUTPUT_C_IOVA,
+	struct qcom_camera_icp_bps_frame frame = {
+		.source_devs = {
+			ctx->bps->dev->parent,
+			ctx->bps->dev->parent,
+			ctx->bps->dev->parent,
+		},
+		.size = {
+			PAGE_ALIGN(ctx->output.sizeimage[0]),
+			PAGE_ALIGN(ctx->capture.sizeimage[0]),
+			PAGE_ALIGN(ctx->capture.sizeimage[1]),
+		},
 	};
-	struct sg_table *sgt[3];
-	dma_addr_t alias_iova[3] = { job.input_iova, job.output_y_iova,
-				     job.output_c_iova };
-	size_t size[3] = { PAGE_ALIGN(ctx->output.sizeimage[0]),
-			   PAGE_ALIGN(ctx->capture.sizeimage[0]),
-			   PAGE_ALIGN(ctx->capture.sizeimage[1]) };
 	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
-	unsigned int alias_count = 0;
-	unsigned int map_count = 0;
-	bool recover = false;
-	int cleanup_ret;
 	int ret;
 
 	src = v4l2_m2m_next_src_buf(ctx->m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->m2m_ctx);
-	if (!src || !dst || !ctx->session || READ_ONCE(ctx->aborting))
+	if (!src || !dst || !ctx->client || READ_ONCE(ctx->aborting))
 		goto finish;
 	v4l2_ctrl_lock(ctx->red_balance);
-	job.red_balance_q10 = ctx->red_balance->val;
-	job.blue_balance_q10 = ctx->blue_balance->val;
+	frame.red_balance_q10 = ctx->red_balance->val;
+	frame.blue_balance_q10 = ctx->blue_balance->val;
 	v4l2_ctrl_unlock(ctx->red_balance);
+	frame.planes[0] = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
+	frame.planes[1] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 0);
+	frame.planes[2] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 1);
+	frame.request_id = ++ctx->request_id;
 
-	sgt[0] = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
-	sgt[1] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 0);
-	sgt[2] = vb2_dma_sg_plane_desc(&dst->vb2_buf, 1);
-	for (alias_count = 0; alias_count < ARRAY_SIZE(alias_iova); alias_count++) {
-		dev_dbg(ctx->bps->dev, "mapping plane %u from %u DMA segments\n",
-			alias_count, sgt[alias_count]->nents);
-		ret = service->ops->alias_map_sg(service, sgt[alias_count],
-						 alias_iova[alias_count],
-						 size[alias_count]);
-		if (ret)
-			goto unmap_aliases;
-	}
-	for (map_count = 0; map_count < ARRAY_SIZE(alias_iova); map_count++) {
-		ret = service->ops->session_map(ctx->session, alias_iova[map_count],
-						size[map_count]);
-		if (ret)
-			goto unmap_session;
-	}
-	job.request_id = ++ctx->request_id;
-	if (xchg(&test_timeout_once, false)) {
-		msleep(250);
+	if (READ_ONCE(test_timeout_once)) {
+		WRITE_ONCE(test_timeout_once, false);
+		dev_warn(ctx->bps->dev, "injecting BPS timeout, resetting all clients\n");
+		service->ops->client_reset(ctx->client);
 		ret = -ETIMEDOUT;
 	} else {
-		ret = service->ops->session_process(ctx->session, &job);
+		ret = service->ops->client_process(ctx->client, &frame);
 	}
 	if (!ret && !READ_ONCE(ctx->aborting))
 		state = VB2_BUF_STATE_DONE;
-	else if (ret) {
-		if (ret == -ETIMEDOUT)
-			dev_warn(ctx->bps->dev,
-				 "BPS frame timed out, resetting firmware session\n");
-		else
-			dev_warn(ctx->bps->dev,
-				 "BPS frame failed (%d), resetting firmware session\n",
-				 ret);
-		/* Stop firmware before releasing buffers it may still access. */
-		qcom_camera_icp_bps_abort_session(ctx);
-		map_count = 0;
-		recover = !READ_ONCE(ctx->aborting);
-	}
-
-unmap_session:
-	while (map_count) {
-		map_count--;
-		cleanup_ret = service->ops->session_unmap(ctx->session,
-						 alias_iova[map_count],
-						 size[map_count]);
-		if (cleanup_ret) {
-			dev_warn(ctx->bps->dev,
-				 "failed to unmap BPS session buffer: %d\n",
-				 cleanup_ret);
-			if (!ret)
-				ret = cleanup_ret;
-			state = VB2_BUF_STATE_ERROR;
-		}
-	}
-unmap_aliases:
-	while (alias_count) {
-		alias_count--;
-		service->ops->alias_unmap(service, alias_iova[alias_count],
-					  size[alias_count]);
-	}
-	if (ret && ctx->session && !READ_ONCE(ctx->aborting)) {
-		dev_warn(ctx->bps->dev,
-			 "BPS frame mapping failed (%d), resetting firmware session\n",
-			 ret);
-		qcom_camera_icp_bps_abort_session(ctx);
-		recover = true;
-	}
-	if (recover) {
-		ret = qcom_camera_icp_bps_open_session(ctx);
-		if (ret)
-			dev_err(ctx->bps->dev,
-				"failed to recover BPS session: %d\n", ret);
-	}
 finish:
 	if (READ_ONCE(ctx->aborting))
 		state = VB2_BUF_STATE_ERROR;
-	if (src) {
+	if (src)
 		src = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
-	}
 	if (dst) {
 		dst = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx);
 		if (src)
@@ -683,7 +605,6 @@ finish:
 			src->sequence = dst ? dst->sequence : ctx->sequence++;
 		v4l2_m2m_buf_done(src, state);
 	}
-
 	v4l2_m2m_job_finish(ctx->bps->m2m_dev, ctx->m2m_ctx);
 }
 

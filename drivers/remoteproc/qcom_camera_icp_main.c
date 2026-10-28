@@ -17,6 +17,7 @@
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -202,6 +203,14 @@ struct qcom_camera_icp_bps_session {
 	void *work_cpu;
 	dma_addr_t work_iova;
 	size_t work_size;
+};
+
+struct qcom_camera_icp_bps_client {
+	struct qcom_camera_icp *icp;
+	struct qcom_camera_icp_bps_session *session;
+	struct qcom_camera_icp_bps_config config;
+	struct list_head list;
+	bool powered;
 };
 
 struct qcom_camera_icp_bps_buffer {
@@ -621,9 +630,9 @@ struct qcom_camera_icp {
 	struct rproc *rproc;
 	struct auxiliary_device *bps_auxdev;
 	struct qcom_camera_icp_bps bps;
-	/* BPS recovery stops ICP, so only one client session may own it. */
 	struct mutex bps_client_lock;
-	bool bps_client_active;
+	struct mutex bps_job_lock;
+	struct list_head bps_clients;
 	struct clk_bulk_data clks[CAMERA_ICP_CLK_COUNT];
 	struct icc_bulk_data paths[CAMERA_ICP_NUM_PATHS];
 	struct dev_pm_domain_list *pds;
@@ -1425,32 +1434,18 @@ qcom_camera_icp_bps_client_session_open(struct qcom_camera_icp_bps *bps)
 
 	if (!READ_ONCE(icp->hfi_ready))
 		return ERR_PTR(-EHOSTDOWN);
-	mutex_lock(&icp->bps_client_lock);
-	if (icp->bps_client_active) {
-		mutex_unlock(&icp->bps_client_lock);
-		return ERR_PTR(-EBUSY);
-	}
-	icp->bps_client_active = true;
-	mutex_unlock(&icp->bps_client_lock);
-
 	session = kzalloc_obj(*session);
-	if (!session) {
-		ret = -ENOMEM;
-		goto release_client;
-	}
+	if (!session)
+		return ERR_PTR(-ENOMEM);
+	mutex_lock(&icp->bps_client_lock);
 	ret = qcom_camera_icp_bps_session_open(icp, session);
+	mutex_unlock(&icp->bps_client_lock);
 	if (ret) {
 		kfree(session);
-		goto release_client;
+		return ERR_PTR(ret);
 	}
 
 	return session;
-
-release_client:
-	mutex_lock(&icp->bps_client_lock);
-	icp->bps_client_active = false;
-	mutex_unlock(&icp->bps_client_lock);
-	return ERR_PTR(ret);
 }
 
 static int qcom_camera_icp_bps_client_session_close(
@@ -1461,14 +1456,10 @@ static int qcom_camera_icp_bps_client_session_close(
 
 	ret = qcom_camera_icp_bps_session_close(session);
 	if (!ret) {
-		if (session->work_cpu &&
-		    session->work_cpu != icp->bps_test_buffer.cpu)
+		if (session->work_cpu)
 			dma_free_coherent(icp->dev, session->work_size,
 					  session->work_cpu, session->work_iova);
 		kfree(session);
-		mutex_lock(&icp->bps_client_lock);
-		icp->bps_client_active = false;
-		mutex_unlock(&icp->bps_client_lock);
 	}
 
 	return ret;
@@ -1479,14 +1470,10 @@ static void qcom_camera_icp_bps_client_session_abort(
 {
 	struct qcom_camera_icp *icp = session->icp;
 
-	if (session->work_cpu &&
-	    session->work_cpu != icp->bps_test_buffer.cpu)
+	if (session->work_cpu)
 		dma_free_coherent(icp->dev, session->work_size,
 				  session->work_cpu, session->work_iova);
 	kfree(session);
-	mutex_lock(&icp->bps_client_lock);
-	icp->bps_client_active = false;
-	mutex_unlock(&icp->bps_client_lock);
 }
 
 static int qcom_camera_icp_bps_client_session_map(
@@ -1514,9 +1501,9 @@ static int qcom_camera_icp_bps_client_alias_map(
 	return qcom_camera_icp_bps_buffer_map(icp, &buffer, bps_iova);
 }
 
-static int qcom_camera_icp_bps_client_alias_map_sg(
+static int qcom_camera_icp_bps_alias_map_sg_domain(
 	struct qcom_camera_icp_bps *bps, struct sg_table *sgt,
-	dma_addr_t bps_iova, size_t size)
+	dma_addr_t bps_iova, size_t size, struct iommu_domain *source_domain)
 {
 	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
 	struct scatterlist *sg;
@@ -1524,7 +1511,7 @@ static int qcom_camera_icp_bps_client_alias_map_sg(
 	unsigned int i;
 	int ret;
 
-	if (!sgt || !size || !IS_ALIGNED(bps_iova, PAGE_SIZE) ||
+	if (!source_domain || !sgt || !size || !IS_ALIGNED(bps_iova, PAGE_SIZE) ||
 	    !IS_ALIGNED(size, PAGE_SIZE) || bps_iova > U32_MAX - (size - 1))
 		return -EINVAL;
 
@@ -1541,7 +1528,7 @@ static int qcom_camera_icp_bps_client_alias_map_sg(
 		for (offset = 0; offset < segment_size; offset += PAGE_SIZE) {
 			phys_addr_t phys;
 
-			phys = iommu_iova_to_phys(icp->domain,
+			phys = iommu_iova_to_phys(source_domain,
 						  source_iova + offset);
 			if (!phys || !IS_ALIGNED(phys, PAGE_SIZE)) {
 				ret = -EFAULT;
@@ -1564,6 +1551,16 @@ unmap:
 	if (mapped)
 		iommu_unmap(icp->domain, bps_iova, mapped);
 	return ret;
+}
+
+static int qcom_camera_icp_bps_client_alias_map_sg(
+	struct qcom_camera_icp_bps *bps, struct sg_table *sgt,
+	dma_addr_t bps_iova, size_t size)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+
+	return qcom_camera_icp_bps_alias_map_sg_domain(bps, sgt, bps_iova,
+						    size, icp->domain);
 }
 
 static void qcom_camera_icp_bps_client_alias_unmap(
@@ -1610,18 +1607,11 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	cdm_offset = PAGE_ALIGN(CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET +
 				striping_firmware->size);
 	gamma_offset = cdm_offset + CAMERA_ICP_BPS_FRAME_CDM_SIZE;
-	if (icp->bps_test_buffer.cpu && !test_bps_frame) {
-		session->work_cpu = icp->bps_test_buffer.cpu;
-		session->work_iova = icp->bps_test_buffer.iova;
-		session->work_size = icp->bps_test_buffer.size;
-	} else {
-		session->work_size = PAGE_ALIGN(gamma_offset +
-						CAMERA_ICP_BPS_GAMMA_LUT_SIZE);
-		session->work_cpu = dma_alloc_coherent(icp->dev,
-						       session->work_size,
-						       &session->work_iova,
-						       GFP_KERNEL | GFP_DMA32);
-	}
+	session->work_size = PAGE_ALIGN(gamma_offset +
+					CAMERA_ICP_BPS_GAMMA_LUT_SIZE);
+	session->work_cpu = dma_alloc_coherent(icp->dev, session->work_size,
+					       &session->work_iova,
+					       GFP_KERNEL | GFP_DMA32);
 	if (!session->work_cpu) {
 		ret = -ENOMEM;
 		goto release_firmware;
@@ -1660,26 +1650,20 @@ static int qcom_camera_icp_bps_client_session_prepare(
 	ret = qcom_camera_icp_bps_session_map(session, session->work_iova,
 					      session->work_size, true);
 	if (ret)
-		goto fail_unmap;
+		goto release_firmware;
 	ret = qcom_camera_icp_bps_session_config(session, session->work_iova);
 	if (ret)
-		goto fail_unmap;
+		goto release_firmware;
 
 	release_firmware(striping_firmware);
 	return 0;
 
-fail_unmap:
-	qcom_camera_icp_bps_session_map(session, session->work_iova,
-					session->work_size, false);
-
 free_work:
-	if (session->work_cpu != icp->bps_test_buffer.cpu) {
-		dma_free_coherent(icp->dev, session->work_size,
-				  session->work_cpu, session->work_iova);
-		session->work_cpu = NULL;
-		session->work_iova = 0;
-		session->work_size = 0;
-	}
+	dma_free_coherent(icp->dev, session->work_size,
+			  session->work_cpu, session->work_iova);
+	session->work_cpu = NULL;
+	session->work_iova = 0;
+	session->work_size = 0;
 release_firmware:
 	release_firmware(striping_firmware);
 	return ret;
@@ -1721,6 +1705,225 @@ static int qcom_camera_icp_bps_client_session_process(
 		CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET, job->request_id);
 }
 
+static void qcom_camera_icp_bps_reset_clients(struct qcom_camera_icp *icp)
+{
+	struct qcom_camera_icp_bps_client *client;
+
+	list_for_each_entry(client, &icp->bps_clients, list) {
+		if (client->powered) {
+			qcom_camera_icp_bps_power_off(&icp->bps);
+			client->powered = false;
+		}
+	}
+	list_for_each_entry(client, &icp->bps_clients, list) {
+		if (client->session) {
+			qcom_camera_icp_bps_client_session_abort(client->session);
+			client->session = NULL;
+		}
+	}
+}
+
+static int qcom_camera_icp_bps_prepare_client(
+	struct qcom_camera_icp_bps_client *client)
+{
+	struct qcom_camera_icp *icp = client->icp;
+	int ret;
+
+	if (client->session)
+		return 0;
+	ret = qcom_camera_icp_bps_power_on(&icp->bps);
+	if (ret)
+		return ret;
+	client->powered = true;
+	client->session = qcom_camera_icp_bps_client_session_open(&icp->bps);
+	if (IS_ERR(client->session)) {
+		ret = PTR_ERR(client->session);
+		client->session = NULL;
+		goto power_off;
+	}
+	ret = qcom_camera_icp_bps_client_session_prepare(client->session,
+						       &client->config);
+	if (!ret)
+		return 0;
+	if (qcom_camera_icp_bps_client_session_close(client->session)) {
+		qcom_camera_icp_bps_reset_clients(icp);
+		return ret;
+	}
+	client->session = NULL;
+power_off:
+	qcom_camera_icp_bps_power_off(&icp->bps);
+	client->powered = false;
+	return ret;
+}
+
+static struct qcom_camera_icp_bps_client *
+qcom_camera_icp_bps_open_client(struct qcom_camera_icp_bps *bps,
+			      const struct qcom_camera_icp_bps_config *config)
+{
+	struct qcom_camera_icp *icp = container_of(bps, struct qcom_camera_icp, bps);
+	struct qcom_camera_icp_bps_client *client;
+	int ret;
+
+	if (!config || !config->width || !config->height ||
+	    config->width > 16384 || config->height > 16384 ||
+	    !IS_ALIGNED(config->width, 2) || !IS_ALIGNED(config->height, 2) ||
+	    config->input_stride < DIV_ROUND_UP(config->width * 10, 8) ||
+	    config->output_stride < config->width ||
+	    config->input_stride > U16_MAX || config->output_stride > U16_MAX)
+		return ERR_PTR(-EINVAL);
+	if (!try_module_get(THIS_MODULE))
+		return ERR_PTR(-ENODEV);
+	client = kzalloc_obj(*client);
+	if (!client) {
+		module_put(THIS_MODULE);
+		return ERR_PTR(-ENOMEM);
+	}
+	client->icp = icp;
+	client->config = *config;
+	mutex_lock(&icp->bps_job_lock);
+	list_add_tail(&client->list, &icp->bps_clients);
+	ret = qcom_camera_icp_bps_prepare_client(client);
+	if (ret)
+		list_del(&client->list);
+	mutex_unlock(&icp->bps_job_lock);
+	if (ret) {
+		kfree(client);
+		module_put(THIS_MODULE);
+		return ERR_PTR(ret);
+	}
+	return client;
+}
+
+static int qcom_camera_icp_bps_close_client(
+	struct qcom_camera_icp_bps_client *client)
+{
+	struct qcom_camera_icp *icp = client->icp;
+	int ret = 0;
+
+	mutex_lock(&icp->bps_job_lock);
+	if (client->session) {
+		ret = qcom_camera_icp_bps_client_session_close(client->session);
+		if (ret)
+			qcom_camera_icp_bps_reset_clients(icp);
+		else
+			client->session = NULL;
+	}
+	if (client->powered)
+		qcom_camera_icp_bps_power_off(&icp->bps);
+	list_del(&client->list);
+	mutex_unlock(&icp->bps_job_lock);
+	kfree(client);
+	module_put(THIS_MODULE);
+	return ret;
+}
+
+static void qcom_camera_icp_bps_reset_client(
+	struct qcom_camera_icp_bps_client *client)
+{
+	mutex_lock(&client->icp->bps_job_lock);
+	qcom_camera_icp_bps_reset_clients(client->icp);
+	mutex_unlock(&client->icp->bps_job_lock);
+}
+
+static int qcom_camera_icp_bps_process_client(
+	struct qcom_camera_icp_bps_client *client,
+	const struct qcom_camera_icp_bps_frame *frame)
+{
+	struct qcom_camera_icp *icp = client->icp;
+	struct qcom_camera_icp_bps_job job = {
+		.input_iova = 0x10000000,
+		.output_y_iova = 0x12000000,
+		.output_c_iova = 0x14000000,
+	};
+	dma_addr_t alias_iova[] = { job.input_iova, job.output_y_iova,
+				    job.output_c_iova };
+	struct iommu_domain *source_domains[3];
+	size_t minimum_size[] = {
+		(size_t)client->config.input_stride * client->config.height,
+		(size_t)client->config.output_stride * client->config.height,
+		(size_t)client->config.output_stride * (client->config.height / 2),
+	};
+	unsigned int alias_count = 0;
+	unsigned int map_count = 0;
+	unsigned int plane_count = ARRAY_SIZE(alias_iova);
+	unsigned int index;
+	int cleanup_ret;
+	int ret;
+
+	if (!frame ||
+	    frame->red_balance_q10 < QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10 ||
+	    frame->red_balance_q10 > QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10 ||
+	    frame->blue_balance_q10 < QCOM_CAMERA_ICP_BPS_BALANCE_MIN_Q10 ||
+	    frame->blue_balance_q10 > QCOM_CAMERA_ICP_BPS_BALANCE_MAX_Q10)
+		return -EINVAL;
+	for (index = 0; index < ARRAY_SIZE(alias_iova); index++) {
+		if (!frame->planes[index] || frame->size[index] > SZ_32M ||
+		    !IS_ALIGNED(frame->size[index], PAGE_SIZE) ||
+		    !IS_ALIGNED(frame->offset[index], 256) ||
+		    frame->offset[index] > frame->size[index] ||
+		    frame->size[index] - frame->offset[index] < minimum_size[index])
+			return -EINVAL;
+		source_domains[index] = frame->source_devs[index] ?
+			iommu_get_domain_for_dev(frame->source_devs[index]) : icp->domain;
+		if (!source_domains[index])
+			return -EOPNOTSUPP;
+	}
+	job.input_iova += frame->offset[0];
+	job.output_y_iova += frame->offset[1];
+	job.output_c_iova += frame->offset[2];
+	if (frame->planes[1] == frame->planes[2] &&
+	    source_domains[1] == source_domains[2] && frame->size[1] == frame->size[2]) {
+		plane_count = 2;
+		job.output_c_iova = alias_iova[1] + frame->offset[2];
+	}
+	job.red_balance_q10 = frame->red_balance_q10;
+	job.blue_balance_q10 = frame->blue_balance_q10;
+	job.request_id = frame->request_id;
+	mutex_lock(&icp->bps_job_lock);
+	ret = qcom_camera_icp_bps_prepare_client(client);
+	if (ret)
+		goto unlock;
+	for (alias_count = 0; alias_count < plane_count; alias_count++) {
+		ret = qcom_camera_icp_bps_alias_map_sg_domain(&icp->bps,
+			frame->planes[alias_count], alias_iova[alias_count],
+			frame->size[alias_count], source_domains[alias_count]);
+		if (ret)
+			goto unmap_aliases;
+	}
+	for (map_count = 0; map_count < plane_count; map_count++) {
+		ret = qcom_camera_icp_bps_client_session_map(client->session,
+			alias_iova[map_count], frame->size[map_count]);
+		if (ret)
+			goto reset_clients;
+	}
+	ret = qcom_camera_icp_bps_client_session_process(client->session, &job);
+	if (ret)
+		goto reset_clients;
+	while (map_count) {
+		map_count--;
+		cleanup_ret = qcom_camera_icp_bps_client_session_unmap(client->session,
+			alias_iova[map_count], frame->size[map_count]);
+		if (cleanup_ret) {
+			ret = cleanup_ret;
+			goto reset_clients;
+		}
+	}
+	goto unmap_aliases;
+
+reset_clients:
+	dev_warn(icp->dev, "BPS client frame failed (%d), resetting all sessions\n", ret);
+	qcom_camera_icp_bps_reset_clients(icp);
+unmap_aliases:
+	while (alias_count) {
+		alias_count--;
+		qcom_camera_icp_bps_client_alias_unmap(&icp->bps,
+			alias_iova[alias_count], frame->size[alias_count]);
+	}
+unlock:
+	mutex_unlock(&icp->bps_job_lock);
+	return ret;
+}
+
 static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 	.power_on = qcom_camera_icp_bps_power_on,
 	.power_off = qcom_camera_icp_bps_power_off,
@@ -1736,6 +1939,10 @@ static const struct qcom_camera_icp_bps_ops qcom_camera_icp_bps_ops = {
 	.alias_map = qcom_camera_icp_bps_client_alias_map,
 	.alias_map_sg = qcom_camera_icp_bps_client_alias_map_sg,
 	.alias_unmap = qcom_camera_icp_bps_client_alias_unmap,
+	.client_open = qcom_camera_icp_bps_open_client,
+	.client_close = qcom_camera_icp_bps_close_client,
+	.client_process = qcom_camera_icp_bps_process_client,
+	.client_reset = qcom_camera_icp_bps_reset_client,
 };
 
 static void
@@ -2538,6 +2745,11 @@ static int qcom_camera_icp_alloc_memory(struct qcom_camera_icp *icp)
 	return 0;
 }
 
+static void qcom_camera_icp_remove_rproc(void *data)
+{
+	rproc_del(data);
+}
+
 static int qcom_camera_icp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2585,6 +2797,8 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	init_completion(&icp->hfi_ping_done);
 	init_completion(&icp->hfi_command_done);
 	mutex_init(&icp->bps_client_lock);
+	mutex_init(&icp->bps_job_lock);
+	INIT_LIST_HEAD(&icp->bps_clients);
 	mutex_init(&icp->hfi_command_lock);
 	platform_set_drvdata(pdev, icp);
 
@@ -2673,9 +2887,18 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	ret = rproc_add(rproc);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to add remoteproc\n");
+	ret = devm_add_action_or_reset(dev, qcom_camera_icp_remove_rproc, rproc);
+	if (ret)
+		return ret;
 
 	icp->bps_auxdev = devm_auxiliary_device_create(dev, "bps", &icp->bps);
 	if (!icp->bps_auxdev) {
+		ret = -ENOMEM;
+		goto del_rproc;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO_QCOM_CAMERA_NATIVE) &&
+	    of_machine_is_compatible("oneplus,caihong") &&
+	    !devm_auxiliary_device_create(dev, "capture", &icp->bps)) {
 		ret = -ENOMEM;
 		goto del_rproc;
 	}
@@ -2683,15 +2906,7 @@ static int qcom_camera_icp_probe(struct platform_device *pdev)
 	return 0;
 
 del_rproc:
-	rproc_del(rproc);
 	return dev_err_probe(dev, ret, "failed to add BPS auxiliary device\n");
-}
-
-static void qcom_camera_icp_remove(struct platform_device *pdev)
-{
-	struct qcom_camera_icp *icp = platform_get_drvdata(pdev);
-
-	rproc_del(icp->rproc);
 }
 
 static const struct of_device_id qcom_camera_icp_of_match[] = {
@@ -2702,7 +2917,6 @@ MODULE_DEVICE_TABLE(of, qcom_camera_icp_of_match);
 
 static struct platform_driver qcom_camera_icp_driver = {
 	.probe = qcom_camera_icp_probe,
-	.remove = qcom_camera_icp_remove,
 	.driver = {
 		.name = "qcom-camera-icp",
 		.of_match_table = qcom_camera_icp_of_match,
