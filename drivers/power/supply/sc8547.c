@@ -214,6 +214,7 @@
 #define SC8547_VOOC_DEFAULT_CURRENT_CODE	61
 #define SC8547_VOOC_MIN_CURRENT_CODE	10 /* official 1.0-A terminal curve point */
 #define SC8547_VOOC_MAX_CURRENT_CODE	61 /* official project-23926 default */
+#define SC8547_VOOC_CURRENT_REQUEST_MAX	5
 #define SC8547_VOOC_CURVE_CONFIRM_SAMPLES	4
 #define SC8547_VOOC_CURVE_IBUS_MARGIN_UA	1000000
 #define SC8547_VOOC_TEMP_LITTLE_COLD_DECIC	50
@@ -433,6 +434,9 @@ struct sc8547_device {
 	bool vooc_cable_state_known;
 	u8 vooc_cable_absent_count;
 	u8 vooc_active_current_code;
+	u8 vooc_current_change_requests;
+	bool vooc_current_change_pending;
+	bool vooc_current_change_sent;
 	const struct sc8547_vooc_curve *vooc_curve;
 	u8 vooc_curve_index;
 	u8 vooc_curve_confirm_count;
@@ -1103,10 +1107,13 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 			 sc->vooc_curve_confirm_count);
 	sc->vooc_active_current_code = active;
 	sc->vooc_policy_clamped = active < requested;
-	if (reduce_active)
+	if (reduce_active) {
+		sc->vooc_current_change_pending = true;
+		sc->vooc_current_change_requests = SC8547_VOOC_CURRENT_REQUEST_MAX;
 		dev_info(sc->dev,
-			 "VOOC battery policy reduced current %u -> %u; applying on next request\n",
+			 "VOOC battery policy reduced current %u -> %u; requesting adapter update\n",
 			 previous_active, active);
+	}
 	return 0;
 }
 
@@ -2468,8 +2475,23 @@ static int sc8547_vooc_send_safe_reply(struct sc8547_device *sc, u8 rx,
 		data = sc8547_vooc_pack_value(sc->vooc_active_current_code ?
 						      sc->vooc_active_current_code :
 						      SC8547_VOOC_DEFAULT_CURRENT_CODE);
+		if (sc->vooc_current_change_pending) {
+			sc->vooc_current_change_pending = false;
+			sc->vooc_current_change_sent = true;
+			dev_info(sc->dev, "VOOC current update replied code=%u\n",
+				 sc->vooc_active_current_code);
+		}
 		break;
 	case SC8547_VOOC_CMD_GET_BATT_VOL:
+		if (sc->vooc_current_change_pending) {
+			if (!sc->vooc_current_change_requests) {
+				dev_warn(sc->dev, "VOOC adapter did not request reduced current\n");
+				return -EAGAIN;
+			}
+			sc->vooc_current_change_requests--;
+			data = 0x7f;
+			break;
+		}
 		vbat_uv = sc8547_vooc_report_bat_uv(vbus_uv, cached_vbat_uv,
 						    cached_ibus_ua, fast_entry);
 		if (vbat_uv < 0)
@@ -2624,6 +2646,9 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 		goto out_qos;
 	msleep(SC8547_RESET_SETTLE_MS);
 	sc->vooc_last_total_ibus_ua = -ENODATA;
+	sc->vooc_current_change_requests = 0;
+	sc->vooc_current_change_pending = false;
+	sc->vooc_current_change_sent = false;
 
 	ret = sc8547_vooc_secondary_prepare(sc, &secondary_state);
 	if (ret)
@@ -2810,6 +2835,20 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 			break;
 		}
 		flags = reg;
+		if (sc->vooc_current_change_sent) {
+			if (flags & (SC8547_VOOC_TXDATA_WR_FAIL |
+				     SC8547_VOOC_ERR_TRANS | SC8547_VOOC_NINTH_CLK_ERR)) {
+				dev_warn(sc->dev, "VOOC reduced-current reply failed flags=0x%02x\n",
+					 flags);
+				ret = -EIO;
+				break;
+			}
+			if (flags & (SC8547_VOOC_RXDATA_DONE | SC8547_VOOC_TXDATA_DONE)) {
+				sc->vooc_current_change_sent = false;
+				dev_info(sc->dev, "VOOC reduced-current exchange completed code=%u\n",
+					 sc->vooc_active_current_code);
+			}
+		}
 		/* RXDATA_DONE remains usable with a simultaneous TX error. */
 		if (flags & SC8547_VOOC_RXDATA_DONE) {
 			ret = regmap_read(sc->regmap, SC8547_REG_VOOC_RX_DATA,
@@ -3007,7 +3046,7 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 				if (reply_vbus_window_ok) {
 					vooc_cp_gate_pending = true;
 					vooc_cp_gate_due_us =
-						ktime_us_delta(ktime_get(), start) + 10000LL;
+						ktime_us_delta(ktime_get(), start);
 					dev_info(sc->dev,
 						 "VOOC CP gate ready after normal VBUS reply\n");
 				} else if (!vooc_cp_gate_pending) {
@@ -3099,6 +3138,12 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 					break;
 				}
 			}
+			if (fast_entry_sent && !vooc_cp_enabled && !skip_reply &&
+			    vooc_cp_gate_pending && reply_vbus_window_ok &&
+			    ((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_IS_VBUS_OK) {
+				next_adc_sample_us = 0;
+				goto sample_adc;
+			}
 			usleep_range(SC8547_VOOC_POLL_MIN_US,
 				     SC8547_VOOC_POLL_MAX_US);
 			elapsed_us = ktime_us_delta(ktime_get(), start);
@@ -3135,6 +3180,7 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 			}
 		}
 
+sample_adc:
 		elapsed_us = ktime_us_delta(ktime_get(), start);
 		if (elapsed_us >= next_adc_sample_us) {
 			vbus_uv = sc8547_get_vbus_uv(sc);
@@ -3418,10 +3464,6 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 		ret = -ETIMEDOUT;
 	}
 
-out_qos:
-	cpu_latency_qos_remove_request(&vooc_qos);
-	return ret;
-
 out_cleanup:
 	secondary_disable_ret = sc8547_vooc_secondary_disable(&secondary_state);
 	if (secondary_disable_ret) {
@@ -3561,6 +3603,8 @@ out_cleanup:
 		 "VOOC session rc=%d frames=%u vbus_uv=%d ibus_ua=%d\n",
 		 ret, rx_count, sc->vooc_last_vbus_uv,
 		 sc->vooc_last_ibus_ua);
+out_qos:
+	cpu_latency_qos_remove_request(&vooc_qos);
 	return ret;
 }
 
