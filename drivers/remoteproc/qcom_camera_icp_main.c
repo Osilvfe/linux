@@ -240,7 +240,7 @@ struct qcom_camera_icp_hfi_ping {
 #define CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET	0
 #define CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET	SZ_4K
 #define CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET	0x2800
-#define CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE	196
+#define CAMERA_ICP_BPS_FRAME_GENERIC_CDM_SIZE	228
 #define CAMERA_ICP_BPS_FRAME_IQ_OFFSET		0x3000
 #define CAMERA_ICP_BPS_FRAME_STRIPING_OFFSET	0x4000
 #define CAMERA_ICP_BPS_FRAME_CDM_OFFSET		0x6000
@@ -261,6 +261,7 @@ struct qcom_camera_icp_hfi_ping {
 
 #define CAMERA_ICP_CDM_CMD_DMI			1
 #define CAMERA_ICP_CDM_CMD_REG_CONT		3
+#define CAMERA_ICP_BPS_BLACK_LEVEL_REG		0x3c68
 #define CAMERA_ICP_BPS_WHITE_BALANCE_REG	0x3668
 #define CAMERA_ICP_BPS_DEMOSAIC_REG		0x4768
 #define CAMERA_ICP_BPS_COLOR_CORRECTION_REG	0x4968
@@ -273,13 +274,18 @@ struct qcom_camera_icp_hfi_ping {
 #define CAMERA_ICP_BPS_GAMMA_DELTA_MASK		GENMASK(11, 0)
 #define CAMERA_ICP_BPS_GAMMA_DELTA_SHIFT	12
 
-#define CAMERA_ICP_BPS_GAMMA_ENABLE		0
+#define CAMERA_ICP_BPS_GAMMA_ENABLE		1
 
 static const u32 qcom_camera_icp_bps_demosaic_config[] = {
 	0x00000000, 0x00000080, 0x01000000, 0x00000066,
 };
 
-/* Titan880 BPS WB14: green, blue and red gains followed by zero offsets. */
+static unsigned int bps_black_level = 60;
+module_param(bps_black_level, uint, 0400);
+MODULE_PARM_DESC(bps_black_level,
+		 "BPS black level in RAW10 units (0 disables, clamped to 1023)");
+
+/* Titan880 BPS WB14: green, blue and red gains followed by black offsets. */
 static const u32 qcom_camera_icp_bps_white_balance_config[] = {
 	QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10,
 	QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10,
@@ -287,28 +293,41 @@ static const u32 qcom_camera_icp_bps_white_balance_config[] = {
 	0, 0, 0, 0, 0, 0,
 };
 
-/* Default 257-point Qualcomm gamma15 curve from gamma_1_5_0.xsd. */
+/* Shared Gamma 2.2 curve after Bayer black-level and white-balance correction. */
 static const u16 qcom_camera_icp_bps_gamma_curve[] = {
-	0, 18, 30, 42, 54, 66, 78, 92, 106, 118, 133, 147, 159, 171, 183,
-	195, 207, 217, 227, 239, 249, 259, 269, 277, 287, 297, 305, 313,
-	321, 329, 337, 345, 351, 357, 365, 373, 381, 388, 394, 400, 406,
-	414, 420, 426, 434, 440, 444, 450, 458, 464, 468, 474, 480, 486,
-	492, 496, 502, 508, 512, 518, 524, 528, 534, 538, 542, 548, 552,
-	558, 564, 568, 572, 576, 580, 584, 588, 592, 598, 602, 606, 610,
-	614, 618, 622, 626, 630, 632, 636, 640, 645, 649, 653, 657, 661,
-	665, 669, 672, 675, 679, 681, 685, 688, 691, 695, 699, 701, 704,
-	707, 711, 713, 716, 719, 723, 725, 728, 731, 735, 737, 741, 744,
-	747, 749, 752, 755, 757, 760, 763, 765, 768, 771, 773, 776, 779,
-	781, 784, 787, 789, 792, 795, 797, 800, 803, 805, 808, 811, 813,
-	816, 819, 821, 823, 825, 827, 829, 831, 833, 836, 839, 841, 844,
-	846, 848, 851, 853, 855, 857, 859, 861, 864, 866, 868, 870, 872,
-	874, 876, 878, 880, 882, 884, 886, 888, 890, 892, 894, 896, 898,
-	900, 903, 905, 907, 909, 911, 913, 915, 916, 918, 920, 922, 923,
-	925, 927, 929, 931, 932, 934, 935, 937, 939, 941, 943, 945, 947,
-	948, 950, 952, 954, 955, 957, 959, 961, 963, 964, 966, 967, 969,
-	971, 972, 974, 975, 976, 978, 980, 982, 983, 985, 987, 988, 990,
-	992, 994, 995, 997, 999, 1001, 1003, 1004, 1005, 1007, 1008,
-	1010, 1011, 1013, 1015, 1016, 1017, 1019, 1020, 1022, 1023,
+	0, 82, 113, 136, 154, 171, 186, 199,
+	212, 223, 234, 245, 255, 264, 273, 282,
+	290, 298, 306, 314, 321, 328, 335, 342,
+	349, 355, 362, 368, 374, 380, 386, 392,
+	398, 403, 409, 414, 419, 425, 430, 435,
+	440, 445, 450, 455, 459, 464, 469, 473,
+	478, 482, 487, 491, 496, 500, 504, 509,
+	513, 517, 521, 525, 529, 533, 537, 541,
+	545, 549, 552, 556, 560, 564, 567, 571,
+	575, 578, 582, 585, 589, 593, 596, 599,
+	603, 606, 610, 613, 616, 620, 623, 626,
+	630, 633, 636, 639, 642, 646, 649, 652,
+	655, 658, 661, 664, 667, 670, 673, 676,
+	679, 682, 685, 688, 691, 694, 697, 700,
+	703, 705, 708, 711, 714, 717, 719, 722,
+	725, 728, 730, 733, 736, 739, 741, 744,
+	747, 749, 752, 754, 757, 760, 762, 765,
+	767, 770, 772, 775, 778, 780, 783, 785,
+	788, 790, 793, 795, 797, 800, 802, 805,
+	807, 810, 812, 814, 817, 819, 822, 824,
+	826, 829, 831, 833, 836, 838, 840, 842,
+	845, 847, 849, 852, 854, 856, 858, 861,
+	863, 865, 867, 869, 872, 874, 876, 878,
+	880, 883, 885, 887, 889, 891, 893, 895,
+	898, 900, 902, 904, 906, 908, 910, 912,
+	914, 916, 919, 921, 923, 925, 927, 929,
+	931, 933, 935, 937, 939, 941, 943, 945,
+	947, 949, 951, 953, 955, 957, 959, 961,
+	963, 965, 967, 969, 971, 972, 974, 976,
+	978, 980, 982, 984, 986, 988, 990, 992,
+	993, 995, 997, 999, 1001, 1003, 1005, 1006,
+	1008, 1010, 1012, 1014, 1016, 1018, 1019, 1021,
+	1023
 };
 
 /* SM8650 Titan880 RGB-to-YUV matrix with full-range 12-bit clamps. */
@@ -402,7 +421,7 @@ static __le32 *qcom_camera_icp_bps_write_dmi(__le32 *command, u32 reg,
 					     u8 bank, dma_addr_t lut_iova)
 {
 	*command++ = cpu_to_le32(CAMERA_ICP_CDM_CMD_DMI << 24 |
-				 CAMERA_ICP_BPS_GAMMA_LUT_BANK_SIZE - 1);
+				 (CAMERA_ICP_BPS_GAMMA_LUT_BANK_SIZE - 1));
 	*command++ = cpu_to_le32(lower_32_bits(lut_iova));
 	*command++ = cpu_to_le32((u32)bank << 24 | reg);
 
@@ -440,7 +459,9 @@ static __le32 *qcom_camera_icp_bps_write_white_balance(void *cpu,
 	struct qcom_camera_icp_hfi_image_desc *input;
 	const struct qcom_camera_icp_bps_color_profile *profile;
 	u32 config[ARRAY_SIZE(qcom_camera_icp_bps_white_balance_config)];
+	u32 black_offset = min(bps_black_level, 1023U) << 8;
 	u32 width;
+	size_t index;
 
 	bps_config = cpu + CAMERA_ICP_BPS_FRAME_CONFIG_OFFSET;
 	input = &bps_config->image[QCOM_CAMERA_ICP_HFI_BPS_INPUT_IMAGE];
@@ -451,6 +472,8 @@ static __le32 *qcom_camera_icp_bps_write_white_balance(void *cpu,
 				      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10);
 	config[2] = DIV_ROUND_CLOSEST(profile->red_gain_q10 * red_balance_q10,
 				      QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10);
+	for (index = 3; index < ARRAY_SIZE(config); index++)
+		config[index] = black_offset << 14;
 
 	return qcom_camera_icp_bps_write_reg_cont(command,
 		CAMERA_ICP_BPS_WHITE_BALANCE_REG, config, ARRAY_SIZE(config));
@@ -485,6 +508,13 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	__le32 *dmi_command;
 	__le32 *dmi_end;
 	u32 unit = QCOM_CAMERA_ICP_BPS_BALANCE_UNIT_Q10;
+	u32 black_offset = min(bps_black_level, 1023U) << 8;
+	u32 black_scale = min((BIT(18) << 11) / (BIT(18) - black_offset),
+			      (unsigned long)GENMASK(16, 0));
+	u32 black_config[6] = {
+		black_offset << 14, black_scale,
+		0, 0, 0, 0,
+	};
 	size_t generic_size;
 	size_t dmi_size;
 
@@ -504,6 +534,8 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 			      full_luma_clamp_min) != 0x308);
 	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
 			      white_balance_enable) != 0x3dc);
+	BUILD_BUG_ON(offsetof(struct qcom_camera_icp_hfi_bps_iq_settings,
+			      black_level_enable) != 0x424);
 	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_PAYLOAD_OFFSET +
 		     sizeof(struct qcom_camera_icp_hfi_bps_frame_payload) >
 		     CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET);
@@ -513,6 +545,7 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	BUILD_BUG_ON(CAMERA_ICP_BPS_FRAME_DMI_OFFSET + 3 * 3 * sizeof(*command) >
 		     CAMERA_ICP_BPS_FRAME_IQ_OFFSET);
 	BUILD_BUG_ON((2 + ARRAY_SIZE(qcom_camera_icp_bps_white_balance_config) +
+		      2 + ARRAY_SIZE(black_config) +
 		      2 + ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config) +
 		      2 + 10 +
 		      2 + ARRAY_SIZE(qcom_camera_icp_bps_color_xform_config)) *
@@ -523,6 +556,7 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	command = cpu + CAMERA_ICP_BPS_FRAME_GENERIC_CDM_OFFSET;
 
 	iq->white_balance_enable = cpu_to_le32(1);
+	iq->black_level_enable = cpu_to_le32(black_offset != 0);
 	iq->demosaic_enable = cpu_to_le32(1);
 	iq->color_correction_enable = cpu_to_le32(1);
 	iq->gamma_enable = cpu_to_le32(CAMERA_ICP_BPS_GAMMA_ENABLE);
@@ -534,6 +568,8 @@ static void qcom_camera_icp_init_bps_frame_settings(void *cpu,
 	iq->full_chroma_clamp_max = cpu_to_le32(U8_MAX);
 
 	end = qcom_camera_icp_bps_write_white_balance(cpu, command, unit, unit);
+	end = qcom_camera_icp_bps_write_reg_cont(end, CAMERA_ICP_BPS_BLACK_LEVEL_REG,
+					     black_config, ARRAY_SIZE(black_config));
 	end = qcom_camera_icp_bps_write_reg_cont(end, CAMERA_ICP_BPS_DEMOSAIC_REG,
 						 qcom_camera_icp_bps_demosaic_config,
 						 ARRAY_SIZE(qcom_camera_icp_bps_demosaic_config));

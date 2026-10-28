@@ -218,7 +218,9 @@ struct qcom_camera_icp_hfi_bps_iq_settings {
 	__le32 full_chroma_rounding_pattern;
 	u8 reserved_800[188];
 	__le32 white_balance_enable;
-	u8 reserved_992[284];
+	u8 reserved_992[68];
+	__le32 black_level_enable;
+	u8 reserved_1064[212];
 } __packed;
 
 struct qcom_camera_icp_hfi_bps_frame_payload {
