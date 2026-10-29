@@ -198,6 +198,7 @@ static void dsi_mgr_phy_disable(int id)
 struct dsi_bridge {
 	struct drm_bridge base;
 	int id;
+	bool mode_switch_failed;
 };
 
 #define to_dsi_bridge(x) container_of(x, struct dsi_bridge, base)
@@ -398,6 +399,7 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 	int ret;
 
 	DBG("set mode: " DRM_MODE_FMT, DRM_MODE_ARG(mode));
+	to_dsi_bridge(bridge)->mode_switch_failed = false;
 
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		return;
@@ -414,7 +416,7 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 		if (ret) {
 			dev_err(&msm_dsi->pdev->dev,
 				"failed to switch panel mode: %d\n", ret);
-			return;
+			goto failed;
 		}
 	}
 
@@ -422,7 +424,7 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 	if (ret) {
 		dev_err(&msm_dsi->pdev->dev,
 			"failed to set DSI mode: %d\n", ret);
-		goto rollback_panel;
+		goto failed;
 	}
 
 	if (is_bonded_dsi && other_dsi) {
@@ -431,9 +433,7 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 		if (ret) {
 			dev_err(&other_dsi->pdev->dev,
 				"failed to set DSI mode: %d\n", ret);
-			if (seamless)
-				goto rollback_host;
-			return;
+			goto failed;
 		}
 	}
 
@@ -445,7 +445,7 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 		dev_err(&msm_dsi->pdev->dev,
 			"failed to update DSI timing: %d\n", ret);
 	if (ret)
-		goto rollback_host;
+		goto failed;
 
 	if (is_bonded_dsi && other_dsi) {
 		ret = msm_dsi_host_update_timing(other_dsi->host,
@@ -453,25 +453,20 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 		if (ret)
 			dev_err(&other_dsi->pdev->dev,
 				"failed to update DSI timing: %d\n", ret);
-		if (ret)
-			msm_dsi_host_disable_timing_db(host);
 	}
 	if (ret)
-		goto rollback_host;
+		goto failed;
 
 	return;
 
-rollback_host:
-	msm_dsi_host_set_display_mode(host, &old_mode);
-	if (is_bonded_dsi && other_dsi)
-		msm_dsi_host_set_display_mode(other_dsi->host, &old_mode);
+failed:
+	if (!seamless)
+		return;
 
-rollback_panel:
-	if (seamless &&
-	    drm_panel_bridge_mode_switch(msm_dsi->next_bridge, adjusted_mode,
-					 &old_mode))
-		dev_err(&msm_dsi->pdev->dev,
-			"failed to roll back panel mode\n");
+	msm_dsi_host_disable_timing_db(host);
+	if (is_bonded_dsi && other_dsi)
+		msm_dsi_host_disable_timing_db(other_dsi->host);
+	to_dsi_bridge(bridge)->mode_switch_failed = true;
 }
 
 static enum drm_mode_status dsi_mgr_bridge_mode_valid(struct drm_bridge *bridge,
@@ -580,6 +575,19 @@ bool msm_dsi_manager_is_seamless_mode_switch(
 out:
 	drm_bridge_put(bridge);
 	return seamless;
+}
+
+bool msm_dsi_manager_mode_switch_failed(struct drm_encoder *encoder)
+{
+	struct drm_bridge *bridge;
+	bool failed;
+
+	bridge = drm_bridge_chain_get_first_bridge(encoder);
+	failed = bridge && bridge->funcs == &dsi_mgr_bridge_funcs &&
+		 to_dsi_bridge(bridge)->mode_switch_failed;
+	drm_bridge_put(bridge);
+
+	return failed;
 }
 
 void msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder)

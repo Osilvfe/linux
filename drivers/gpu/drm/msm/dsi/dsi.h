@@ -60,6 +60,7 @@ bool msm_dsi_manager_is_seamless_mode_switch(
 				const struct drm_display_mode *old_mode,
 				const struct drm_display_mode *new_mode);
 void msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder);
+bool msm_dsi_manager_mode_switch_failed(struct drm_encoder *encoder);
 
 /* dsi host */
 struct msm_dsi_host;

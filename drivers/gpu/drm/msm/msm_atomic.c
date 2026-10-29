@@ -246,6 +246,21 @@ static void msm_atomic_disable_timing_db(struct drm_atomic_commit *state)
 	}
 }
 
+static bool msm_atomic_mode_switch_failed(struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *new_conn_state;
+	struct drm_connector *connector;
+	int i;
+
+	for_each_new_connector_in_state(state, connector, new_conn_state, i) {
+		if (new_conn_state->best_encoder &&
+		    msm_dsi_manager_mode_switch_failed(new_conn_state->best_encoder))
+			return true;
+	}
+
+	return false;
+}
+
 int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 {
 	struct msm_drm_private *priv = dev->dev_private;
@@ -314,9 +329,13 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 		drm_atomic_helper_update_legacy_modeset_state(dev, state);
 		drm_atomic_helper_calc_timestamping_constants(state);
 		drm_atomic_helper_commit_crtc_set_mode(dev, state);
-	} else {
-		drm_atomic_helper_commit_modeset_disables(dev, state);
+		if (msm_atomic_mode_switch_failed(state)) {
+			drm_warn(dev, "Seamless mode switch failed, retrying full modeset\n");
+			seamless = false;
+		}
 	}
+	if (!seamless)
+		drm_atomic_helper_commit_modeset_disables(dev, state);
 	drm_atomic_helper_commit_planes(dev, state, 0);
 	if (!seamless)
 		drm_atomic_helper_commit_modeset_enables(dev, state);

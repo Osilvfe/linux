@@ -308,6 +308,7 @@ bool msm_dsi_manager_is_seamless_mode_switch(
 				const struct drm_display_mode *old_mode,
 				const struct drm_display_mode *new_mode);
 void msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder);
+bool msm_dsi_manager_mode_switch_failed(struct drm_encoder *encoder);
 #else
 static inline void __init msm_dsi_register(void)
 {
@@ -362,6 +363,12 @@ static inline bool msm_dsi_manager_is_seamless_mode_switch(
 static inline void
 msm_dsi_manager_disable_timing_db(struct drm_encoder *encoder)
 {
+}
+
+static inline bool
+msm_dsi_manager_mode_switch_failed(struct drm_encoder *encoder)
+{
+	return false;
 }
 #endif
 
