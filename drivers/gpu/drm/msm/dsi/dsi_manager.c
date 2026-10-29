@@ -197,8 +197,12 @@ static void dsi_mgr_phy_disable(int id)
 
 struct dsi_bridge {
 	struct drm_bridge base;
+	struct drm_connector *connector;
+	struct drm_display_mode *fixed_modes;
+	unsigned int num_fixed_modes;
 	int id;
 	bool mode_switch_failed;
+	bool panel_scaling;
 };
 
 #define to_dsi_bridge(x) container_of(x, struct dsi_bridge, base)
@@ -469,6 +473,117 @@ failed:
 	to_dsi_bridge(bridge)->mode_switch_failed = true;
 }
 
+static unsigned int dsi_mgr_copy_fixed_modes(struct list_head *modes,
+					    const struct drm_display_mode *preferred,
+					    struct drm_display_mode *target)
+{
+	const struct drm_display_mode *mode;
+	unsigned int count = 0;
+
+	list_for_each_entry(mode, modes, head) {
+		if ((mode->type & DRM_MODE_TYPE_DRIVER) &&
+		    mode->hdisplay == preferred->hdisplay &&
+		    mode->vdisplay == preferred->vdisplay) {
+			if (target)
+				drm_mode_copy(&target[count], mode);
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static int dsi_mgr_bridge_cache_fixed_modes(struct drm_bridge *bridge)
+{
+	struct dsi_bridge *dsi_bridge = to_dsi_bridge(bridge);
+	struct drm_connector *connector = dsi_bridge->connector;
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(dsi_mgr_bridge_get_id(bridge));
+	const struct drm_display_mode *mode, *preferred = NULL;
+	struct drm_display_mode *fixed_modes;
+	unsigned int count, copied;
+
+	list_for_each_entry(mode, &connector->modes, head) {
+		if ((mode->type & DRM_MODE_TYPE_DRIVER) &&
+		    (!preferred || (u64)mode->hdisplay * mode->vdisplay >
+				   (u64)preferred->hdisplay * preferred->vdisplay))
+			preferred = mode;
+	}
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		if ((mode->type & DRM_MODE_TYPE_DRIVER) &&
+		    (!preferred || (u64)mode->hdisplay * mode->vdisplay >
+				   (u64)preferred->hdisplay * preferred->vdisplay))
+			preferred = mode;
+	}
+
+	if (!preferred)
+		return -EINVAL;
+
+	count = dsi_mgr_copy_fixed_modes(&connector->modes, preferred, NULL);
+	count += dsi_mgr_copy_fixed_modes(&connector->probed_modes, preferred, NULL);
+	fixed_modes = devm_kcalloc(msm_dsi->dev->dev, count, sizeof(*fixed_modes), GFP_KERNEL);
+	if (!fixed_modes)
+		return -ENOMEM;
+
+	copied = dsi_mgr_copy_fixed_modes(&connector->modes, preferred, fixed_modes);
+	dsi_mgr_copy_fixed_modes(&connector->probed_modes, preferred, fixed_modes + copied);
+	dsi_bridge->fixed_modes = fixed_modes;
+	dsi_bridge->num_fixed_modes = count;
+
+	return 0;
+}
+
+static const struct drm_display_mode *
+dsi_mgr_bridge_fixed_mode(struct drm_bridge *bridge,
+			  const struct drm_display_mode *requested)
+{
+	struct dsi_bridge *dsi_bridge = to_dsi_bridge(bridge);
+	struct drm_connector *connector = dsi_bridge->connector;
+	unsigned int index;
+	int ret;
+
+	if (!connector || !dsi_bridge->panel_scaling)
+		return NULL;
+	if (!dsi_bridge->fixed_modes) {
+		ret = dsi_mgr_bridge_cache_fixed_modes(bridge);
+		if (ret)
+			return ERR_PTR(ret);
+	}
+
+	if (requested->hdisplay <= 0 || requested->vdisplay <= 0 ||
+	    requested->hdisplay > dsi_bridge->fixed_modes[0].hdisplay ||
+	    requested->vdisplay > dsi_bridge->fixed_modes[0].vdisplay || requested->vscan > 1 ||
+	    requested->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN |
+				DRM_MODE_FLAG_3D_MASK))
+		return ERR_PTR(-EINVAL);
+
+	for (index = 0; index < dsi_bridge->num_fixed_modes; index++) {
+		if (drm_mode_vrefresh(&dsi_bridge->fixed_modes[index]) ==
+		    drm_mode_vrefresh(requested))
+			return &dsi_bridge->fixed_modes[index];
+	}
+
+	return ERR_PTR(-EINVAL);
+}
+
+static int dsi_mgr_bridge_atomic_check(struct drm_bridge *bridge,
+				       struct drm_bridge_state *bridge_state,
+				       struct drm_crtc_state *crtc_state,
+				       struct drm_connector_state *conn_state)
+{
+	const struct drm_display_mode *fixed_mode;
+
+	fixed_mode = dsi_mgr_bridge_fixed_mode(bridge, &crtc_state->mode);
+	if (IS_ERR(fixed_mode))
+		return PTR_ERR(fixed_mode);
+	if (!fixed_mode)
+		return 0;
+
+	drm_mode_copy(&crtc_state->adjusted_mode, fixed_mode);
+	drm_mode_set_crtcinfo(&crtc_state->adjusted_mode, CRTC_INTERLACE_HALVE_V);
+
+	return 0;
+}
+
 static enum drm_mode_status dsi_mgr_bridge_mode_valid(struct drm_bridge *bridge,
 						      const struct drm_display_info *info,
 						      const struct drm_display_mode *mode)
@@ -478,7 +593,14 @@ static enum drm_mode_status dsi_mgr_bridge_mode_valid(struct drm_bridge *bridge,
 	struct mipi_dsi_host *host = msm_dsi->host;
 	struct platform_device *pdev = msm_dsi->pdev;
 	struct dev_pm_opp *opp;
+	const struct drm_display_mode *fixed_mode;
 	unsigned long byte_clk_rate;
+
+	fixed_mode = dsi_mgr_bridge_fixed_mode(bridge, mode);
+	if (IS_ERR(fixed_mode))
+		return MODE_BAD;
+	if (fixed_mode)
+		mode = fixed_mode;
 
 	byte_clk_rate = dsi_byte_clk_get_rate(host, IS_BONDED_DSI(), mode);
 
@@ -520,7 +642,16 @@ static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.atomic_post_disable = dsi_mgr_bridge_post_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,
+	.atomic_check = dsi_mgr_bridge_atomic_check,
 };
+
+static bool dsi_mgr_bridge_can_keep_timing(struct drm_bridge *bridge,
+					 const struct drm_display_mode *old_mode,
+					 const struct drm_display_mode *new_mode)
+{
+	return old_mode && new_mode && to_dsi_bridge(bridge)->panel_scaling &&
+		drm_mode_equal(old_mode, new_mode);
+}
 
 bool msm_dsi_manager_is_seamless_mode_switch(
 				struct drm_encoder *encoder,
@@ -548,6 +679,11 @@ bool msm_dsi_manager_is_seamless_mode_switch(
 	msm_dsi = dsi_mgr_get_dsi(id);
 	if (!msm_dsi || !msm_dsi->next_bridge)
 		goto out;
+
+	if (dsi_mgr_bridge_can_keep_timing(bridge, old_mode, new_mode)) {
+		seamless = true;
+		goto out;
+	}
 
 	if (!old_mode) {
 		if (msm_dsi_host_get_display_mode(msm_dsi->host,
@@ -652,6 +788,9 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
 		DRM_ERROR("Unable to create bridge connector\n");
 		return PTR_ERR(connector);
 	}
+	dsi_bridge->connector = connector;
+	dsi_bridge->panel_scaling = msm_dsi->next_bridge &&
+		of_device_is_compatible(msm_dsi->next_bridge->of_node, "csot,ppc100hb1-1");
 
 	return 0;
 }

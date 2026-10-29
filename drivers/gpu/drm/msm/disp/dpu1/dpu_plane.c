@@ -720,6 +720,18 @@ static int dpu_plane_check_inline_rotation(struct dpu_plane *pdpu,
 	return 0;
 }
 
+static bool dpu_plane_needs_scaling(const struct drm_plane_state *plane_state)
+{
+	unsigned int width = drm_rect_width(&plane_state->src) >> 16;
+	unsigned int height = drm_rect_height(&plane_state->src) >> 16;
+
+	if (drm_rotation_90_or_270(plane_state->rotation))
+		swap(width, height);
+
+	return width != drm_rect_width(&plane_state->dst) ||
+		height != drm_rect_height(&plane_state->dst);
+}
+
 static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
 		struct dpu_sw_pipe *pipe,
 		struct dpu_sw_pipe_cfg *pipe_cfg,
@@ -742,10 +754,7 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
 	 * Now check if the SSPP supports scaling at all.
 	 */
 	if (!(sblk->scaler_blk.len && pipe->sspp->ops.setup_scaler) &&
-	    ((drm_rect_width(&new_plane_state->src) >> 16 !=
-	      drm_rect_width(&new_plane_state->dst)) ||
-	     (drm_rect_height(&new_plane_state->src) >> 16 !=
-	      drm_rect_height(&new_plane_state->dst))))
+	    dpu_plane_needs_scaling(new_plane_state))
 		return -ERANGE;
 
 	fmt = msm_framebuffer_format(new_plane_state->fb);
@@ -812,6 +821,45 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
 #define MAX_UPSCALE_RATIO	20
 #define MAX_DOWNSCALE_RATIO	4
 
+static int dpu_plane_scale_to_mode(struct drm_plane_state *plane_state,
+				   const struct drm_crtc_state *crtc_state)
+{
+	const struct drm_display_mode *mode = &crtc_state->mode;
+	const struct drm_display_mode *adjusted = &crtc_state->adjusted_mode;
+	struct drm_rect *dst = &plane_state->dst;
+	struct drm_rect src = plane_state->src;
+	u32 width = adjusted->hdisplay, height = adjusted->vdisplay;
+	u32 left, top;
+	int min_scale = FRAC_16_16(1, MAX_UPSCALE_RATIO);
+	int max_scale = MAX_DOWNSCALE_RATIO << 16;
+
+	if (mode->hdisplay == adjusted->hdisplay && mode->vdisplay == adjusted->vdisplay)
+		return 0;
+	if (mode->hdisplay <= 0 || mode->vdisplay <= 0 ||
+	    adjusted->hdisplay <= 0 || adjusted->vdisplay <= 0)
+		return -EINVAL;
+
+	if ((u64)width * mode->vdisplay > (u64)height * mode->hdisplay)
+		width = div_u64((u64)height * mode->hdisplay, mode->vdisplay);
+	else
+		height = div_u64((u64)width * mode->vdisplay, mode->hdisplay);
+
+	left = (adjusted->hdisplay - width) / 2;
+	top = (adjusted->vdisplay - height) / 2;
+	dst->x1 = left + DIV_ROUND_CLOSEST_ULL((u64)dst->x1 * width, mode->hdisplay);
+	dst->x2 = left + DIV_ROUND_CLOSEST_ULL((u64)dst->x2 * width, mode->hdisplay);
+	dst->y1 = top + DIV_ROUND_CLOSEST_ULL((u64)dst->y1 * height, mode->vdisplay);
+	dst->y2 = top + DIV_ROUND_CLOSEST_ULL((u64)dst->y2 * height, mode->vdisplay);
+
+	drm_rect_rotate(&src, plane_state->fb->width << 16,
+			plane_state->fb->height << 16, plane_state->rotation);
+	if (drm_rect_calc_hscale(&src, dst, min_scale, max_scale) < 0 ||
+	    drm_rect_calc_vscale(&src, dst, min_scale, max_scale) < 0)
+		return -ERANGE;
+
+	return 0;
+}
+
 static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 					 struct drm_plane_state *new_plane_state,
 					 const struct drm_crtc_state *crtc_state)
@@ -820,9 +868,12 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	struct dpu_plane *pdpu = to_dpu_plane(plane);
 	struct dpu_plane_state *pstate = to_dpu_plane_state(new_plane_state);
 	struct drm_rect fb_rect = { 0 };
+	bool scaled_mode = crtc_state &&
+		(crtc_state->mode.hdisplay != crtc_state->adjusted_mode.hdisplay ||
+		 crtc_state->mode.vdisplay != crtc_state->adjusted_mode.vdisplay);
 
-	min_scale = FRAC_16_16(1, MAX_UPSCALE_RATIO);
-	max_scale = MAX_DOWNSCALE_RATIO << 16;
+	min_scale = scaled_mode ? 0 : FRAC_16_16(1, MAX_UPSCALE_RATIO);
+	max_scale = scaled_mode ? INT_MAX : MAX_DOWNSCALE_RATIO << 16;
 
 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
 						  min_scale,
@@ -834,6 +885,10 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	}
 	if (!new_plane_state->visible)
 		return 0;
+
+	ret = dpu_plane_scale_to_mode(new_plane_state, crtc_state);
+	if (ret)
+		return ret;
 
 	pstate->stage = DPU_STAGE_0 + pstate->base.normalized_zpos;
 	if (pstate->stage >= pdpu->catalog->caps->max_mixer_blendstages) {
@@ -1203,6 +1258,8 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
 	    old_plane_state->src_h != plane_state->src_h ||
 	    old_plane_state->crtc_w != plane_state->crtc_w ||
 	    old_plane_state->crtc_h != plane_state->crtc_h ||
+	    drm_rect_width(&old_plane_state->dst) != drm_rect_width(&plane_state->dst) ||
+	    drm_rect_height(&old_plane_state->dst) != drm_rect_height(&plane_state->dst) ||
 	    msm_framebuffer_format(old_plane_state->fb) !=
 	    msm_framebuffer_format(plane_state->fb))
 		crtc_state->planes_changed = true;
@@ -1281,8 +1338,7 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 
 	fmt = msm_framebuffer_format(plane_state->fb);
 	reqs.yuv = MSM_FORMAT_IS_YUV(fmt);
-	reqs.scale = (plane_state->src_w >> 16 != plane_state->crtc_w) ||
-		(plane_state->src_h >> 16 != plane_state->crtc_h);
+	reqs.scale = dpu_plane_needs_scaling(plane_state);
 
 	reqs.rot90 = drm_rotation_90_or_270(plane_state->rotation);
 

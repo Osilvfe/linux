@@ -6,6 +6,7 @@
  * Copyright (c) 2025, 2026 Junjie Cao <caojunjie650@gmail.com>
  */
 
+#include <linux/align.h>
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/device-id/of.h>
@@ -223,7 +224,31 @@ static int nt36532_get_modes(struct drm_panel *panel,
 	struct nt36532 *ctx = to_nt36532(panel);
 	const struct panel_info *panel_info = ctx->panel_info;
 	struct drm_display_mode *mode;
-	unsigned int i;
+	static const struct nt36532_scaled_size {
+		unsigned int width;
+		unsigned int height;
+	} scaled_sizes[] = {
+		{ 2560, 1600 },
+		{ 2560, 1440 },
+		{ 2400, 1696 },
+		{ 2100, 1484 },
+		{ 2048, 1536 },
+		{ 1920, 1200 },
+		{ 1920, 1080 },
+		{ 1800, 1272 },
+		{ 1680, 1050 },
+		{ 1600, 1200 },
+		{ 1600, 900 },
+		{ 1500, 1060 },
+		{ 1280, 960 },
+		{ 1280, 800 },
+		{ 1280, 720 },
+		{ 1200, 848 },
+		{ 1024, 768 },
+	};
+	static const unsigned int scaled_refresh_rates[] = { 60, 120 };
+	unsigned int i, refresh;
+	int count = 0;
 
 	ctx->connector = connector;
 
@@ -239,13 +264,30 @@ static int nt36532_get_modes(struct drm_panel *panel,
 
 		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(scaled_sizes); i++) {
+		for (refresh = 0; refresh < ARRAY_SIZE(scaled_refresh_rates); refresh++) {
+			mode = drm_cvt_mode(connector->dev, ALIGN(scaled_sizes[i].width, 8),
+					    scaled_sizes[i].height,
+					    scaled_refresh_rates[refresh], true, false, false);
+			if (!mode)
+				return -ENOMEM;
+
+			mode->hdisplay = scaled_sizes[i].width;
+			drm_mode_set_name(mode);
+			mode->type = DRM_MODE_TYPE_DRIVER;
+			drm_mode_probed_add(connector, mode);
+			count++;
+		}
 	}
 
 	connector->display_info.bpc = 8;
 	connector->display_info.width_mm = panel_info->modes[0].mode.width_mm;
 	connector->display_info.height_mm = panel_info->modes[0].mode.height_mm;
 
-	return panel_info->num_modes;
+	return count;
 }
 
 static int nt36532_find_mode(struct nt36532 *ctx,

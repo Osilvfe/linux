@@ -373,6 +373,7 @@ static void _dpu_crtc_setup_blend_cfg(struct dpu_crtc_mixer *mixer,
 static void _dpu_crtc_program_lm_output_roi(struct drm_crtc *crtc)
 {
 	struct dpu_crtc_state *crtc_state;
+	struct dpu_mdss_color black = { .color_3 = 0xfff };
 	int lm_idx;
 
 	crtc_state = to_dpu_crtc_state(crtc->state);
@@ -389,6 +390,10 @@ static void _dpu_crtc_program_lm_output_roi(struct drm_crtc *crtc)
 		cfg.out_height = drm_rect_height(lm_roi);
 		cfg.right_mixer = lm_idx & 0x1;
 		cfg.flags = 0;
+		if ((crtc->state->mode.hdisplay != crtc->state->adjusted_mode.hdisplay ||
+		     crtc->state->mode.vdisplay != crtc->state->adjusted_mode.vdisplay) &&
+		    hw_lm->ops.setup_border_color)
+			hw_lm->ops.setup_border_color(hw_lm, &black, true);
 		hw_lm->ops.setup_mixer_out(hw_lm, &cfg);
 	}
 }

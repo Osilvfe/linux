@@ -206,6 +206,12 @@ static bool msm_atomic_is_seamless_mode_switch(
 		    !old_crtc_state->enable || !new_crtc_state->enable)
 			return false;
 
+		if (drm_mode_equal(&old_crtc_state->adjusted_mode,
+				   &new_crtc_state->adjusted_mode) &&
+		    old_crtc_state->mode.hdisplay == new_crtc_state->mode.hdisplay &&
+		    old_crtc_state->mode.vdisplay == new_crtc_state->mode.vdisplay)
+			return false;
+
 		for_each_oldnew_connector_in_state(state, connector,
 						   old_conn_state,
 						   new_conn_state, j) {
