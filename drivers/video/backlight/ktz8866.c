@@ -60,6 +60,7 @@ struct ktz8866 {
 	struct gpio_desc *enn_gpio;
 	struct ktz8866_slave *slave;
 	bool led_on;
+	bool led_state_valid;
 };
 
 /* For debug purpose */
@@ -77,13 +78,17 @@ static inline void ktz8866_read(struct ktz8866 *ktz, unsigned int reg,
 	regmap_read(ktz->regmap, reg, val);
 }
 
-static void ktz8866_write(struct ktz8866 *ktz, unsigned int reg,
+static int ktz8866_write(struct ktz8866 *ktz, unsigned int reg,
 			  unsigned int val)
 {
-	regmap_write(ktz->regmap, reg, val);
+	int ret, slave_ret = 0;
+
+	ret = regmap_write(ktz->regmap, reg, val);
 
 	if (ktz->slave)
-		regmap_write(ktz->slave->regmap, reg, val);
+		slave_ret = regmap_write(ktz->slave->regmap, reg, val);
+
+	return ret ?: slave_ret;
 }
 
 static void ktz8866_ic_write_byte_dual(unsigned int reg,
@@ -101,13 +106,17 @@ static void ktz8866_ic_write_byte_single(unsigned int reg,
 	regmap_write(priv->regmap, reg, val);
 }
 
-static void ktz8866_update_bits(struct ktz8866 *ktz, unsigned int reg,
+static int ktz8866_update_bits(struct ktz8866 *ktz, unsigned int reg,
 				unsigned int mask, unsigned int val)
 {
-	regmap_update_bits(ktz->regmap, reg, mask, val);
+	int ret, slave_ret = 0;
+
+	ret = regmap_update_bits(ktz->regmap, reg, mask, val);
 
 	if (ktz->slave)
-		regmap_update_bits(ktz->slave->regmap, reg, mask, val);
+		slave_ret = regmap_update_bits(ktz->slave->regmap, reg, mask, val);
+
+	return ret ?: slave_ret;
 }
 
 static inline void
@@ -146,10 +155,12 @@ static void bl_ic_ktz8866_set_lcd_bias_by_gpio(bool enable)
 	gpiod_set_value_cansleep(priv->enn_gpio, val);
 }
 
-static void bl_ic_ktz8866_enable(bool enable)
+static int bl_ic_ktz8866_enable(struct ktz8866 *ktz, bool enable)
 {
-	if (priv->led_on == enable)
-		return;
+	int ret;
+
+	if (ktz->led_state_valid && ktz->led_on == enable)
+		return 0;
 
 	/*
 	 * TODO: take hw_en and bias en into account here, so we can fully shut
@@ -158,34 +169,64 @@ static void bl_ic_ktz8866_enable(bool enable)
 	if (enable) {
 		/* LED Backlight Driver regisers */
 		/* BL_CFG1: OVP=34.0V, linear BLED, PWM Disabled */
-		ktz8866_ic_write_byte_dual(0x02, 0xda);
+		ret = ktz8866_write(ktz, BL_CFG1, 0xda);
+		if (ret)
+			goto error;
 		/* BL_OPTION2: inductance 4.7uH, BL_CURRENT_LIMIT 2.5A */
-		ktz8866_ic_write_byte_dual(0x11, 0x37);
+		ret = ktz8866_write(ktz, BL_OPTION2, 0x37);
+		if (ret)
+			goto error;
 		/* enable backlight and 4 / 6 backlihgt regions */
-		ktz8866_update_bits(priv, 0x08, BL_EN_BIT | CURRENT_SINKS_MASK,
-				    BL_EN_BIT | GENMASK(3, 0));
+		ret = ktz8866_update_bits(ktz, BL_EN,
+					  BL_EN_BIT | CURRENT_SINKS_MASK,
+					  BL_EN_BIT | GENMASK(3, 0));
 	} else {
-		ktz8866_ic_write_byte_dual(0x08, 0x00);
+		ret = ktz8866_write(ktz, BL_EN, 0);
 	}
 
-	priv->led_on = enable;
+	if (ret)
+		goto error;
+
+	ktz->led_on = enable;
+	ktz->led_state_valid = true;
+
+	return 0;
+
+error:
+	ktz->led_state_valid = false;
+	return ret;
 }
 
 static int ktz8866_backlight_update_status(struct backlight_device *backlight_dev)
 {
 	struct ktz8866 *ktz = bl_get_data(backlight_dev);
 	unsigned int brightness = backlight_get_brightness(backlight_dev);
+	int ret;
 
-	if (brightness)
-		bl_ic_ktz8866_enable(true);
+	if (!brightness) {
+		ret = bl_ic_ktz8866_enable(ktz, false);
+		if (ret)
+			return ret;
+	}
 
-	ktz8866_write(ktz, BL_BRT_LSB, FIELD_GET(LOWER_BYTE, brightness));
-	ktz8866_write(ktz, BL_BRT_MSB, FIELD_GET(HIGHER_BYTE, brightness));
+	ret = ktz8866_write(ktz, BL_BRT_LSB, FIELD_GET(LOWER_BYTE, brightness));
+	if (ret)
+		goto error;
+	ret = ktz8866_write(ktz, BL_BRT_MSB, FIELD_GET(HIGHER_BYTE, brightness));
+	if (ret)
+		goto error;
 
-	if (!brightness)
-		bl_ic_ktz8866_enable(false);
+	if (brightness) {
+		ret = bl_ic_ktz8866_enable(ktz, true);
+		if (ret)
+			goto error;
+	}
 
 	return 0;
+
+error:
+	bl_ic_ktz8866_enable(ktz, false);
+	return ret;
 }
 
 static const struct backlight_ops ktz8866_backlight_ops = {
