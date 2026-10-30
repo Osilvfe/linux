@@ -1,0 +1,16 @@
+What:           /sys/bus/hid/devices/.../oneplus/f4_compensation
+Date:           October 2026
+Contact:        Osilvfe <osilvfe@gmail.com>
+Description:
+                仅限 Bluetooth 22d9:3869 键盘，布尔值，默认 0。
+                只有用户态 BLE 补偿后端就绪后才写入 1，此时将原始
+                F16/F17 翻译为 F4/Fn 触控板切换；后端负责维持 MCU 状态。
+                不写入 1 时保留原始 F16/F17 行为。后端退出须写回 0。
+
+What:           /sys/bus/hid/devices/.../oneplus/media_keys
+Date:           October 2026
+Contact:        Osilvfe <osilvfe@gmail.com>
+Description:
+                仅限上述键盘，布尔值，默认 0（标准 F 键优先）。
+                1 为图标功能优先，Fn 反选标准 F 键。按下时记住翻译，
+                按住期间修改设置或先释放 Fn 不改变对应的释放键码。

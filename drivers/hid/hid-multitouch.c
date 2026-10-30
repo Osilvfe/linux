@@ -51,6 +51,7 @@ MODULE_LICENSE("GPL");
 #include "hid-ids.h"
 
 #include "hid-haptic.h"
+#include "hid-multitouch-oneplus.h"
 
 /* quirks to control the device */
 #define MT_QUIRK_NOT_SEEN_MEANS_UP	BIT(0)
@@ -172,6 +173,7 @@ struct mt_report_data {
 
 struct mt_device {
 	struct mt_class mtclass;	/* our mt device class */
+	struct mt_oneplus *oneplus;
 	struct timer_list release_timer;	/* to release sticky fingers */
 	struct hid_haptic_device *haptic;	/* haptic related configuration */
 	struct hid_device *hdev;	/* hid_device we're attached to */
@@ -515,6 +517,65 @@ static struct attribute *sysfs_attrs[] = {
 
 static const struct attribute_group mt_attribute_group = {
 	.attrs = sysfs_attrs
+};
+
+static ssize_t f4_compensation_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct mt_device *td = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(td->oneplus->f4_compensation));
+}
+
+static ssize_t f4_compensation_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct mt_device *td = hid_get_drvdata(to_hid_device(dev));
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+	WRITE_ONCE(td->oneplus->f4_compensation, enabled);
+	return count;
+}
+static DEVICE_ATTR_RW(f4_compensation);
+
+static ssize_t media_keys_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct mt_device *td = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(td->oneplus->media_keys));
+}
+
+static ssize_t media_keys_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct mt_device *td = hid_get_drvdata(to_hid_device(dev));
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+	WRITE_ONCE(td->oneplus->media_keys, enabled);
+	return count;
+}
+static DEVICE_ATTR_RW(media_keys);
+
+static struct attribute *mt_oneplus_attrs[] = {
+	&dev_attr_f4_compensation.attr,
+	&dev_attr_media_keys.attr,
+	NULL,
+};
+
+static const struct attribute_group mt_oneplus_group = {
+	.name = "oneplus",
+	.attrs = mt_oneplus_attrs,
 };
 
 static void mt_get_feature(struct hid_device *hdev, struct hid_report *report)
@@ -1500,6 +1561,9 @@ static int mt_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 	}
 
 	application = rdata->application;
+	ret = mt_oneplus_input_mapping(td->oneplus, hi, usage, bit, max);
+	if (ret)
+		return ret;
 
 	/*
 	 * If mtclass.export_all_inputs is not set, only map fields from
@@ -1586,6 +1650,7 @@ static int mt_event(struct hid_device *hid, struct hid_field *field,
 	struct mt_device *td = hid_get_drvdata(hid);
 	struct mt_report_data *rdata;
 
+	mt_oneplus_event(td->oneplus, field, usage, value);
 	rdata = mt_find_report_data(td, field->report);
 	if (rdata && rdata->is_mt_collection)
 		return mt_touch_event(hid, field, usage, value);
@@ -2132,6 +2197,11 @@ static int mt_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		dev_err(&hdev->dev, "cannot allocate multitouch data\n");
 		return -ENOMEM;
 	}
+	if (mt_oneplus_match(hdev)) {
+		td->oneplus = devm_kzalloc(&hdev->dev, sizeof(*td->oneplus), GFP_KERNEL);
+		if (!td->oneplus)
+			return -ENOMEM;
+	}
 	td->haptic = devm_kzalloc(&hdev->dev, sizeof(*(td->haptic)), GFP_KERNEL);
 	if (!td->haptic)
 		return -ENOMEM;
@@ -2204,6 +2274,12 @@ static int mt_probe(struct hid_device *hdev, const struct hid_device_id *id)
 				hdev->name);
 
 	mt_set_modes(hdev, HID_LATENCY_NORMAL, TOUCHPAD_REPORT_ALL);
+
+	if (td->oneplus) {
+		ret = devm_device_add_group(&hdev->dev, &mt_oneplus_group);
+		if (ret)
+			dev_warn(&hdev->dev, "cannot create OnePlus controls: %d\n", ret);
+	}
 
 	if (!td->is_haptic_touchpad)
 		devm_kfree(&hdev->dev, td->haptic);
