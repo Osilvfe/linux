@@ -5495,7 +5495,7 @@ static void ufshcd_lu_init(struct ufs_hba *hba, struct scsi_device *sdev)
 {
 	int len = QUERY_DESC_MAX_SIZE;
 	u8 lun = ufshcd_scsi_to_upiu_lun(sdev->lun);
-	u8 lun_qdepth = hba->nutrs;
+	u8 lun_qdepth = 0;
 	u8 *desc_buf;
 	int ret;
 
@@ -5518,6 +5518,13 @@ static void ufshcd_lu_init(struct ufs_hba *hba, struct scsi_device *sdev)
 		 * use the smaller between UFSHCI CAP.NUTRS and UFS LU bLUQueueDepth
 		 */
 		lun_qdepth = min_t(int, desc_buf[UNIT_DESC_PARAM_LU_Q_DEPTH], hba->nutrs);
+	} else if (hba->dev_info.bqueuedepth) {
+		/*
+		 * In shared queueing architecture, bLUQueueDepth is 0 and the
+		 * device-wide bQueueDepth bounds the commands outstanding to the
+		 * whole device at any time, so the LU must not exceed it either.
+		 */
+		lun_qdepth = min_t(int, hba->dev_info.bqueuedepth, hba->nutrs);
 	}
 	/*
 	 * According to UFS device specification, the write protection mode is only supported by
@@ -5564,10 +5571,11 @@ set_qdepth:
 	 * For WLUNs that don't support unit descriptor, queue depth is set to 1.
 	 * For LUs whose bLUQueueDepth == 0, use the UFS device-wide queue depth
 	 * when valid; some firmware reports a working global bQueueDepth while
-	 * leaving the unit descriptor field zero.
+	 * leaving the unit descriptor field zero. When neither is available,
+	 * fall back to the full host queue depth.
 	 */
-	if (!lun_qdepth && hba->dev_info.bqueuedepth)
-		lun_qdepth = hba->dev_info.bqueuedepth;
+	if (!lun_qdepth)
+		lun_qdepth = hba->nutrs;
 	dev_dbg(hba->dev, "Set LU %x queue depth %d\n", lun, lun_qdepth);
 	scsi_change_queue_depth(sdev, lun_qdepth);
 }
