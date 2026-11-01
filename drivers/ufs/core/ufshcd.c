@@ -5767,6 +5767,30 @@ static inline int ufshcd_transfer_rsp_status(struct ufs_hba *hba,
 			ocs = OCS_SUCCESS;
 	}
 
+	/*
+	 * Some controller/device combinations complete a valid Response UPIU
+	 * with OCS_MISMATCH_RESP_UPIU_SIZE: the device answers commands beyond
+	 * its queue capacity with TASK SET FULL flow control, and the
+	 * controller flags that response as a size mismatch instead of
+	 * delivering it with OCS_SUCCESS. Recover the completion only when the
+	 * response in the UCD verifiably is that flow-control answer - a
+	 * Response UPIU for this task tag carrying TASK SET FULL, the only
+	 * status ever observed under this OCS. Everything else keeps the
+	 * DID_ERROR path below, so the controller error is never silently
+	 * ignored. Handing the status to the SCSI midlayer restores the
+	 * queue-depth limiting that DID_ERROR bypasses (TASK SET FULL ->
+	 * BLK_STS_DEV_RESOURCE -> scsi_track_queue_full()).
+	 */
+	if (ocs == OCS_MISMATCH_RESP_UPIU_SIZE &&
+	    lrbp->ucd_rsp_ptr->header.transaction_code == UPIU_TRANSACTION_RESPONSE &&
+	    lrbp->ucd_rsp_ptr->header.task_tag == tag &&
+	    lrbp->ucd_rsp_ptr->header.status == SAM_STAT_TASK_SET_FULL) {
+		dev_warn_ratelimited(hba->dev,
+			"OCS_MISMATCH_RESP_UPIU_SIZE carries TASK SET FULL (tag %d), processing flow control\n",
+			tag);
+		ocs = OCS_SUCCESS;
+	}
+
 	switch (ocs) {
 	case OCS_SUCCESS:
 		hba->ufs_stats.last_hibern8_exit_tstamp = ktime_set(0, 0);
