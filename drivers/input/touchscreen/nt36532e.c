@@ -48,6 +48,8 @@
 #define NVT_RESET_STATE_MAX 0xaf
 #define NVT_CMD_SLEEP 0x11
 #define NVT_EXT_CMD 0x7f
+#define NVT_PEN_VIBRATOR_ON 0x16
+#define NVT_PEN_VIBRATOR_OFF 0x17
 
 struct nvt_partition {
 	u32 bin, sram, size, crc;
@@ -80,6 +82,7 @@ struct nt36532e {
 	u8 pen_format, pen_buttons;
 	bool pen_in_range, pen_contact;
 	int pen_scan_type, pen_command_error;
+	int pen_vibrator, pen_vibrator_error;
 	int last_error;
 	u8 *tx, *rx;
 	size_t xfer_size;
@@ -637,14 +640,11 @@ static void nvt_report_pen(struct nt36532e *ts, const u8 *d)
  * 4 Sunwoda, 5 Maxeye 3rd. A retail model name is not this protocol ID.
  * Called with the device mutex held so IRQ reads cannot change the page.
  */
-static int nvt_set_pen_scan(struct nt36532e *ts, unsigned int type)
+static int nvt_send_pen_command(struct nt36532e *ts, u8 command)
 {
-	static const u8 commands[] = { 0x11, 0x10, 0x12, 0x13, 0x15, 0x18 };
 	u8 buf[3] = { 0 };
 	int ret, attempt;
 
-	if (type >= ARRAY_SIZE(commands))
-		return -EINVAL;
 	ret = nvt_set_page(ts, NVT_EVENT_BUF_ADDR);
 	if (ret)
 		return ret;
@@ -652,7 +652,7 @@ static int nvt_set_pen_scan(struct nt36532e *ts, unsigned int type)
 		if (buf[1] != NVT_EXT_CMD) {
 			buf[0] = NVT_EVENT_HOST_CMD;
 			buf[1] = NVT_EXT_CMD;
-			buf[2] = commands[type];
+			buf[2] = command;
 			ret = nvt_spi_write(ts, buf, sizeof(buf));
 			if (ret)
 				return ret;
@@ -667,6 +667,15 @@ static int nvt_set_pen_scan(struct nt36532e *ts, unsigned int type)
 			return 0;
 	}
 	return -ETIMEDOUT;
+}
+
+static int nvt_set_pen_scan(struct nt36532e *ts, unsigned int type)
+{
+	static const u8 commands[] = { 0x11, 0x10, 0x12, 0x13, 0x15, 0x18 };
+
+	if (type >= ARRAY_SIZE(commands))
+		return -EINVAL;
+	return nvt_send_pen_command(ts, commands[type]);
 }
 
 static void nvt_report_touch(struct nt36532e *ts, const u8 *d)
@@ -816,6 +825,7 @@ static ssize_t pen_scan_store(struct device *dev, struct device_attribute *attr,
 	else {
 		ret = nvt_set_pen_scan(ts, type);
 		ts->pen_command_error = ret;
+		ts->pen_vibrator = -1;
 		/* An absent ACK leaves the applied controller state uncertain. */
 		ts->pen_scan_type = ret ? -1 : (int)type;
 		nvt_pen_release(ts);
@@ -824,6 +834,47 @@ static ssize_t pen_scan_store(struct device *dev, struct device_attribute *attr,
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_RW(pen_scan);
+
+static ssize_t pen_vibrator_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct nt36532e *ts = dev_get_drvdata(dev);
+	ssize_t len;
+
+	mutex_lock(&ts->lock);
+	len = sysfs_emit(buf, "%d\n", ts->pen_vibrator);
+	mutex_unlock(&ts->lock);
+	return len;
+}
+
+static ssize_t pen_vibrator_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct nt36532e *ts = dev_get_drvdata(dev);
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+	mutex_lock(&ts->lock);
+	if (!ts->pen_support)
+		ret = -EOPNOTSUPP;
+	else if (!ts->irq_enabled)
+		ret = -EBUSY;
+	else {
+		ret = nvt_send_pen_command(ts, enabled ? NVT_PEN_VIBRATOR_ON :
+					   NVT_PEN_VIBRATOR_OFF);
+		ts->pen_vibrator_error = ret;
+		ts->pen_vibrator = ret ? -1 : (int)enabled;
+	}
+	mutex_unlock(&ts->lock);
+	if (ret)
+		return ret;
+	return count;
+}
+static DEVICE_ATTR_RW(pen_vibrator);
 
 static ssize_t pen_stats_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
@@ -837,12 +888,14 @@ static ssize_t pen_stats_show(struct device *dev, struct device_attribute *attr,
 		"scan_type=%d command_error=%d packets=%llu reports=%llu "
 		"checksum_errors=%llu out_of_range=%llu unknown_formats=%llu "
 		"format=%02x in_range=%u contact=%u raw_x=%u raw_y=%u "
-		"pressure=%u distance=%u buttons=%u max_pressure=%u\n",
+		"pressure=%u distance=%u buttons=%u max_pressure=%u "
+		"vibrator=%d vibrator_error=%d\n",
 		ts->pen_scan_type, ts->pen_command_error, ts->pen_packets,
 		ts->pen_reports, ts->pen_checksum_errors, ts->pen_out_of_range,
 		ts->pen_unknown_formats, ts->pen_format, ts->pen_in_range,
 		ts->pen_contact, ts->pen_x, ts->pen_y, ts->pen_pressure,
-		ts->pen_distance, ts->pen_buttons, ts->pen_max_pressure);
+		ts->pen_distance, ts->pen_buttons, ts->pen_max_pressure,
+		ts->pen_vibrator, ts->pen_vibrator_error);
 	mutex_unlock(&ts->lock);
 	return len;
 }
@@ -851,6 +904,7 @@ static DEVICE_ATTR_RO(pen_stats);
 static struct attribute *nvt_attrs[] = {
 	&dev_attr_touch_stats.attr,
 	&dev_attr_pen_scan.attr,
+	&dev_attr_pen_vibrator.attr,
 	&dev_attr_pen_stats.attr,
 	NULL,
 };
@@ -924,6 +978,7 @@ static void nvt_stop_events(struct nt36532e *ts)
 	/* A pending IRQ thread takes the mutex and sees irq_enabled=false. */
 	disable_irq_nosync(ts->spi->irq);
 	ts->irq_enabled = false;
+	ts->pen_vibrator = -1;
 	ts->stops++;
 	ts->sleep_error = nvt_set_page(ts, NVT_EVENT_BUF_ADDR);
 	if (!ts->sleep_error)
@@ -947,6 +1002,7 @@ static void nvt_resume_work(struct work_struct *work)
 	if (ts->suspended || !ts->panel_ready || ts->irq_enabled)
 		goto out;
 	ts->starts++;
+	ts->pen_vibrator = -1;
 	nvt_hw_reset(ts);
 	if (!ts->detected) {
 		ret = nvt_detect(ts);
@@ -1037,6 +1093,7 @@ static int nt36532e_probe(struct spi_device *spi)
 		return -ENOMEM;
 	ts->spi = spi;
 	ts->pen_scan_type = -1;
+	ts->pen_vibrator = -1;
 	mutex_init(&ts->lock);
 	INIT_WORK(&ts->resume_work, nvt_resume_work);
 	spi_set_drvdata(spi, ts);

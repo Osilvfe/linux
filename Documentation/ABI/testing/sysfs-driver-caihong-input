@@ -1,0 +1,12 @@
+What:           /sys/bus/spi/devices/.../pen_vibrator
+Date:           October 2026
+Contact:        Osilvfe <osilvfe@gmail.com>
+Description:
+                Novatek 笔书写反馈的触控器门控，布尔值，默认不发送命令。
+                读取 -1 表示未知，0/1 仅表示控制器已确认关闭/开启请求，
+                不是笔端马达状态；还需单独完成笔端 BLE 工具/等级配置。
+                使用原厂 7f/17 关闭、7f/16 开启，保持现有笔扫描模式。
+                休眠、重置或切换扫描模式后状态变为未知，不自动恢复。
+                无笔支持返回 EOPNOTSUPP，事件通路未启用返回 EBUSY，
+                SPI 故障直接返回，无控制器确认返回 ETIMEDOUT。
+                pen_stats 中 vibrator/vibrator_error 为请求状态和错误码。
