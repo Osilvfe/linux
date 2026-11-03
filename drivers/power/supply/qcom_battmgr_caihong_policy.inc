@@ -248,6 +248,10 @@ static int qcom_battmgr_oneplus_property_set_locked(struct qcom_battmgr *battmgr
 	if (!battmgr->service_up)
 		return -ENOTCONN;
 
+	if (opcode == BATTMGR_BAT_PROPERTY_SET && property == BATT_CHG_CTRL_EN &&
+	    value && READ_ONCE(battmgr->oneplus_charge_inhibit))
+		return -ECANCELED;
+
 	battmgr->oneplus_ext_pending = true;
 	battmgr->oneplus_ext_opcode = opcode;
 	battmgr->oneplus_ext_property = property;
@@ -703,12 +707,15 @@ static void qcom_battmgr_oneplus_ffc_worker(struct work_struct *work)
 	int ret;
 
 	if (!READ_ONCE(battmgr->oneplus_ffc_policy) ||
-	    !READ_ONCE(battmgr->service_up))
+	    !READ_ONCE(battmgr->service_up) ||
+	    READ_ONCE(battmgr->oneplus_charge_inhibit))
 		return;
 
 	cp_running = qcom_battmgr_oneplus_charge_pump_running();
 
 	mutex_lock(&battmgr->oneplus_lock);
+	if (battmgr->oneplus_charge_inhibit)
+		goto out_unlock;
 	ret = qcom_battmgr_oneplus_ffc_refresh_locked(battmgr);
 	if (ret) {
 		battmgr->oneplus_ffc_last_rc = ret;
@@ -5330,7 +5337,7 @@ static void qcom_battmgr_oneplus_policy_auto_worker(
 	int ret;
 
 	mutex_lock(&battmgr->oneplus_lock);
-	if (!battmgr->oneplus_policy_auto_start)
+	if (!battmgr->oneplus_policy_auto_start || battmgr->oneplus_charge_inhibit)
 		goto out_unlock;
 	if (!battmgr->service_up || battmgr->oneplus_policy_running ||
 	    battmgr->oneplus_pps_5m_running ||
@@ -5464,7 +5471,8 @@ static int qcom_battmgr_oneplus_dual_auto_wait_connected(
 		mutex_lock(&battmgr->oneplus_lock);
 		if (!battmgr->oneplus_dual_auto_enabled ||
 		    !battmgr->oneplus_dual_auto_run ||
-		    battmgr->oneplus_dual_auto_cancel_requested) {
+		    battmgr->oneplus_dual_auto_cancel_requested ||
+		    battmgr->oneplus_charge_inhibit) {
 			ret = -ECANCELED;
 		} else if (!battmgr->service_up) {
 			ret = -EHOSTDOWN;
@@ -5573,6 +5581,9 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 	if (!battmgr->oneplus_dual_auto_enabled)
 		goto out_unlock;
 	reschedule = true;
+
+	if (battmgr->oneplus_charge_inhibit)
+		goto out_unlock;
 
 	if (!READ_ONCE(battmgr->service_up)) {
 		/*
@@ -6441,6 +6452,11 @@ static void qcom_battmgr_caihong_notifications_ready(
 static void qcom_battmgr_caihong_service_event(struct qcom_battmgr *battmgr,
 						bool service_up)
 {
+	if (READ_ONCE(battmgr->oneplus_charge_control)) {
+		WRITE_ONCE(battmgr->oneplus_charge_dirty, true);
+		mod_delayed_work(system_freezable_wq, &battmgr->oneplus_charge_work, 0);
+	}
+
 	if (service_up && READ_ONCE(battmgr->oneplus_ffc_policy) &&
 	    (READ_ONCE(battmgr->oneplus_ffc_boot_reconcile) ||
 	     READ_ONCE(battmgr->oneplus_ffc_requested) ||
@@ -6461,11 +6477,21 @@ static void qcom_battmgr_caihong_service_event(struct qcom_battmgr *battmgr,
 				 &battmgr->oneplus_policy_monitor_work, 0);
 }
 
+#include "qcom_battmgr_caihong_control.inc"
+
 static int qcom_battmgr_caihong_init(struct qcom_battmgr *battmgr)
 {
 	struct device *dev = battmgr->dev;
 
 	mutex_init(&battmgr->oneplus_lock);
+	mutex_init(&battmgr->oneplus_charge_lock);
+	INIT_DELAYED_WORK(&battmgr->oneplus_charge_work, qcom_battmgr_caihong_charge_worker);
+	battmgr->oneplus_charge_control = of_machine_is_compatible("oneplus,caihong");
+	if (battmgr->oneplus_charge_control) {
+		battmgr->info.charge_ctrl_start = 95;
+		battmgr->info.charge_ctrl_end = 100;
+		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
+	}
 	dev_set_drvdata(dev, battmgr);
 	INIT_WORK(&battmgr->oneplus_dual_auto_run_work,
 		  qcom_battmgr_oneplus_dual_auto_run_worker);
@@ -6592,6 +6618,13 @@ static int qcom_battmgr_caihong_register(struct qcom_battmgr *battmgr)
 	struct device *dev = battmgr->dev;
 	int ret;
 
+	if (battmgr->oneplus_charge_control) {
+		ret = devm_add_action_or_reset(dev, qcom_battmgr_caihong_charge_unregister,
+					       battmgr);
+		if (ret)
+			return ret;
+	}
+
 #define CAIHONG_ADD_GROUP(_enabled, _group, _description) do { \
 	if (_enabled) { \
 		ret = devm_device_add_group(dev, _group); \
@@ -6640,6 +6673,12 @@ static int qcom_battmgr_caihong_register(struct qcom_battmgr *battmgr)
 
 #undef CAIHONG_ADD_GROUP
 
+	if (battmgr->oneplus_charge_control) {
+		ret = qcom_battmgr_caihong_charge_register(battmgr);
+		if (ret)
+			return ret;
+	}
+
 	if (battmgr->oneplus_policy_auto_start)
 		queue_delayed_work(system_long_wq,
 				   &battmgr->oneplus_policy_auto_work,
@@ -6659,6 +6698,8 @@ static void qcom_battmgr_caihong_remove(struct qcom_battmgr *battmgr)
 {
 	bool dual_auto_run;
 	bool cancel_cp = false;
+
+	qcom_battmgr_caihong_charge_unregister(battmgr);
 
 	WRITE_ONCE(battmgr->oneplus_otg_control, false);
 	cancel_work_sync(&battmgr->oneplus_otg_init_work);

@@ -7,6 +7,8 @@
 #include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/kthread.h>
+#include <linux/of.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 /* OnePlus firmware extension used to retrieve the partner PDO table. */

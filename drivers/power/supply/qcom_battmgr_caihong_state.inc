@@ -9,6 +9,21 @@
  */
 	/* Keep product-policy state independent of the generic request lock. */
 	struct mutex oneplus_lock;
+	struct mutex oneplus_charge_lock;
+	const struct power_supply_desc *oneplus_battery_base_desc;
+	struct power_supply_desc oneplus_battery_desc;
+	struct notifier_block oneplus_charge_pm_nb;
+	struct delayed_work oneplus_charge_work;
+	bool oneplus_charge_control;
+	bool oneplus_charge_registered;
+	bool oneplus_charge_inhibit;
+	bool oneplus_charge_applied;
+	bool oneplus_charge_latched;
+	bool oneplus_charge_suspended;
+	bool oneplus_charge_dirty;
+	bool oneplus_charge_verify_pending;
+	unsigned int oneplus_charge_behaviour;
+	int oneplus_charge_last_rc;
 	struct completion oneplus_pps_ack;
 	struct qcom_battmgr_oneplus_pps_response oneplus_pps;
 	int oneplus_pps_error;

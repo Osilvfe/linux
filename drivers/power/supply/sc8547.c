@@ -432,6 +432,7 @@ struct sc8547_device {
 	bool suspended;
 	bool vooc_cable_online;
 	bool vooc_cable_state_known;
+	bool vooc_charge_inhibited;
 	u8 vooc_cable_absent_count;
 	u8 vooc_active_current_code;
 	u8 vooc_current_change_requests;
@@ -790,6 +791,18 @@ static int sc8547_get_vooc_bat_uv(struct sc8547_device *sc)
  * when the two safety-critical gauge values (cell voltage and temperature)
  * are unavailable.
  */
+static bool sc8547_charge_is_inhibited(void)
+{
+	struct power_supply *psy = power_supply_get_by_name("qcom-battmgr-bat");
+	bool inhibited;
+
+	if (!psy)
+		return true;
+	inhibited = qcom_battmgr_caihong_charge_is_inhibited(psy);
+	power_supply_put(psy);
+	return inhibited;
+}
+
 static int sc8547_get_vooc_battery_state(struct sc8547_vooc_battery_state *state)
 {
 	struct power_supply *psy;
@@ -1011,6 +1024,9 @@ static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
 	u8 previous_active;
 	bool advance = false;
 	int ret;
+
+	if (sc8547_charge_is_inhibited())
+		return -ECANCELED;
 
 	ret = sc8547_get_vooc_battery_state(&state);
 	if (ret)
@@ -1310,11 +1326,22 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 	 */
 	if (psp == POWER_SUPPLY_PROP_CALIBRATE &&
 	    val->intval == SC8547_POLICY_CANCEL_CMD) {
+		if (sc->vooc_capable && sc8547_charge_is_inhibited()) {
+			WRITE_ONCE(sc->vooc_charge_inhibited, true);
+			WRITE_ONCE(sc->vooc_auto_retry, false);
+		}
 		atomic_set(&sc->policy_cancel, 1);
 		return 0;
 	}
 
+	if (val->intval > 0 && sc8547_charge_is_inhibited())
+		return -ECANCELED;
+
 	mutex_lock(&sc->lock);
+	if (val->intval > 0 && sc8547_charge_is_inhibited()) {
+		ret = -ECANCELED;
+		goto out;
+	}
 	if (psp == POWER_SUPPLY_PROP_INPUT_VOLTAGE_LIMIT) {
 		if (val->intval == 0) {
 			sc->pps_target_vbus_uv = 0;
@@ -3814,7 +3841,10 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	retry_delay_ms = ret == -EAGAIN ?
 		SC8547_VOOC_PRE_MODEL_RETRY_DELAY_MS :
 		SC8547_VOOC_AUTO_RETRY_DELAY_MS;
-	if (!ret) {
+	if (ret == -ECANCELED && !READ_ONCE(sc->vooc_auto_retry)) {
+		sc->vooc_auto_retry_count = 0;
+		dev_info(sc->dev, "VOOC automatic session cancelled by request\n");
+	} else if (!ret) {
 		sc->vooc_auto_retry_count = 0;
 		WRITE_ONCE(sc->vooc_auto_retry, false);
 		dev_info(sc->dev, "VOOC automatic session completed\n");
@@ -3876,6 +3906,18 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	unsigned long retry_delay;
 	int online;
 	int vbus_uv;
+
+	if (sc8547_charge_is_inhibited()) {
+		WRITE_ONCE(sc->vooc_charge_inhibited, true);
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		atomic_set(&sc->policy_cancel, 1);
+		cancel_delayed_work(&sc->vooc_retry_work);
+		return;
+	}
+	if (READ_ONCE(sc->vooc_charge_inhibited)) {
+		WRITE_ONCE(sc->vooc_charge_inhibited, false);
+		was_online = false;
+	}
 
 	online = sc8547_vooc_usb_online();
 	vbus_uv = sc8547_get_vbus_uv(sc);
@@ -3952,7 +3994,8 @@ static int sc8547_vooc_psy_notifier(struct notifier_block *nb,
 	struct power_supply *psy = data;
 
 	if (event != PSY_EVENT_PROP_CHANGED || !psy ||
-	    strcmp(psy->desc->name, "qcom-battmgr-usb"))
+	    (strcmp(psy->desc->name, "qcom-battmgr-usb") &&
+	     strcmp(psy->desc->name, "qcom-battmgr-bat")))
 		return NOTIFY_DONE;
 
 	mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,

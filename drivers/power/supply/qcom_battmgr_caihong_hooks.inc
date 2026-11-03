@@ -9,6 +9,13 @@
 #if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_CAIHONG)
 #include "qcom_battmgr_caihong_policy.inc"
 #else
+static inline const struct power_supply_desc *
+qcom_battmgr_caihong_battery_desc(struct qcom_battmgr *battmgr,
+				const struct power_supply_desc *desc)
+{
+	return desc;
+}
+
 static inline u32 qcom_battmgr_oneplus_get_ui_soc(
 	struct qcom_battmgr *battmgr)
 {

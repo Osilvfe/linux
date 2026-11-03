@@ -1750,6 +1750,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		else
 			psy_desc = &sm8350_bat_psy_desc;
 
+		psy_desc = qcom_battmgr_caihong_battery_desc(battmgr, psy_desc);
 		battmgr->bat_psy = devm_power_supply_register(dev, psy_desc, &psy_cfg);
 		if (IS_ERR(battmgr->bat_psy))
 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),

@@ -5,13 +5,21 @@
 
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/types.h>
 
 struct power_supply;
 
 #if IS_REACHABLE(CONFIG_BATTERY_QCOM_BATTMGR_CAIHONG)
 int qcom_battmgr_caihong_get_raw_capacity(struct power_supply *psy);
+bool qcom_battmgr_caihong_charge_is_inhibited(struct power_supply *psy);
 int qcom_battmgr_caihong_notify_fastchg_complete(struct power_supply *psy);
 #else
+static inline bool
+qcom_battmgr_caihong_charge_is_inhibited(struct power_supply *psy)
+{
+	return false;
+}
+
 static inline int
 qcom_battmgr_caihong_get_raw_capacity(struct power_supply *psy)
 {

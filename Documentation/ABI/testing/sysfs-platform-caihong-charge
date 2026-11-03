@@ -1,0 +1,13 @@
+What:		/sys/devices/.../oneplus_charge_control_status
+Date:		October 2026
+Contact:	Caihong 维护者
+Description:
+		Caihong 充电策略的只读诊断接口，以空格分隔的 key=value 形式报告
+		inhibited、applied、pending、latched、suspended、raw_soc 和 last_rc。
+		请求模式不代表硬件控制成功：必须同时检查 pending=0、last_rc=0，
+		并实际验证供电与电池电流。
+
+		标准电池 charge_behaviour 属性选择 auto 或 inhibit-charge。
+		inhibit-charge 关闭充电而不主动切断适配器输入，不承诺电池硬件隔离。
+		标准 start/end 阈值采用原始电量并带回差，end=100 关闭额外限充。
+		启用限充时，睡眠前保守停充，唤醒后重新读取电量并判断。
