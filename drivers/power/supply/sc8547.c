@@ -400,6 +400,7 @@ struct sc8547_active_sample {
 struct sc8547_pps_run_state {
 	int target_vbus_uv;
 	bool vendor_current_control;
+	bool experimental_high_current;
 };
 
 struct sc8547_vooc_curve;
@@ -4599,15 +4600,33 @@ static int sc8547_disable_charge_checked(struct sc8547_device *sc)
 	return 0;
 }
 
+static u32 sc8547_pps_ibus_limit(const struct sc8547_pps_run_state *p)
+{
+	if (!p->vendor_current_control)
+		return SC8547_PPS_FIXED_IBUS_MAX_UA;
+	return p->experimental_high_current ? 2850000 :
+		SC8547_VENDOR_CURRENT_IBUS_ADC_MAX_UA;
+}
+
+static bool sc8547_pps_input_lost(bool experimental, unsigned int sample,
+				  int ibus_ua, unsigned int *checks)
+{
+	if (!experimental || sample < 10)
+		return false;
+	if (ibus_ua < 100000)
+		(*checks)++;
+	else
+		*checks = 0;
+	return *checks >= 4;
+}
+
 static int sc8547_capture_active_sample(struct sc8547_device *sc,
 					 struct sc8547_pps_run_state *p,
 					 struct sc8547_active_sample *s)
 {
 	const struct sc8547_enable_window *w = &sc->window;
 	unsigned int reg06, reg07, reg0e;
-	u32 ibus_max_ua = p->vendor_current_control ?
-		SC8547_VENDOR_CURRENT_IBUS_ADC_MAX_UA :
-		SC8547_PPS_FIXED_IBUS_MAX_UA;
+	u32 ibus_max_ua = sc8547_pps_ibus_limit(p);
 	int headroom_uv;
 	int ret;
 
@@ -4712,6 +4731,7 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 	unsigned int attempt;
 	unsigned int sample;
 	unsigned int sample_goal;
+	unsigned int no_input_samples = 0;
 	unsigned int reg06, reg07, reg0e;
 	bool prep_touched = false;
 	int recovery_ret;
@@ -4723,6 +4743,8 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 
 	atomic_set(&sc->pps_running, 1);
 	p->vendor_current_control = vendor_current_control;
+	p->experimental_high_current = vendor_current_control && continuous &&
+		qcom_battmgr_caihong_pps_high_current_active();
 	if ((!continuous &&
 	     (!run_ms || run_ms % SC8547_STABILITY_SAMPLE_MS ||
 	      run_ms > SC8547_POLICY_RUN_MS)) ||
@@ -4849,6 +4871,15 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 		ret = sc8547_capture_confirmed_active_sample(sc, p, &active);
 		if (ret)
 			goto reject;
+		/* Confirm actual input loss after a five-second startup grace.
+		 * Residual pump voltage and stale firmware ONLINE cannot hold this
+		 * experimental run open after cable removal.
+		 */
+		if (sc8547_pps_input_lost(p->experimental_high_current, sample,
+					  active.ibus_ua, &no_input_samples)) {
+			ret = -ENODEV;
+			goto disable;
+		}
 	}
 	goto disable;
 

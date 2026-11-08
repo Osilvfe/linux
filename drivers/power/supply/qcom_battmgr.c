@@ -18,6 +18,14 @@
 #include <linux/math.h>
 #include <linux/units.h>
 
+#if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_CAIHONG)
+static bool caihong_pps_high_current;
+module_param_named(caihong_pps_high_current, caihong_pps_high_current, bool, 0444);
+MODULE_PARM_DESC(caihong_pps_high_current,
+		 "Opt in to the experimental Caihong continuous PPS high-current profile");
+static bool caihong_pps_high_current_active;
+#endif
+
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
 

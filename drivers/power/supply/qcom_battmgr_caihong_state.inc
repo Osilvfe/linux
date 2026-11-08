@@ -85,6 +85,8 @@
 	int oneplus_secondary_final_primary_off_rc;
 	int oneplus_secondary_final_secondary_off_rc;
 	bool oneplus_dual_running;
+	bool oneplus_dual_experimental_high_current;
+	u32 oneplus_dual_effective_target_ua;
 	bool oneplus_dual_valid;
 	bool oneplus_dual_stop_requested;
 	bool oneplus_dual_continuous_run;
@@ -132,9 +134,9 @@
 	u32 oneplus_dual_boost_pps_ma;
 	u32 oneplus_dual_boost_step_limit;
 	u32 oneplus_dual_boost_attempts;
-	u32 oneplus_dual_boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
-	u32 oneplus_dual_boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
-	u32 oneplus_dual_boost_secondary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
+	u32 oneplus_dual_boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
+	u32 oneplus_dual_boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
+	u32 oneplus_dual_boost_secondary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
 	u32 oneplus_dual_hold_samples;
 	u32 oneplus_dual_hold_full_checks;
 	u32 oneplus_dual_hold_vnow_cv_adjustments;
