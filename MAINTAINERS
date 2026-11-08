@@ -20403,6 +20403,7 @@ F:	Documentation/devicetree/bindings/media/i2c/giantec,gt9772.yaml
 F:	Documentation/devicetree/bindings/media/i2c/smartsens,sc1320cs.yaml
 F:	Documentation/devicetree/bindings/media/i2c/smartsens,sc820cs.yaml
 F:	Documentation/devicetree/bindings/power/supply/southchip,sc8547.yaml
+F:	Documentation/power/caihong-pps-high-current.rst
 F:	arch/arm64/boot/dts/qcom/sm8650-oneplus-caihong.dts
 F:	drivers/iio/light/tcs3701.c
 F:	drivers/input/keyboard/oneplus_pogo.c

@@ -10,6 +10,7 @@ Power Management
     apm-acpi
     basic-pm-debugging
     charger-manager
+    caihong-pps-high-current
     drivers-testing
     energy-model
     freezing-of-tasks
