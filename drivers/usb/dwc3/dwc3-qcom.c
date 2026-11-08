@@ -488,7 +488,8 @@ static int dwc3_qcom_mux_register(struct dwc3_qcom *qcom)
 {
 	struct typec_mux_desc desc = {};
 
-	if (!device_property_present(qcom->dev, "mode-switch"))
+	if (!IS_ENABLED(CONFIG_TYPEC) ||
+	    !device_property_present(qcom->dev, "mode-switch"))
 		return 0;
 
 	desc.drvdata = qcom;
@@ -809,11 +810,11 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
 
+	if (qcom->mux)
+		typec_mux_unregister(qcom->mux);
 	if (pm_runtime_resume_and_get(qcom->dev) < 0)
 		return;
 
-	if (qcom->mux)
-		typec_mux_unregister(qcom->mux);
 	dwc3_core_remove(&qcom->dwc);
 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
 	dwc3_qcom_interconnect_exit(qcom);
