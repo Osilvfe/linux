@@ -1337,7 +1337,13 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 	if (val->intval > 0 && sc8547_charge_is_inhibited())
 		return -ECANCELED;
 
-	mutex_lock(&sc->lock);
+	/*
+	 * battmgr may call us with oneplus_lock held, while the VOOC worker
+	 * holds sc->lock and calls back into battmgr. Let the caller unwind
+	 * on contention instead of reversing that lock order.
+	 */
+	if (!mutex_trylock(&sc->lock))
+		return -EBUSY;
 	if (val->intval > 0 && sc8547_charge_is_inhibited()) {
 		ret = -ECANCELED;
 		goto out;
