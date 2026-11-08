@@ -1576,6 +1576,7 @@
 
 &usb_1 {
 	dr_mode = "otg";
+	mode-switch;
 	usb-role-switch;
 
 	status = "okay";

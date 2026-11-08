@@ -131,6 +131,7 @@ config USB_DWC3_QCOM
 	tristate "Qualcomm Platform"
 	depends on ARCH_QCOM || COMPILE_TEST
 	depends on EXTCON || !EXTCON
+	depends on TYPEC || !TYPEC
 	depends on OF
 	default USB_DWC3
 	help
