@@ -15,6 +15,76 @@ struct qcom_battmgr_oneplus_cp_run_ctx {
 	int result;
 };
 
+/* Read-only boot policy plus a run-owned gate shared with SC8547. */
+bool qcom_battmgr_caihong_pps_high_current_active(void)
+{
+	return READ_ONCE(caihong_pps_high_current_active);
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_caihong_pps_high_current_active);
+
+struct qcom_battmgr_oneplus_pps_profile {
+	bool experimental;
+	u32 target_ua;
+	u32 ibus_max_ua;
+	u32 soft_ibus_ua;
+	u32 emergency_ibus_adc_ua;
+	u32 source_max_mv;
+	u32 boost_steps;
+	u32 handoff_min_ua;
+	u32 path_soft_uv;
+};
+
+static struct qcom_battmgr_oneplus_pps_profile
+qcom_battmgr_oneplus_pps_profile(bool experimental)
+{
+	return (struct qcom_battmgr_oneplus_pps_profile) {
+		.experimental = experimental,
+		.target_ua = experimental ? 4500000 :
+			BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA,
+		.ibus_max_ua = experimental ? 2650000 :
+			BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+		.soft_ibus_ua = experimental ? 2450000 :
+			BATTMGR_ONEPLUS_CP_DUAL_HOLD_SOFT_IBUS_UA,
+		.emergency_ibus_adc_ua = experimental ? 2850000 :
+			BATTMGR_ONEPLUS_CP_DUAL_EMERGENCY_IBUS_ADC_MAX_UA,
+		.source_max_mv = experimental ? 10000 :
+			BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV,
+		.boost_steps = experimental ? 15 :
+			BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS,
+		.handoff_min_ua = experimental ? 1800000 :
+			BATTMGR_ONEPLUS_CP_DUAL_BOOST_HANDOFF_MIN_UA,
+		.path_soft_uv = experimental ? 175000 :
+			BATTMGR_ONEPLUS_CP_DUAL_PATH_TAPER_UV,
+	};
+}
+
+/* The source contract covers both charge pumps and the parallel buck path.
+ * Reserve the last fresh buck current, with a 500-mA floor. This is bounded
+ * telemetry-based headroom, not a calibrated measurement of cable current.
+ */
+static u32 qcom_battmgr_oneplus_pps_target(
+	const struct qcom_battmgr_oneplus_pps_profile *profile,
+	u32 capacity, int temp_decic, u32 source_ua, u32 buck_ua, u32 *ceiling_ua)
+{
+	u32 target = profile->target_ua;
+	u32 reserve_ua;
+
+	if (!profile->experimental)
+		return target;
+	if (capacity > 100 || !buck_ua || buck_ua > 5000000)
+		return 0;
+	if (temp_decic >= 380 || capacity >= 75)
+		target = min_t(u32, target, 3000000);
+	if (temp_decic < 200 || temp_decic >= 400 || capacity >= 85)
+		target = min_t(u32, target, 2000000);
+	reserve_ua = max_t(u32, 500000, buck_ua);
+	if (source_ua <= reserve_ua)
+		return 0;
+	target = min(target, source_ua - reserve_ua);
+	*ceiling_ua = min(*ceiling_ua, target);
+	return *ceiling_ua;
+}
+
 static int qcom_battmgr_oneplus_pps_request(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_oneplus_pps_request request = {
@@ -2868,9 +2938,9 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 	u32 boost_pps_ma;
 	u32 boost_step_limit;
 	u32 boost_attempts;
-	u32 boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
-	u32 boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
-	u32 boost_secondary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS];
+	u32 boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
+	u32 boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
+	u32 boost_secondary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
 	u32 hold_samples;
 	u32 hold_full_checks;
 	u32 hold_vnow_cv_adjustments;
@@ -3277,7 +3347,7 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 	len += sysfs_emit_at(buf, len, "\n");
 	len += sysfs_emit_at(buf, len, "boost_trace=");
 	for (i = 0; i < min_t(u32, boost_attempts,
-				     BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS); i++)
+				     BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS); i++)
 		len += sysfs_emit_at(buf, len, "%s%u/%u/%u", i ? "," : "",
 				     boost_request_mv[i],
 				     boost_primary_ibus_ua[i],
@@ -3294,6 +3364,10 @@ static ssize_t oneplus_pps_dual_500ms_show(struct device *dev,
 	}
 	len += sysfs_emit_at(buf, len, "\n");
 
+	len += sysfs_emit_at(buf, len,
+		"experimental_profile=%u effective_target_ua=%u limits_above=default-profile\n",
+		READ_ONCE(battmgr->oneplus_dual_experimental_high_current),
+		READ_ONCE(battmgr->oneplus_dual_effective_target_ua));
 	return len;
 }
 
@@ -3317,6 +3391,17 @@ static int qcom_battmgr_oneplus_dual_system_check(
 	if (!*usb_online) {
 		ret = -ENODEV;
 		goto out_unlock;
+	}
+
+	if (READ_ONCE(caihong_pps_high_current_active)) {
+		ret = qcom_battmgr_oneplus_request_property(battmgr,
+			BATTMGR_USB_PROPERTY_GET, USB_CURR_NOW, 0);
+		if (ret)
+			goto out_unlock;
+		if (!battmgr->usb.current_now || battmgr->usb.current_now > 5000000) {
+			ret = -ERANGE;
+			goto out_unlock;
+		}
 	}
 
 	ret = qcom_battmgr_oneplus_request_property(battmgr,
@@ -3350,6 +3435,11 @@ static int qcom_battmgr_oneplus_dual_system_check(
 	if (ret)
 		goto out_unlock;
 	*ibat_ua = battmgr->status.current_now;
+	if (READ_ONCE(caihong_pps_high_current_active) &&
+	    *ibat_ua < -10000000) {
+		ret = -ERANGE;
+		goto out_unlock;
+	}
 
 	ret = qcom_battmgr_oneplus_request_property(battmgr,
 		BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, 0);
@@ -3509,9 +3599,9 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	u32 boost_pps_ma = 0;
 	u32 boost_step_limit = 0;
 	u32 boost_attempts = 0;
-	u32 boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS] = { 0 };
-	u32 boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS] = { 0 };
-	u32 boost_secondary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS] = { 0 };
+	u32 boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS] = { 0 };
+	u32 boost_primary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS] = { 0 };
+	u32 boost_secondary_ibus_ua[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS] = { 0 };
 	u32 aggregate_boost_ibus_ua = 0;
 	u32 hold_samples = 0;
 	u32 hold_full_checks = 0;
@@ -3577,6 +3667,11 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	bool hold_output_limited = false;
 	bool hold_output_taper_active = false;
 	bool continuous;
+	struct qcom_battmgr_oneplus_pps_profile profile =
+		qcom_battmgr_oneplus_pps_profile(false);
+	u32 target_ua = BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA;
+	u32 target_ceiling_ua = 4500000;
+
 	unsigned int i;
 	int cleanup_ret;
 	int monitor_temp_decic = 0;
@@ -3601,6 +3696,12 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		mutex_unlock(&battmgr->oneplus_lock);
 		return -EBUSY;
 	}
+	profile = qcom_battmgr_oneplus_pps_profile(automatic && continuous &&
+		caihong_pps_high_current && battmgr->oneplus_pps_read_buffer &&
+		of_machine_is_compatible("oneplus,caihong"));
+	WRITE_ONCE(caihong_pps_high_current_active, profile.experimental);
+	battmgr->oneplus_dual_experimental_high_current = profile.experimental;
+	battmgr->oneplus_dual_effective_target_ua = profile.target_ua;
 	battmgr->oneplus_dual_running = true;
 	battmgr->oneplus_dual_valid = false;
 	battmgr->oneplus_dual_stop_requested = false;
@@ -3871,7 +3972,7 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	msleep(BATTMGR_ONEPLUS_CP_DUAL_PRIMARY_SETTLE_MS);
 	primary_entry_rc = qcom_battmgr_oneplus_require_cp_active_bounded(
 		primary_psy, &primary_entry_ibus_ua,
-		BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+		profile.ibus_max_ua,
 		&ibus_rechecks, &ibus_recoveries);
 	if (primary_entry_rc) {
 		ret = primary_entry_rc;
@@ -3908,7 +4009,7 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	msleep(BATTMGR_ONEPLUS_CP_DUAL_SOURCE_SETTLE_MS);
 	primary_pre_rc = qcom_battmgr_oneplus_require_cp_active_bounded(
 		primary_psy, &primary_pre_ibus_ua,
-		BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+		profile.ibus_max_ua,
 		&ibus_rechecks, &ibus_recoveries);
 	if (primary_pre_rc) {
 		ret = primary_pre_rc;
@@ -3976,12 +4077,12 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	primary_boost_pre_rc =
 		qcom_battmgr_oneplus_require_cp_active_bounded(
 			primary_psy, &primary_boost_pre_ibus_ua,
-			BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+			profile.ibus_max_ua,
 			&ibus_rechecks, &ibus_recoveries);
 	secondary_boost_pre_rc =
 		qcom_battmgr_oneplus_require_cp_active_bounded(
 			secondary_psy, &secondary_boost_pre_ibus_ua,
-			BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+			profile.ibus_max_ua,
 			&ibus_rechecks, &ibus_recoveries);
 	if (primary_boost_pre_rc || secondary_boost_pre_rc) {
 		ret = primary_boost_pre_rc ? primary_boost_pre_rc :
@@ -3990,13 +4091,13 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	}
 
 	if (!source_to_mv ||
-	    source_to_mv > BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV -
+	    source_to_mv > profile.source_max_mv -
 			   BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEP_MV) {
 		ret = -ERANGE;
 		goto cancel_dual;
 	}
-	boost_step_limit = min_t(u32, BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEPS,
-		(BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV - source_to_mv) /
+	boost_step_limit = min_t(u32, profile.boost_steps,
+		(profile.source_max_mv - source_to_mv) /
 			BATTMGR_ONEPLUS_CP_DUAL_BOOST_STEP_MV);
 	mutex_lock(&battmgr->oneplus_lock);
 	boost_pps_ma = qcom_battmgr_oneplus_pps_current_limit(
@@ -4008,19 +4109,39 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		ret = -EOPNOTSUPP;
 		goto cancel_dual;
 	}
+	if (profile.experimental) {
+		/* The preceding sample was taken before PPS/pump startup. */
+		monitor_rc = qcom_battmgr_oneplus_dual_system_check(battmgr,
+			&monitor_usb_online, &monitor_vbat_uv, &monitor_vbat_ocv_uv,
+			&monitor_ibat_ua, &monitor_capacity, &monitor_temp_decic);
+		if (monitor_rc) {
+			ret = monitor_rc;
+			goto cancel_dual;
+		}
+	}
+	target_ua = qcom_battmgr_oneplus_pps_target(&profile, monitor_capacity,
+		monitor_temp_decic, boost_pps_ma * 1000,
+		READ_ONCE(battmgr->usb.current_now), &target_ceiling_ua);
+	if (profile.experimental && target_ua < profile.handoff_min_ua) {
+		ret = -EOPNOTSUPP;
+		goto cancel_dual;
+	}
+	WRITE_ONCE(battmgr->oneplus_dual_effective_target_ua, target_ua);
 
 	/*
-	 * Follow the vendor third-party PPS policy shape: adjust source voltage in
-	 * 40-mV increments against aggregate CP IBUS. Keep the fast acquisition
-	 * bounded to ten samples, or fewer as the 9.4-V physical ceiling approaches,
-	 * and retain an independent 1.45-A ceiling on each
-	 * pump. Select the highest advertised APDO current up to the vendor's 5-A
+	 * Follow the vendor third-party PPS policy shape with 40-mV increments
+	 * against aggregate CP IBUS. The default retains ten acquisition samples,
+	 * a 2-A aggregate target and independent 1.45-A normal pump limits.
+	 * The explicit experimental profile selects its own bounded step count,
+	 * loaded source-request ceiling, derated target and software current limits;
+	 * SC8547 still checks the unchanged measured 9.4-V input window.
+	 * Select the highest advertised APDO current up to the vendor's 5-A
 	 * limit; that contract is only a source ceiling, while the voltage loop
-	 * below controls the two pumps to 2 A aggregate and leaves headroom for the
+	 * below controls the selected aggregate target and leaves headroom for the
 	 * parallel buck path. If both pumps remain balanced and finish narrowly
 	 * below the target window, let the slower hold controller complete
 	 * acquisition instead of
-	 * treating the fixed ten-step boundary as an electrical failure.
+	 * treating the bounded acquisition limit as an electrical failure.
 	 */
 	for (i = 0; i < boost_step_limit; i++) {
 		if (READ_ONCE(battmgr->oneplus_dual_stop_requested)) {
@@ -4048,12 +4169,12 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		primary_boost_post_rc =
 			qcom_battmgr_oneplus_require_cp_active_bounded(
 				primary_psy, &primary_boost_post_ibus_ua,
-				BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+				profile.ibus_max_ua,
 				&ibus_rechecks, &ibus_recoveries);
 		secondary_boost_post_rc =
 			qcom_battmgr_oneplus_require_cp_active_bounded(
 				secondary_psy, &secondary_boost_post_ibus_ua,
-				BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+				profile.ibus_max_ua,
 				&ibus_rechecks, &ibus_recoveries);
 
 		boost_request_mv[i] = source_boost_mv;
@@ -4066,18 +4187,36 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 			break;
 		}
 
+		if (profile.experimental) {
+			monitor_rc = qcom_battmgr_oneplus_dual_system_check(battmgr,
+				&monitor_usb_online, &monitor_vbat_uv, &monitor_vbat_ocv_uv,
+				&monitor_ibat_ua, &monitor_capacity, &monitor_temp_decic);
+			if (monitor_rc) {
+				ret = monitor_rc;
+				break;
+			}
+			target_ua = qcom_battmgr_oneplus_pps_target(&profile,
+				monitor_capacity, monitor_temp_decic, boost_pps_ma * 1000,
+				READ_ONCE(battmgr->usb.current_now), &target_ceiling_ua);
+			if (target_ua < profile.handoff_min_ua) {
+				ret = -EOPNOTSUPP;
+				break;
+			}
+			WRITE_ONCE(battmgr->oneplus_dual_effective_target_ua, target_ua);
+		}
+
 		aggregate_boost_ibus_ua = primary_boost_post_ibus_ua +
 			secondary_boost_post_ibus_ua;
 		if (aggregate_boost_ibus_ua >=
-		    BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA -
+		    target_ua -
 		    BATTMGR_ONEPLUS_CP_DUAL_BOOST_DEADBAND_UA)
 			break;
 	}
 	if (!ret && aggregate_boost_ibus_ua <
-	    BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA -
+	    target_ua -
 	    BATTMGR_ONEPLUS_CP_DUAL_BOOST_DEADBAND_UA &&
 	    (aggregate_boost_ibus_ua <
-		BATTMGR_ONEPLUS_CP_DUAL_BOOST_HANDOFF_MIN_UA ||
+		profile.handoff_min_ua ||
 	     primary_boost_post_ibus_ua <
 		BATTMGR_ONEPLUS_CP_DUAL_BOOST_HANDOFF_PUMP_MIN_UA ||
 	     secondary_boost_post_ibus_ua <
@@ -4085,6 +4224,9 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		ret = -ERANGE;
 
 	/*
+	 * The historical numeric examples below describe the default profile.
+	 * The opt-in path uses the selected profile and source-budgeted target;
+	 * the same error, voltage/CV, full and cancellation paths remain in charge.
 	 * B29 completed 116 hold samples before slow current drift put one pump only
 	 * 3.75 mA above the independent 1.2-A stop.  Match both arms of the vendor
 	 * third-party current loop, but avoid using its full 40-mV target-voltage
@@ -4133,7 +4275,7 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		 * write and the physical 9.4-V cap; the vendor strategy capability remains
 		 * 11 V / 5 A and is reported separately.
 		 */
-		hold_max_request_mv = BATTMGR_ONEPLUS_CP_2TO1_SOURCE_MAX_MV;
+		hold_max_request_mv = profile.source_max_mv;
 		for (i = 0;
 		     continuous || i < BATTMGR_ONEPLUS_CP_DUAL_HOLD_SAMPLES;
 		     i++) {
@@ -4159,25 +4301,25 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 			primary_hold_check_rc =
 				qcom_battmgr_oneplus_require_cp_active_bounded(
 					primary_psy, &primary_hold_ibus_ua,
-					BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+					profile.ibus_max_ua,
 					&ibus_rechecks, &ibus_recoveries);
 			secondary_hold_check_rc =
 				qcom_battmgr_oneplus_require_cp_active_bounded(
 					secondary_psy, &secondary_hold_ibus_ua,
-					BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+					profile.ibus_max_ua,
 					&ibus_rechecks, &ibus_recoveries);
 
 			hold_samples = i + 1;
 			primary_emergency = primary_hold_check_rc == -ERANGE &&
 				primary_hold_ibus_ua >
-					BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA &&
+					profile.ibus_max_ua &&
 				primary_hold_ibus_ua <=
-					BATTMGR_ONEPLUS_CP_DUAL_EMERGENCY_IBUS_ADC_MAX_UA;
+					profile.emergency_ibus_adc_ua;
 			secondary_emergency = secondary_hold_check_rc == -ERANGE &&
 				secondary_hold_ibus_ua >
-					BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA &&
+					profile.ibus_max_ua &&
 				secondary_hold_ibus_ua <=
-					BATTMGR_ONEPLUS_CP_DUAL_EMERGENCY_IBUS_ADC_MAX_UA;
+					profile.emergency_ibus_adc_ua;
 			if (primary_hold_check_rc || secondary_hold_check_rc) {
 				if (!(primary_emergency || !primary_hold_check_rc) ||
 				    !(secondary_emergency || !secondary_hold_check_rc) ||
@@ -4342,6 +4484,15 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 					!hold_full_checks;
 			}
 
+			target_ua = qcom_battmgr_oneplus_pps_target(&profile,
+				monitor_capacity, monitor_temp_decic, boost_pps_ma * 1000,
+				READ_ONCE(battmgr->usb.current_now), &target_ceiling_ua);
+			if (profile.experimental && target_ua < profile.handoff_min_ua) {
+				hold_rc = -EOPNOTSUPP;
+				ret = hold_rc;
+				goto record_hold_sample;
+			}
+			WRITE_ONCE(battmgr->oneplus_dual_effective_target_ua, target_ua);
 			aggregate_hold_ibus_ua = primary_hold_ibus_ua +
 				secondary_hold_ibus_ua;
 			if (hold_primary_output_uv >=
@@ -4349,7 +4500,7 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 			    hold_secondary_output_uv >=
 					BATTMGR_ONEPLUS_CP_DUAL_SECONDARY_TAPER_UV ||
 			    hold_path_drop_uv >=
-					BATTMGR_ONEPLUS_CP_DUAL_PATH_TAPER_UV) {
+					profile.path_soft_uv) {
 				hold_output_taper_active = true;
 				hold_low_ibus_checks = 0;
 				if ((!continuous &&
@@ -4420,11 +4571,11 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				goto record_hold_sample;
 			}
 			if (primary_hold_ibus_ua >=
-				    BATTMGR_ONEPLUS_CP_DUAL_HOLD_SOFT_IBUS_UA ||
+				    profile.soft_ibus_ua ||
 			    secondary_hold_ibus_ua >=
-				    BATTMGR_ONEPLUS_CP_DUAL_HOLD_SOFT_IBUS_UA ||
+				    profile.soft_ibus_ua ||
 			    aggregate_hold_ibus_ua >
-				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA +
+				    target_ua +
 				    BATTMGR_ONEPLUS_CP_DUAL_BOOST_DEADBAND_UA) {
 				hold_low_ibus_checks = 0;
 				if (!continuous &&
@@ -4463,7 +4614,8 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 			if (!hold_output_taper_active &&
 			    !hold_vnow_cv_active &&
 			    aggregate_hold_ibus_ua <
-			    BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_UA) {
+			    (profile.experimental ? target_ua - 200000 :
+			     BATTMGR_ONEPLUS_CP_DUAL_LOW_IBUS_UA)) {
 				hold_low_ibus_checks++;
 				if ((!continuous &&
 				     i + 1 == BATTMGR_ONEPLUS_CP_DUAL_HOLD_SAMPLES) ||
@@ -4559,11 +4711,11 @@ record_hold_sample:
 	} else {
 		primary_post_rc = qcom_battmgr_oneplus_require_cp_active_bounded(
 			primary_psy, &primary_post_ibus_ua,
-			BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+			profile.ibus_max_ua,
 			&ibus_rechecks, &ibus_recoveries);
 		secondary_post_rc = qcom_battmgr_oneplus_require_cp_active_bounded(
 			secondary_psy, &secondary_post_ibus_ua,
-			BATTMGR_ONEPLUS_CP_DUAL_IBUS_MAX_UA,
+			profile.ibus_max_ua,
 			&ibus_rechecks, &ibus_recoveries);
 		if (primary_post_rc || secondary_post_rc) {
 			ret = primary_post_rc ? primary_post_rc : secondary_post_rc;
@@ -4846,6 +4998,7 @@ cleanup_cp:
 	battmgr->oneplus_dual_secondary_loaded_target_uv =
 		secondary_loaded_target_uv;
 	battmgr->oneplus_dual_result = ret;
+	WRITE_ONCE(caihong_pps_high_current_active, false);
 	battmgr->oneplus_dual_running = false;
 	battmgr->oneplus_dual_valid = true;
 	battmgr->oneplus_dual_stop_requested = false;
