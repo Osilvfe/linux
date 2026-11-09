@@ -5602,6 +5602,68 @@ static int qcom_battmgr_oneplus_dual_auto_connected_locked(
 	return 0;
 }
 
+static bool qcom_battmgr_oneplus_dual_auto_pps_ready_locked(
+	struct qcom_battmgr *battmgr)
+{
+	u32 limit_ma;
+	u32 reserve_ua;
+	u32 current_ua;
+	int ret;
+
+	if (!battmgr->service_up)
+		return false;
+
+	ret = qcom_battmgr_oneplus_pps_request(battmgr);
+	if (ret)
+		return false;
+
+	limit_ma = qcom_battmgr_oneplus_pps_current_limit(
+		battmgr, BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MV,
+		BATTMGR_ONEPLUS_CP_DUAL_VENDOR_PPS_MAX_MA);
+	current_ua = READ_ONCE(battmgr->usb.current_now);
+	if (!current_ua || current_ua > 5000000)
+		return false;
+	reserve_ua = max_t(u32, 500000, current_ua);
+
+	return limit_ma * 1000 > reserve_ua &&
+	       limit_ma * 1000 - reserve_ua >=
+		       BATTMGR_ONEPLUS_CP_DUAL_BOOST_HANDOFF_MIN_UA;
+}
+
+static void qcom_battmgr_oneplus_dual_auto_wait_pps_ready(
+	struct qcom_battmgr *battmgr)
+{
+	unsigned int check;
+	unsigned int stable = 0;
+	bool ready;
+
+	for (check = 0; check < BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_CHECKS;
+	     check++) {
+		mutex_lock(&battmgr->oneplus_lock);
+		if (!battmgr->oneplus_dual_auto_enabled ||
+		    !battmgr->oneplus_dual_auto_run ||
+		    battmgr->oneplus_dual_auto_cancel_requested) {
+			mutex_unlock(&battmgr->oneplus_lock);
+			return;
+		}
+		ready = qcom_battmgr_oneplus_dual_auto_pps_ready_locked(battmgr);
+		mutex_unlock(&battmgr->oneplus_lock);
+		if (ready) {
+			if (++stable >=
+			    BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_STABLE_CHECKS)
+				return;
+		} else {
+			stable = 0;
+		}
+		msleep(BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MS);
+	}
+
+	dev_info(battmgr->dev,
+		 "automatic PPS capability not ready after %u ms; trying bounded session\n",
+		 BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_CHECKS *
+			 BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MS);
+}
+
 static int qcom_battmgr_oneplus_dual_auto_wait_connected(
 	struct qcom_battmgr *battmgr)
 {
@@ -5674,6 +5736,11 @@ static void qcom_battmgr_oneplus_dual_auto_run_worker(
 		}
 		battmgr->oneplus_dual_auto_windows_started++;
 		mutex_unlock(&battmgr->oneplus_lock);
+
+		if (continuous && caihong_pps_high_current &&
+		    battmgr->oneplus_pps_read_buffer &&
+		    of_machine_is_compatible("oneplus,caihong"))
+			qcom_battmgr_oneplus_dual_auto_wait_pps_ready(battmgr);
 
 		ret = qcom_battmgr_oneplus_dual_run(battmgr, 1, true);
 
