@@ -1,106 +1,102 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
-Caihong experimental higher-current PPS profile
-==============================================
+Caihong PPS 高电流配置
+========================================
 
-This profile is opt-in and applies only to the OnePlus Pad Pro
-(``oneplus,caihong``), with the existing OnePlus firmware ABI enabled, during
-an automatic continuous dual-pump PPS session.  The default policy remains
-unchanged.  Use this opt-in only with a known suitable PPS source and a
-5 A-rated electronically marked cable, as in the historical device test.
-Linux does not independently verify the cable rating or measure its total
-current through this interface; the firmware owns PD contract negotiation.  It does not enable higher current for fixed-ratio PPS diagnostics,
-independent bounded pump tests, VOOC, other boards, or ordinary fixed PD.
+适用范围与默认设置
+----------------------------------------
 
-Enable the read-only-at-runtime parameter at boot::
+高电流配置默认开启，仅适用于 OnePlus Pad Pro（``oneplus,caihong``）启用现有
+OnePlus 固件 ABI 后的自动连续双电荷泵 PPS 会话。固定比例 PPS 诊断、独立限时泵
+测试、VOOC、其他板型和普通固定 PD 的策略不变。
 
-    qcom_battmgr.caihong_pps_high_current=1
+板级 DTS 已启用 ``oneplus,pps-auto-start``。插线后，在电源提供适用的 PPS 档位、
+充电未被禁止且电压和温度符合保护条件时，驱动自动尝试连续双泵 PPS。
+拔线会取消会话；连续会话退出后不会在同一次连接上无限重启，重新插线后才重新触发。
 
-For a modular battmgr driver, the corresponding module option is
-``caihong_pps_high_current=1``.  Remove the option and reboot to use the
-original profile.  The parameter is mode 0444 and cannot change an active
-session.  There is no additional writable charging sysfs interface.
+PPS 电源电流协商上限为 5 A，实际请求不能超过电源在对应电压下公布的 APDO 能力。
+这不是强制取流 5 A，也不是将双泵目标设为 5 A；双泵合计输入目标最高为 4.5 A，
+并且还须从协商电流中扣除 buck 支路预留。必须使用已确认适用的 PPS 电源和额定
+5 A 的电子标记线缆。Linux 不通过此接口独立验证线缆额定能力，也不直接测量线缆
+总电流；PD 合同协商由固件负责。
 
-The battmgr coordinator publishes a stable, pointer-free active-session gate.
-Each vendor-current continuous SC8547 run snapshots that gate; it is cleared
-only after the existing simultaneous pump cancellation and worker completion.
-The exported function returns false when the Caihong driver is not reachable.
+无需额外启动参数即可开启。若需恢复原有 2 A 双泵目标配置，在启动参数中指定::
 
-Profile and limits
-------------------
+    qcom_battmgr.caihong_pps_high_current=0
 
-Under 20 to less than 38 degrees C, the aggregate charge-pump input target is
-at most 4.5 A for raw SOC below 75 percent, 3 A from 75 to 84 percent, and 2 A
-from 85 percent.  Below 20 degrees C or at and above 40 degrees C, it is at most
-2 A; from 38 to below 40 degrees C, it is at most 3 A.  The existing system
-voltage and temperature admissibility checks still run.  The target ceiling
-can only decrease within one continuous session.
+对于模块形式的 battmgr，使用模块选项 ``caihong_pps_high_current=0``。
+显式设置为 1 或移除上述关闭选项后重启，可恢复默认高电流配置。
+参数权限保持为 0444，运行中只读，不能修改活动会话；没有新增可写的充电 sysfs 接口。
 
-The source must advertise the requested PPS voltage and current.  The pump
-budget subtracts the latest measured ordinary buck input current, with a
-500 mA minimum reserve, from the selected APDO current.  Unknown, zero or
-implausible buck telemetry rejects this experimental operation.  Less than
-1.8 A of remaining pump budget also rejects it.  A fresh system/buck sample
-is required after pump startup and before the first target selection, and
-again on each experimental boost iteration.  During hold, system samples
-retain the existing two-second cadence; the current target uses the latest
-such sample.  These asynchronous measurements and the minimum reserve are
-not a calibrated measurement or guarantee of total cable current.
+battmgr 协调器公布不含私有内存指针的活动会话标志；每次 SC8547 厂商电流控制连续
+运行会保存其快照。只有取消两个泵并等待工作线程完成后才清除该标志。
+当 Caihong 驱动不可达时，导出的查询函数返回 false。
 
-The profile widens the following software limits, solely in this active
-experimental path:
+控制目标与保护
+----------------------------------------
 
-========================== ============== ==============
-Limit                      Default        Experimental
-========================== ============== ==============
-Aggregate boost target     2 A            up to 4.5 A
-Per-pump normal IBUS        1.45 A         2.65 A
-Per-pump soft IBUS          1.35 A         2.45 A
-Per-pump emergency IBUS     1.65 A         2.85 A
-Path-delta soft taper       150 mV         175 mV
-Loaded source request max  9.4 V          10 V
-Boost steps, 40 mV each     10             15
-Balanced handoff minimum   1.9 A          1.8 A
-========================== ============== ==============
+温度在 20°C 至不足 38°C 时，原始 SOC 低于 75% 的双泵合计输入目标最高为 4.5 A，
+75% 至不足 85% 时最高为 3 A，85% 及以上最高为 2 A。低于 20°C 或达到 40°C 时
+最高为 2 A；38°C 至不足 40°C 时最高为 3 A。原有系统电压、温度准入检查仍然有效，
+且同一连续会话中的目标上限只能降低。
 
-The 10 V value is the negotiated source request, not measured pump VBUS.  The
-SC8547 measured VBUS ceiling stays 9.4 V, and the existing entry/pre-start
-window and loaded-target margin remain unchanged.  The 200 mV path hard stop,
-cell/output voltage limits, gauge-voltage CV feedback, temperature and full
-checks, source-capability checks, hardware register profiles, charging
-inhibition and cancellation are retained.  An additional experimental-only
-10 A charging battery-current stop is applied.  The mode therefore must not
-be described as preserving every software protection threshold unchanged.
+双泵预算从选定的 APDO 电流中扣除最近采样的 buck 输入电流，并至少预留 500 mA。
+buck 数据未知、为零或超过 5 A 时拒绝高电流运行；剩余双泵预算不足 1.8 A 时也拒绝。
+启动泵后、首次选择目标前，以及每次高电流升压迭代时都重新采样。
+保持阶段延续每两秒采样一次的节奏，使用最近一次数据更新目标。
+这些异步采样和最小预留不构成经过校准的线缆总电流测量或保证。
 
-A five-second startup grace followed by four consecutive samples below
-100 mA exits an experimental continuous pump run through its existing
-normal disable/readback/restore path.  This handles residual pump-side
-voltage and delayed firmware USB-online reporting after cable removal.
-It does not change the default run's termination rules.
+高电流配置保留以下限制，可通过上述启动参数切回低电流配置：
 
-``oneplus_pps_dual_500ms`` status reports ``experimental_profile`` and the
-last ``effective_target_ua``.  Existing limit fields above that line describe
-the default profile; they are labelled accordingly.  The effective target
-is an upper bound and is not the source's measured current.
+.. list-table:: 软件限制
+   :header-rows: 1
 
-Validation and dependencies
----------------------------
+   * - 项目
+     - 低电流回退配置
+     - 默认高电流配置
+   * - 双泵合计升压目标
+     - 2 A
+     - 最高 4.5 A
+   * - 单泵正常 IBUS
+     - 1.45 A
+     - 2.65 A
+   * - 单泵软限制 IBUS
+     - 1.35 A
+     - 2.45 A
+   * - 单泵紧急 IBUS
+     - 1.65 A
+     - 2.85 A
+   * - 路径压差软降流
+     - 150 mV
+     - 175 mV
+   * - 带载电源请求电压上限
+     - 9.4 V
+     - 10 V
+   * - 40 mV 升压步数上限
+     - 10
+     - 15
+   * - 双泵平衡交接最低合计电流
+     - 1.9 A
+     - 1.8 A
 
-The implementation transfers the higher-current control shape tested on a
-Caihong with a 5 A-capable source and cable in the local October 2026 series.
-One historical high-target trace covered about 304 seconds and reported an
-aggregate pump median near 4.00 A, maximum 4.15 A, and peak battery net power
-about 37 W.  These are device telemetry, not an external power-meter result,
-and do not prove actual adapter output of 5 A or 9 V times 5 A.
+10 V 是协商的电源请求电压，不是泵端实测 VBUS；SC8547 实测 VBUS 上限仍为 9.4 V。
+原有进入、预启动窗口和带载目标余量不变。200 mV 路径压差硬停止、电芯及输出电压
+限制、电量计电压 CV 反馈、温度和充满检查、电源能力检查、硬件寄存器配置、充电禁止
+以及取消流程均保留。高电流路径还在电池充电电流超过 10 A 时停止。
+与低电流配置相比，部分软件阈值确实不同，不能描述为所有保护阈值完全相同。
 
-The original low-current policy's loaded-target margin, independent source
-capability checks, voltage feedback and teardown remain prerequisites here.
-The separate PPS/VOOC mutex-order fix must be applied first; see
-``https://github.com/Osilvfe/linux/pull/3``.  This change does not duplicate
-that lock fix or alter upstream VOOC recovery and charging-inhibition logic.
+高电流连续运行在五秒启动宽限后，若连续四个样本的泵输入电流低于 100 mA，就走
+既有关闭、读回和恢复路径退出，以处理拔线后的残余电压和固件 USB 在线状态延迟。
+低电流回退配置的终止规则未改变。
 
-This is an experimental port to a newer upstream base.  Historical device
-validation is retained as evidence; source/host checks on the rebased code
-are recorded separately and are not claimed as a new device test.  Longer
-thermal, full-charge and additional source/cable coverage remain useful
-before making the profile the default.
+``oneplus_pps_dual_500ms`` 保留 ``experimental_profile`` 和
+``effective_target_ua`` 字段，分别报告是否使用高电流配置和最近的有效目标。
+此前一行以上的限制字段仍描述原低电流配置；``limits_above=default-profile``
+是沿用的标记，不代表当前默认高电流阈值。有效目标是上限，不是电源实测电流。
+
+依赖与限制
+----------------------------------------
+
+原低电流策略的带载目标余量、独立电源能力检查、电压反馈及退出清理仍是必要前提。
+必须先合入 PPS/VOOC 锁顺序修正，见 ``https://github.com/Osilvfe/linux/pull/3``。
+本配置不重复该修正，也不修改 VOOC 恢复或充电禁止逻辑。
