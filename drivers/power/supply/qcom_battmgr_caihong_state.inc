@@ -132,6 +132,8 @@
 	u32 oneplus_dual_primary_boost_post_ibus_ua;
 	u32 oneplus_dual_secondary_boost_post_ibus_ua;
 	u32 oneplus_dual_boost_pps_ma;
+	u32 oneplus_dual_buck_reserve_ua;
+	u32 oneplus_dual_buck_reserve_uv;
 	u32 oneplus_dual_boost_step_limit;
 	u32 oneplus_dual_boost_attempts;
 	u32 oneplus_dual_boost_request_mv[BATTMGR_ONEPLUS_CP_DUAL_BOOST_STORAGE_STEPS];
@@ -189,6 +191,7 @@
 	bool oneplus_dual_auto_enabled;
 	bool oneplus_dual_auto_armed;
 	bool oneplus_dual_auto_connected;
+	bool oneplus_dual_auto_detach_seen;
 	bool oneplus_dual_auto_run;
 	bool oneplus_dual_auto_cancel_requested;
 	bool oneplus_dual_auto_continuous;

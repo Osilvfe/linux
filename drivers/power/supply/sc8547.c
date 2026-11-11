@@ -459,6 +459,8 @@ struct sc8547_device {
 	u8 device_id;
 	int vooc_last_vbus_uv;
 	int vooc_last_ibus_ua;
+	u8 vooc_last_rx_count;
+	bool vooc_session_rx_seen;
 	bool vooc_last_cp_started;
 	/* Per-session protocol context.  These fields are reset for every session. */
 	u8 vooc_tx_head;
@@ -1309,6 +1311,16 @@ static int sc8547_psy_get_property(struct power_supply *psy,
  * these standard power-supply properties.  Keep this interface deliberately
  * small: target voltage, prepare, run, cancel and restore.
  */
+/* Record who cancelled a running PPS session.  A single -ECANCELED return
+ * cannot tell the VOOC watcher, the charge-control latch and a real unplug
+ * apart, which made field reports of a short fast-charge session ambiguous.
+ */
+static void sc8547_cancel_policy(struct sc8547_device *sc, const char *reason)
+{
+	dev_info(sc->dev, "PPS session cancelled by %s\n", reason);
+	atomic_set(&sc->policy_cancel, 1);
+}
+
 static int sc8547_psy_set_property(struct power_supply *psy,
 				   enum power_supply_property psp,
 				   const union power_supply_propval *val)
@@ -1332,7 +1344,7 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 			WRITE_ONCE(sc->vooc_charge_inhibited, true);
 			WRITE_ONCE(sc->vooc_auto_retry, false);
 		}
-		atomic_set(&sc->policy_cancel, 1);
+		sc8547_cancel_policy(sc, "userspace request");
 		return 0;
 	}
 
@@ -3674,6 +3686,7 @@ out_cleanup:
 			 "VOOC -EOVERFLOW source unresolved: rx_count=%u session_vbus=%d cleanup_vbus=%d\n",
 			 rx_count, sc->vooc_last_vbus_uv,
 			 cleanup_vbus_uv);
+	sc->vooc_last_rx_count = rx_count;
 	dev_info(sc->dev,
 		 "VOOC session rc=%d frames=%u vbus_uv=%d ibus_ua=%d\n",
 		 ret, rx_count, sc->vooc_last_vbus_uv,
@@ -3853,10 +3866,23 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	}
 
 	mutex_lock(&sc->lock);
-	if (!sc->vooc_capable ||
-	    !sc->vooc_auto_retry || atomic_read(&sc->pps_running)) {
+	if (!sc->vooc_capable || !sc->vooc_auto_retry) {
 		mutex_unlock(&sc->lock);
 		atomic_set(&sc->vooc_retry_running, 0);
+		return;
+	}
+	if (atomic_read(&sc->pps_running) || sc->pps_prepared) {
+		/*
+		 * A prepared or running PPS session owns the input path and must
+		 * not be suspended for a DPDM probe.  Keep the request pending
+		 * instead of dropping it: the previous early return cleared the
+		 * running flag and never queued the work again, so a busy PPS
+		 * session could leave the VOOC retry armed but unscheduled.
+		 */
+		mutex_unlock(&sc->lock);
+		atomic_set(&sc->vooc_retry_running, 0);
+		sc8547_queue_vooc_retry(sc,
+			msecs_to_jiffies(SC8547_VOOC_AUTO_RETRY_DELAY_MS));
 		return;
 	}
 	/* Do not wake the adapter or touch DP/DM when the gauge already reports
@@ -3898,8 +3924,11 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 		ret = -ECANCELED;
 	if (!ret) {
 		session_started = true;
+		sc->vooc_last_rx_count = 0;
 		ret = sc8547_vooc_session(sc);
 	}
+	if (session_started && sc->vooc_last_rx_count)
+		sc->vooc_session_rx_seen = true;
 	if ((dpdm_normalized || dpdm_preselected) && !session_started)
 		wcd939x_usbss_set_vooc_dpdm(false);
 	retry_max = ret == -EAGAIN ? SC8547_VOOC_PRE_MODEL_RETRY_MAX :
@@ -3944,6 +3973,7 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 			msecs_to_jiffies(retry_delay_ms));
 	} else if (sc->vooc_recovery_retry_count <
 		   SC8547_VOOC_RECOVERY_RETRY_MAX &&
+		   sc->vooc_session_rx_seen &&
 		   sc->vooc_last_vbus_uv >= SC8547_VOOC_CABLE_PRESENT_UV &&
 		   sc->vooc_last_vbus_uv <= SC8547_VOOC_MAX_VBUS_UV) {
 		sc->vooc_recovery_retry_count++;
@@ -3953,6 +3983,17 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 			 ret, sc->vooc_recovery_retry_count,
 			 SC8547_VOOC_RECOVERY_RETRY_MAX, retry_delay_ms);
 		sc8547_queue_vooc_retry(sc, msecs_to_jiffies(retry_delay_ms));
+	} else if (ret == -ETIMEDOUT && !sc->vooc_session_rx_seen) {
+		/* A PD-only source leaves the VOOC wire silent.  The initial
+		 * bounded retries already covered a slow adapter wake-up; the
+		 * thirty-second recovery loop only keeps the shared charge
+		 * controller busy and cancels automatic PPS on every tick.
+		 */
+		dev_info(sc->dev,
+			 "VOOC source silent on all attempts; stopping recovery\n");
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		sc->vooc_auto_retry_count = 0;
+		sc->vooc_recovery_retry_count = 0;
 	} else {
 		dev_warn(sc->dev,
 			 "VOOC automatic session stopped after rc=%d\n", ret);
@@ -3977,7 +4018,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	if (sc8547_charge_is_inhibited()) {
 		WRITE_ONCE(sc->vooc_charge_inhibited, true);
 		WRITE_ONCE(sc->vooc_auto_retry, false);
-		atomic_set(&sc->policy_cancel, 1);
+		sc8547_cancel_policy(sc, "charge control");
 		cancel_delayed_work(&sc->vooc_retry_work);
 		return;
 	}
@@ -3999,6 +4040,18 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	 * suspended for VOOC.  A live SC8547 VBUS distinguishes that transition
 	 * from a physical cable removal. */
 	if (online <= 0 && vbus_uv < SC8547_VOOC_CABLE_PRESENT_UV) {
+		/*
+		 * A PPS session owns the input path.  Firmware and VBUS both drop
+		 * while the source is being retargeted, and cancelling the session
+		 * here would tear down a healthy fast charge.  Leave the PPS run to
+		 * its own input-loss monitor; it has a startup grace and needs four
+		 * consecutive samples before it declares the source gone.
+		 */
+		if (atomic_read(&sc->pps_running)) {
+			mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+			return;
+		}
 		/* The normal VOOC cleanup also removes VBUS briefly before the USB
 		 * input vote is restored.  Defer the edge while protocol work owns
 		 * that transition; a real unplug remains low after cleanup and is
@@ -4026,7 +4079,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		sc->vooc_recovery_retry_count = 0;
 		sc8547_vooc_reset_curve(sc);
 		WRITE_ONCE(sc->vooc_auto_retry, false);
-		atomic_set(&sc->policy_cancel, 1);
+		sc8547_cancel_policy(sc, "VOOC cable removal");
 		cancel_delayed_work(&sc->vooc_retry_work);
 		if (was_online)
 			dev_info(sc->dev,
@@ -4072,6 +4125,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	WRITE_ONCE(sc->vooc_auto_retry, true);
 	sc->vooc_auto_retry_count = 0;
 	sc->vooc_recovery_retry_count = 0;
+	sc->vooc_session_rx_seen = false;
 	retry_delay = initial_check ?
 		msecs_to_jiffies(SC8547_VOOC_BOOT_SETTLE_MS) :
 		msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS);
@@ -5176,7 +5230,7 @@ static int sc8547_suspend(struct device *dev)
 	sc->vooc_resume_retry = sc->vooc_initialized ||
 		READ_ONCE(sc->vooc_auto_retry);
 	WRITE_ONCE(sc->vooc_auto_retry, false);
-	atomic_set(&sc->policy_cancel, 1);
+	sc8547_cancel_policy(sc, "system suspend");
 	cancel_delayed_work_sync(&sc->vooc_cable_work);
 	cancel_delayed_work_sync(&sc->vooc_retry_work);
 	if (sc->vooc_resume_retry)

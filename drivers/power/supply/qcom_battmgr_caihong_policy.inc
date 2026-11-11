@@ -61,10 +61,25 @@ qcom_battmgr_oneplus_pps_profile(bool experimental)
 /* The source contract covers both charge pumps and the parallel buck path.
  * Reserve the last fresh buck current, with a 500-mA floor. This is bounded
  * telemetry-based headroom, not a calibrated measurement of cable current.
+ *
+ * The USB current telemetry is sampled at the live port voltage, while the
+ * pumps draw from the boosted PPS rail.  Convert the buck reserve to the
+ * boost voltage before subtracting it; using the 5-V figure directly while
+ * the rail is still at 5 V under-counts the source budget and rejects a
+ * capable 3-A charger.
  */
+static u32 qcom_battmgr_oneplus_scale_current(u32 ua, u32 from_uv, u32 to_uv)
+{
+	if (!from_uv || !to_uv)
+		return ua;
+
+	return DIV_ROUND_UP_ULL((u64)ua * from_uv, to_uv);
+}
+
 static u32 qcom_battmgr_oneplus_pps_target(
 	const struct qcom_battmgr_oneplus_pps_profile *profile,
-	u32 capacity, int temp_decic, u32 source_ua, u32 buck_ua, u32 *ceiling_ua)
+	u32 capacity, int temp_decic, u32 source_ua, u32 buck_ua,
+	u32 buck_uv, u32 source_mv, u32 *ceiling_ua)
 {
 	u32 target = profile->target_ua;
 	u32 reserve_ua;
@@ -78,6 +93,8 @@ static u32 qcom_battmgr_oneplus_pps_target(
 	if (temp_decic < 200 || temp_decic >= 400 || capacity >= 85)
 		target = min_t(u32, target, 2000000);
 	reserve_ua = max_t(u32, 500000, buck_ua);
+	reserve_ua = qcom_battmgr_oneplus_scale_current(reserve_ua, buck_uv,
+							source_mv * 1000);
 	if (source_ua <= reserve_ua)
 		return 0;
 	target = min(target, source_ua - reserve_ua);
@@ -3375,6 +3392,10 @@ static int qcom_battmgr_oneplus_dual_system_check(
 	struct qcom_battmgr *battmgr, u32 *usb_online, u32 *vbat_uv,
 	u32 *vbat_ocv_uv, int *ibat_ua, u32 *capacity, int *temp_decic)
 {
+	struct power_supply *cp_psy;
+	union power_supply_propval val;
+	bool cp_present = false;
+	int cp_ret;
 	int ret;
 
 	mutex_lock(&battmgr->oneplus_lock);
@@ -3389,11 +3410,42 @@ static int qcom_battmgr_oneplus_dual_system_check(
 		goto out_unlock;
 	*usb_online = battmgr->usb.online;
 	if (!*usb_online) {
-		ret = -ENODEV;
-		goto out_unlock;
+		/*
+		 * The vendor VOOC recovery path suspends the USB input for about
+		 * 1.5 s and gives a physical unplug several seconds to settle.
+		 * During that hand-off the firmware reports USB offline even
+		 * though the source is still attached, which used to abort an
+		 * otherwise healthy automatic PPS session.  Confirm the physical
+		 * input through the charge pump the same way the attach watcher
+		 * does, and keep genuine removal as a hard failure.
+		 */
+		cp_psy = power_supply_get_by_name(
+			BATTMGR_ONEPLUS_PRIMARY_CP_NAME);
+		if (cp_psy) {
+			cp_ret = power_supply_get_property(cp_psy,
+				POWER_SUPPLY_PROP_PRESENT, &val);
+			if (!cp_ret && val.intval) {
+				cp_ret = power_supply_get_property(cp_psy,
+					POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+				if (!cp_ret && val.intval >=
+					    BATTMGR_ONEPLUS_DUAL_AUTO_VBUS_MIN_UV)
+					cp_present = true;
+			}
+			power_supply_put(cp_psy);
+		}
+		if (!cp_present) {
+			ret = -ENODEV;
+			goto out_unlock;
+		}
 	}
 
 	if (READ_ONCE(caihong_pps_high_current_active)) {
+		/* The buck reserve must be converted at the live port voltage:
+		 * once PPS ramps, the same telemetry is reported at 9 V. */
+		ret = qcom_battmgr_oneplus_request_property(battmgr,
+			BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, 0);
+		if (ret)
+			goto out_unlock;
 		ret = qcom_battmgr_oneplus_request_property(battmgr,
 			BATTMGR_USB_PROPERTY_GET, USB_CURR_NOW, 0);
 		if (ret)
@@ -3547,6 +3599,36 @@ static bool qcom_battmgr_oneplus_dual_request_stop(
 	return true;
 }
 
+/*
+ * A pack that is already at the charge end threshold and not actively
+ * charging must not start a 2:1 session: the pumps reject the start and the
+ * automatic watcher would otherwise retry for as long as the cable stays in.
+ * The cached capacity in battmgr->status may be stale (even 0 at boot), so
+ * request both properties before deciding.
+ */
+static bool qcom_battmgr_oneplus_dual_auto_pack_satisfied(
+	struct qcom_battmgr *battmgr)
+{
+	int ret;
+
+	ret = qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, 0);
+	if (ret)
+		return false;
+	if (battmgr->status.percent >= 100)
+		return true;
+	if (battmgr->status.percent <
+	    BATTMGR_ONEPLUS_CP_DUAL_FULL_CAPACITY_MIN)
+		return false;
+
+	ret = qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_BAT_PROPERTY_GET, BATT_STATUS, 0);
+	if (ret)
+		return false;
+
+	return battmgr->status.status != POWER_SUPPLY_STATUS_CHARGING;
+}
+
 static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 					      size_t count, bool automatic)
 {
@@ -3671,6 +3753,8 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		qcom_battmgr_oneplus_pps_profile(false);
 	u32 target_ua = BATTMGR_ONEPLUS_CP_DUAL_BOOST_TARGET_UA;
 	u32 target_ceiling_ua = 4500000;
+	u32 buck_reserve_ua = 0;
+	u32 buck_reserve_uv = 0;
 
 	unsigned int i;
 	int cleanup_ret;
@@ -3859,6 +3943,23 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	if (monitor_vbat_uv > BATTMGR_ONEPLUS_POLICY_VBAT_MAX_UV) {
 		ret = -ERANGE;
 		goto cleanup_cp;
+	}
+
+	/*
+	 * Latch the buck-only port load for the whole session.  Both pumps are
+	 * proven off above and the source is still on fixed 5 V, so this is the
+	 * only point where USB_CURR_NOW reports the parallel buck alone.
+	 * Sampling it later would charge the two pumps against the APDO budget a
+	 * second time: during a hold the port reads 1.7-1.8 A with the same
+	 * current already present as aggregate pump IBUS, which is what drove the
+	 * recomputed target below the 1.8-A floor on a healthy 3-A source.
+	 */
+	buck_reserve_ua = READ_ONCE(battmgr->usb.current_now);
+	buck_reserve_uv = READ_ONCE(battmgr->usb.voltage_now);
+	if (!buck_reserve_ua || buck_reserve_ua > 5000000 ||
+	    !buck_reserve_uv) {
+		buck_reserve_ua = BATTMGR_ONEPLUS_CP_DUAL_RESERVE_FLOOR_UA;
+		buck_reserve_uv = BATTMGR_ONEPLUS_CP_DUAL_RESERVE_FALLBACK_UV;
 	}
 
 	/* Prepare both pumps at low voltage, then perform one shared PPS ramp. */
@@ -4104,8 +4205,14 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 		battmgr, source_to_mv,
 		BATTMGR_ONEPLUS_CP_DUAL_VENDOR_PPS_MAX_MA);
 	battmgr->oneplus_dual_boost_pps_ma = boost_pps_ma;
+	battmgr->oneplus_dual_buck_reserve_ua = buck_reserve_ua;
+	battmgr->oneplus_dual_buck_reserve_uv = buck_reserve_uv;
 	mutex_unlock(&battmgr->oneplus_lock);
 	if (boost_pps_ma < BATTMGR_ONEPLUS_CP_DUAL_PPS_MA) {
+		dev_info(battmgr->dev,
+			 "automatic PPS refused: PPS limit %u mA below %u mA at %u mV\n",
+			 boost_pps_ma, BATTMGR_ONEPLUS_CP_DUAL_PPS_MA,
+			 source_to_mv);
 		ret = -EOPNOTSUPP;
 		goto cancel_dual;
 	}
@@ -4121,8 +4228,14 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	}
 	target_ua = qcom_battmgr_oneplus_pps_target(&profile, monitor_capacity,
 		monitor_temp_decic, boost_pps_ma * 1000,
-		READ_ONCE(battmgr->usb.current_now), &target_ceiling_ua);
+		buck_reserve_ua, buck_reserve_uv, source_to_mv,
+		&target_ceiling_ua);
 	if (profile.experimental && target_ua < profile.handoff_min_ua) {
+		dev_info(battmgr->dev,
+			 "automatic PPS refused: target %u uA below handoff %u uA (pps=%u mA buck=%u uA at %u uV source=%u mV cap=%u temp=%d)\n",
+			 target_ua, profile.handoff_min_ua, boost_pps_ma,
+			 buck_reserve_ua, buck_reserve_uv, source_to_mv,
+			 monitor_capacity, monitor_temp_decic);
 		ret = -EOPNOTSUPP;
 		goto cancel_dual;
 	}
@@ -4196,8 +4309,10 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				break;
 			}
 			target_ua = qcom_battmgr_oneplus_pps_target(&profile,
-				monitor_capacity, monitor_temp_decic, boost_pps_ma * 1000,
-				READ_ONCE(battmgr->usb.current_now), &target_ceiling_ua);
+				monitor_capacity, monitor_temp_decic,
+				boost_pps_ma * 1000, buck_reserve_ua,
+				buck_reserve_uv, source_boost_mv,
+				&target_ceiling_ua);
 			if (target_ua < profile.handoff_min_ua) {
 				ret = -EOPNOTSUPP;
 				break;
@@ -4321,6 +4436,23 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 				secondary_hold_ibus_ua <=
 					profile.emergency_ibus_adc_ua;
 			if (primary_hold_check_rc || secondary_hold_check_rc) {
+				/*
+				 * Near full, the adapter terminates and removes VBUS;
+				 * both pumps then read offline.  That is a normal end of
+				 * the fast-charge window, not an electrical fault, so
+				 * finish cleanly and let the watcher stay idle until a
+				 * real detach.  Mid-charge the same -EIO keeps failing
+				 * closed as before.
+				 */
+				if ((primary_hold_check_rc == -EIO ||
+				     secondary_hold_check_rc == -EIO) &&
+				    qcom_battmgr_oneplus_dual_auto_pack_satisfied(
+					    battmgr)) {
+					hold_full_confirmed = true;
+					hold_rc = 0;
+					ret = 0;
+					goto record_hold_sample;
+				}
 				if (!(primary_emergency || !primary_hold_check_rc) ||
 				    !(secondary_emergency || !secondary_hold_check_rc) ||
 				    !(primary_emergency || secondary_emergency) ||
@@ -4485,12 +4617,33 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 			}
 
 			target_ua = qcom_battmgr_oneplus_pps_target(&profile,
-				monitor_capacity, monitor_temp_decic, boost_pps_ma * 1000,
-				READ_ONCE(battmgr->usb.current_now), &target_ceiling_ua);
+				monitor_capacity, monitor_temp_decic,
+				boost_pps_ma * 1000, buck_reserve_ua,
+				buck_reserve_uv, hold_sample_request_mv,
+				&target_ceiling_ua);
 			if (profile.experimental && target_ua < profile.handoff_min_ua) {
-				hold_rc = -EOPNOTSUPP;
-				ret = hold_rc;
-				goto record_hold_sample;
+				/*
+				 * The budget subtracts the parallel buck current from the
+				 * APDO limit.  That sample is taken while the pumps are
+				 * already drawing their startup surge, so it reports a
+				 * transient several times the steady reserve - measured
+				 * 1.8 A at the port while the buck settled at 0.6-1.0 A -
+				 * and the recomputed target falls below the hand-off floor
+				 * even on a healthy session.  Terminating here turned a
+				 * working 3 A fast charge into a three-second session.
+				 *
+				 * Keep running at the floor instead: the APDO contract still
+				 * bounds the source, both pumps enforce their own IBUS stop,
+				 * and the VBUS window and four-sample input-loss monitor
+				 * remain armed for a genuinely overloaded adapter.
+				 */
+				dev_info_ratelimited(battmgr->dev,
+						     "hold budget below handoff: target=%u uA floor=%u uA pps=%u mA buck=%u uA at %u uV req=%u mV\n",
+						     target_ua, profile.handoff_min_ua,
+						     boost_pps_ma, buck_reserve_ua,
+						     buck_reserve_uv,
+						     hold_sample_request_mv);
+				target_ua = profile.handoff_min_ua;
 			}
 			WRITE_ONCE(battmgr->oneplus_dual_effective_target_ua, target_ua);
 			aggregate_hold_ibus_ua = primary_hold_ibus_ua +
@@ -4998,6 +5151,17 @@ cleanup_cp:
 	battmgr->oneplus_dual_secondary_loaded_target_uv =
 		secondary_loaded_target_uv;
 	battmgr->oneplus_dual_result = ret;
+	dev_info(battmgr->dev,
+		 "automatic PPS dual diagnostics: rc=%d ramp=%d entry=%d entry_ibs=%u pre=%d boost=%d post=%d/%d hold=%d source=%d/%d cleanup=%d/%d restore=%d off=%d/%d steps=%u boost_ma=%u pps_ma=%u source_mv=%u/%u req=%u\n",
+		 ret, ramp_rc, primary_entry_rc, primary_entry_ibus_ua,
+		 primary_pre_rc, source_boost_rc,
+		 primary_boost_post_rc, secondary_boost_post_rc, hold_rc,
+		 primary_run_rc, secondary_run_rc, primary_cleanup_rc,
+		 secondary_cleanup_rc, source_restore_rc,
+		 final_primary_off_rc, final_secondary_off_rc,
+		 boost_attempts, boost_pps_ma,
+		 BATTMGR_ONEPLUS_CP_DUAL_PPS_MA, source_from_mv, source_to_mv,
+		 hold_sample_request_mv);
 	WRITE_ONCE(caihong_pps_high_current_active, false);
 	battmgr->oneplus_dual_running = false;
 	battmgr->oneplus_dual_valid = true;
@@ -5742,7 +5906,29 @@ static void qcom_battmgr_oneplus_dual_auto_run_worker(
 		    of_machine_is_compatible("oneplus,caihong"))
 			qcom_battmgr_oneplus_dual_auto_wait_pps_ready(battmgr);
 
+		/*
+		 * The watcher may queue a start before the gauge has answered at
+		 * boot, in which case the capacity check there saw nothing and
+		 * let a full pack raise PPS to ~9.3 V before the pumps refused
+		 * it.  Re-check with live properties immediately before the run.
+		 */
+		if (qcom_battmgr_oneplus_dual_auto_pack_satisfied(battmgr)) {
+			mutex_lock(&battmgr->oneplus_lock);
+			battmgr->oneplus_dual_auto_full_stop = true;
+			battmgr->oneplus_dual_auto_last_rc = 0;
+			mutex_unlock(&battmgr->oneplus_lock);
+			ret = 0;
+			dev_info(battmgr->dev,
+				 "automatic PPS dual skipped: pack at charge end\n");
+			break;
+		}
+
+		dev_info(battmgr->dev,
+			 "automatic PPS dual session start (continuous=%u)\n",
+			 continuous);
 		ret = qcom_battmgr_oneplus_dual_run(battmgr, 1, true);
+		dev_info(battmgr->dev,
+			 "automatic PPS dual session end rc=%zd\n", ret);
 
 		mutex_lock(&battmgr->oneplus_lock);
 		if (ret >= 0)
@@ -5794,6 +5980,7 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 	bool stop = false;
 	bool reschedule = false;
 	bool service_recovered = false;
+	bool deferred = false;
 	bool queued;
 	int ret;
 
@@ -5844,6 +6031,14 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 		battmgr->oneplus_dual_auto_last_rc = 0;
 
 	if (!connected) {
+		/*
+		 * Remember even a short loss of the physical input.  The debounce
+		 * below still gates tearing down a running session, but a cable
+		 * that is out for less than the debounce window must not be
+		 * forgotten: otherwise replugging the same adapter leaves the
+		 * watcher armed=false and no PPS session ever starts again.
+		 */
+		battmgr->oneplus_dual_auto_detach_seen = true;
 		if (battmgr->oneplus_dual_auto_offline_checks <
 		    BATTMGR_ONEPLUS_DUAL_AUTO_OFFLINE_CHECKS)
 			battmgr->oneplus_dual_auto_offline_checks++;
@@ -5852,10 +6047,18 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 			goto out_unlock;
 
 		battmgr->oneplus_dual_auto_connected = false;
+		/*
+		 * Arm the idle case here.  A running session is armed later by the
+		 * attach edge once its teardown has cleared auto_run; arming it
+		 * now would make the watcher retry "controller busy" every second
+		 * while the old session is still unwinding.
+		 */
 		if (!battmgr->oneplus_dual_auto_run)
 			battmgr->oneplus_dual_auto_armed = true;
 		else {
 			battmgr->oneplus_dual_auto_cancel_requested = true;
+			dev_info(battmgr->dev,
+				 "automatic PPS dual run cancelled: input offline\n");
 			if (battmgr->oneplus_dual_running &&
 			    !battmgr->oneplus_dual_stop_requested) {
 				battmgr->oneplus_dual_stop_requested = true;
@@ -5866,18 +6069,57 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 		goto out_unlock;
 	}
 	battmgr->oneplus_dual_auto_offline_checks = 0;
+	if (battmgr->oneplus_dual_auto_detach_seen) {
+		/*
+		 * Only reinterpret the edge as a fresh attach when nothing owns
+		 * the controller; otherwise keep the flag set so the arming still
+		 * happens on the first idle tick after the old session unwinds.
+		 * At boot the source has not enumerated yet, so the early
+		 * "offline" samples must not arm a second start while a
+		 * continuous session is already running: that produced a
+		 * permanent "controller busy" retry loop.
+		 */
+		if (!battmgr->oneplus_dual_auto_run &&
+		    !battmgr->oneplus_dual_running &&
+		    !battmgr->oneplus_secondary_running &&
+		    !battmgr->oneplus_policy_running &&
+		    !battmgr->oneplus_pps_5m_running) {
+			battmgr->oneplus_dual_auto_detach_seen = false;
+			battmgr->oneplus_dual_auto_connected = false;
+			battmgr->oneplus_dual_auto_armed = true;
+		}
+	}
 
 	if (!battmgr->oneplus_dual_auto_connected &&
 	    battmgr->oneplus_dual_auto_armed) {
 		battmgr->oneplus_dual_auto_armed = false;
-		battmgr->oneplus_dual_auto_attempts++;
 		if (battmgr->oneplus_dual_auto_run ||
 		    battmgr->oneplus_dual_running ||
 		    battmgr->oneplus_secondary_running ||
 		    battmgr->oneplus_policy_running ||
 		    battmgr->oneplus_pps_5m_running) {
 			battmgr->oneplus_dual_auto_last_rc = -EBUSY;
+			/* A VOOC probe or another one-shot policy can own the
+			 * controller at plug-in.  Keep the request armed so the
+			 * next watcher tick can start PPS once it is free. */
+			battmgr->oneplus_dual_auto_armed = true;
+			deferred = true;
+			if (battmgr->oneplus_dual_auto_last_rc != -EBUSY)
+				dev_info(battmgr->dev,
+					 "automatic PPS dual start deferred: controller busy\n");
+		} else if (qcom_battmgr_oneplus_dual_auto_pack_satisfied(battmgr)) {
+			/*
+			 * At a full or charge-terminated pack the pumps refuse the
+			 * start and the watcher used to re-arm every tick, hammering
+			 * the controller with rc=-ERANGE sessions.  Stay idle; the
+			 * charge-control worker arms a fresh attempt when charging
+			 * resumes below the start threshold.
+			 */
+			battmgr->oneplus_dual_auto_last_rc = 0;
+			battmgr->oneplus_dual_auto_armed = false;
+			deferred = false;
 		} else {
+			battmgr->oneplus_dual_auto_attempts++;
 			battmgr->oneplus_dual_auto_run = true;
 			battmgr->oneplus_dual_auto_cancel_requested = false;
 			battmgr->oneplus_dual_auto_windows_started = 0;
@@ -5889,13 +6131,16 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 				battmgr->oneplus_dual_auto_starts++;
 				battmgr->oneplus_dual_auto_last_rc =
 					-EINPROGRESS;
+				dev_info(battmgr->dev,
+					 "automatic PPS dual start queued\n");
 			} else {
 				battmgr->oneplus_dual_auto_run = false;
 				battmgr->oneplus_dual_auto_last_rc = -EBUSY;
 			}
 		}
 	}
-	battmgr->oneplus_dual_auto_connected = true;
+	if (!deferred)
+		battmgr->oneplus_dual_auto_connected = true;
 
 out_unlock:
 	mutex_unlock(&battmgr->oneplus_lock);
@@ -5985,6 +6230,7 @@ static ssize_t qcom_battmgr_oneplus_dual_auto_store(
 			battmgr->oneplus_dual_auto_connected = false;
 			battmgr->oneplus_dual_auto_cancel_requested = false;
 			battmgr->oneplus_dual_auto_full_stop = false;
+			battmgr->oneplus_dual_auto_detach_seen = false;
 			battmgr->oneplus_dual_auto_attempts = 0;
 			battmgr->oneplus_dual_auto_starts = 0;
 			battmgr->oneplus_dual_auto_stops = 0;
