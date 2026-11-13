@@ -433,6 +433,7 @@ struct sc8547_device {
 	bool suspended;
 	bool vooc_cable_online;
 	bool vooc_cable_state_known;
+	bool vooc_source_blocked;
 	bool vooc_charge_inhibited;
 	u8 vooc_cable_absent_count;
 	u8 vooc_active_current_code;
@@ -2553,6 +2554,40 @@ static int sc8547_vooc_send_safe_reply(struct sc8547_device *sc, u8 rx,
 	return 0;
 }
 
+static int sc8547_vooc_check_usb_source(void)
+{
+	struct power_supply *psy;
+	union power_supply_propval type = { };
+	int ret;
+
+	psy = power_supply_get_by_name("qcom-battmgr-usb");
+	if (!psy)
+		return -ENODEV;
+
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_USB_TYPE, &type);
+	power_supply_put(psy);
+	if (ret)
+		return ret;
+
+	switch (type.intval) {
+	case POWER_SUPPLY_USB_TYPE_SDP:
+	case POWER_SUPPLY_USB_TYPE_CDP:
+	case POWER_SUPPLY_USB_TYPE_ACA:
+	case POWER_SUPPLY_USB_TYPE_C:
+		return -EBUSY;
+	case POWER_SUPPLY_USB_TYPE_DCP:
+	case POWER_SUPPLY_USB_TYPE_PD:
+	case POWER_SUPPLY_USB_TYPE_PD_DRP:
+	case POWER_SUPPLY_USB_TYPE_PD_PPS:
+	case POWER_SUPPLY_USB_TYPE_PD_SPR_AVS:
+	case POWER_SUPPLY_USB_TYPE_PD_PPS_SPR_AVS:
+	case POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID:
+		return 0;
+	default:
+		return -EAGAIN;
+	}
+}
+
 static int sc8547_vooc_session(struct sc8547_device *sc)
 {
 	u8 saved_loose, saved_timing;
@@ -2610,6 +2645,9 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 	if (strcmp(sc->role, "primary") ||
 	    sc->variant != SC8547_VARIANT_SC8547A)
 		return -EOPNOTSUPP;
+	ret = sc8547_vooc_check_usb_source();
+	if (ret)
+		return ret;
 	continuous_session = READ_ONCE(sc->vooc_cable_online);
 	/* Reset session state before arming the PHY. */
 	sc->vooc_last_cp_started = false;
@@ -2707,6 +2745,9 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 	sc->vooc_batt_model_done = false;
 	sc->vooc_initialized = true;
 
+	ret = sc8547_vooc_check_usb_source();
+	if (ret)
+		goto out_cleanup;
 	ret = wcd939x_usbss_set_vooc_dpdm(true);
 	if (ret)
 		goto out_cleanup;
@@ -3700,6 +3741,10 @@ static int sc8547_vooc_restart_adapter(struct sc8547_device *sc)
 		goto out_put;
 	}
 
+	ret = sc8547_vooc_check_usb_source();
+	if (ret)
+		goto out_put;
+
 	val.intval = 0;
 	ret = power_supply_set_property(psy,
 			POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
@@ -3770,6 +3815,18 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	if (atomic_cmpxchg(&sc->vooc_retry_running, 0, 1))
 		return;
 
+	ret = sc8547_vooc_check_usb_source();
+	if (ret) {
+		WRITE_ONCE(sc->vooc_source_blocked, true);
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		atomic_set(&sc->vooc_retry_running, 0);
+		if (ret == -EBUSY)
+			dev_info(sc->dev, "VOOC skipped: USB data port\n");
+		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+				 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+		return;
+	}
+
 	online = sc8547_vooc_usb_online();
 	if (online <= 0) {
 		/* USB online briefly drops while battmgr applies/removes the
@@ -3825,6 +3882,8 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 		msleep(SC8547_VOOC_REACTIVE_SETTLE_MS);
 		ret = sc8547_vooc_restart_adapter(sc);
 	}
+	if (!ret)
+		ret = sc8547_vooc_check_usb_source();
 	if (!ret) {
 		/* The board's USBSS needs the VOOC analog path selected before the
 		 * SC8547 PHY reset to generate the adapter's first frame.  This is
@@ -3913,6 +3972,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	unsigned long retry_delay;
 	int online;
 	int vbus_uv;
+	int ret;
 
 	if (sc8547_charge_is_inhibited()) {
 		WRITE_ONCE(sc->vooc_charge_inhibited, true);
@@ -3961,6 +4021,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 			return;
 		}
 		WRITE_ONCE(sc->vooc_cable_online, false);
+		WRITE_ONCE(sc->vooc_source_blocked, false);
 		sc->vooc_cable_absent_count = 0;
 		sc->vooc_recovery_retry_count = 0;
 		sc8547_vooc_reset_curve(sc);
@@ -3976,6 +4037,33 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 
 	WRITE_ONCE(sc->vooc_cable_online, true);
 	sc->vooc_cable_absent_count = 0;
+	ret = sc8547_vooc_check_usb_source();
+	if (ret) {
+		if (ret != -EBUSY &&
+		    (atomic_read(&sc->vooc_retry_running) ||
+		     READ_ONCE(sc->vooc_initialized) ||
+		     atomic_read(&sc->pps_running) ||
+		     READ_ONCE(sc->pps_prepared))) {
+			mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+			return;
+		}
+		if (ret == -EBUSY && !READ_ONCE(sc->vooc_source_blocked))
+			dev_info(sc->dev, "VOOC skipped: USB data port\n");
+		WRITE_ONCE(sc->vooc_source_blocked, true);
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		cancel_delayed_work(&sc->vooc_retry_work);
+		if (READ_ONCE(sc->vooc_initialized))
+			atomic_set(&sc->policy_cancel, 1);
+		if (ret != -EBUSY)
+			mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+		return;
+	}
+	if (READ_ONCE(sc->vooc_source_blocked)) {
+		WRITE_ONCE(sc->vooc_source_blocked, false);
+		was_online = false;
+	}
 	if (was_online)
 		return;
 
@@ -3985,10 +4073,11 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	sc->vooc_auto_retry_count = 0;
 	sc->vooc_recovery_retry_count = 0;
 	retry_delay = initial_check ?
-		msecs_to_jiffies(SC8547_VOOC_BOOT_SETTLE_MS) : 0;
+		msecs_to_jiffies(SC8547_VOOC_BOOT_SETTLE_MS) :
+		msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS);
 	dev_info(sc->dev,
 		 "VOOC cable inserted; scheduling automatic session in %u ms (online=%d vbus=%d)\n",
-		 initial_check ? SC8547_VOOC_BOOT_SETTLE_MS : 0,
+		 jiffies_to_msecs(retry_delay),
 		 online, vbus_uv);
 	sc8547_queue_vooc_retry(sc, retry_delay);
 }
