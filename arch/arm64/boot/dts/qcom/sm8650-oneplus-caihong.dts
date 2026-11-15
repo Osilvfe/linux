@@ -41,6 +41,25 @@
 		serial5 = &uart7;
 	};
 
+	/*
+	 * The resource manager normally overlays this subtree, together with
+	 * freshly allocated rm-rpc capabilities, onto the DTB it hands to the
+	 * VM.  XBL starts Linux directly here, so that overlay only reaches
+	 * XBL's own DT log buffer; the IDs change on every boot and therefore
+	 * cannot be written statically.  Keep the placeholder so the Gunyah
+	 * driver can find /hypervisor, and let it recover the current
+	 * capabilities from the merged tree.
+	 */
+	hypervisor {
+		compatible = "qcom,gunyah-hypervisor-1.0",
+			     "qcom,gunyah-hypervisor", "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		qcom,gh-watchdog {
+		};
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 

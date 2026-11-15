@@ -708,6 +708,7 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
 	struct gunyah_rm_mem_entry *entry;
 	struct folio *folio;
+	u64 remaining;
 	pgoff_t i;
 	int ret;
 
@@ -729,12 +730,17 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 		entry = &parcel->mem_entries[i];
 
 		folio = pfn_folio(PHYS_PFN(le64_to_cpu(entry->phys_addr)));
+		remaining = le64_to_cpu(entry->size);
+		while (remaining) {
+			remaining -= folio_size(folio);
 
-		if (folio_test_private(folio))
-			gunyah_folio_host_reclaim(folio);
+			if (folio_test_private(folio))
+				gunyah_folio_host_reclaim(folio);
 
-		unpin_user_page(folio_page(folio, 0));
-		account_locked_vm(ghvm->mm_s, 1, false);
+			unpin_user_page(folio_page(folio, 0));
+			account_locked_vm(ghvm->mm_s, 1, false);
+			folio = folio_next(folio);
+		}
 	}
 
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
@@ -777,8 +783,9 @@ int gunyah_reclaim_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
 	int ret, ret2 = 0;
 
 	mt_for_each(&ghvm->bindings, b, gfn, end_gfn) {
-		if (b->vm_parcel)
-			ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
+		if (!b->vm_parcel)
+			continue;
+		ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
 		if (ret)
 			ret2 = ret;
 	}

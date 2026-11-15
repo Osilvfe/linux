@@ -12,11 +12,15 @@
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/miscdevice.h>
 #include <linux/auxiliary_bus.h>
+#include <linux/libfdt.h>
+#include <linux/mm.h>
 #include <linux/suspend.h>
+#include <linux/vmalloc.h>
 
 #include <asm/gunyah.h>
 
@@ -160,6 +164,9 @@ struct gunyah_rm {
 	struct fwnode_handle *parent_fwnode;
 
 	struct notifier_block pm_nb;
+
+	/* RM predates VM_SET_DEMAND_PAGING: share all guest memory up-front */
+	bool no_demand_paging;
 };
 
 /**
@@ -772,6 +779,99 @@ static int gunyah_rm_probe_info_area(struct gunyah_rm *rm)
 	return 0;
 }
 
+/*
+ * Linux is normally started by the resource manager, which overlays the
+ * /hypervisor subtree (including the rm-rpc capabilities it just allocated)
+ * onto the DTB handed to the VM.  When XBL starts Linux directly that overlay
+ * is instead merged into XBL's own DT log buffer, so the DTB we booted with
+ * only carries a placeholder.  The capability IDs are allocated fresh on every
+ * boot, so they cannot be written into the board DTS.  Recover them from the
+ * merged tree when it is present.
+ */
+static int gunyah_rm_info_from_xbl(u64 *tx_capid, u64 *rx_capid,
+				   u32 *tx_virq, u32 *rx_virq)
+{
+	struct device_node *np __free(device_node) = NULL;
+	const void *fdt = NULL;
+	u64 reg_addr, reg_size;
+	unsigned long size, i;
+	u8 *buf;
+	int off, rm_off, len, ret = -ENOENT;
+	const __be32 *reg, *irq;
+
+	np = of_find_node_by_name(NULL, "xbl-dt-log-merged");
+	if (!np)
+		return -ENOENT;
+	if (of_property_read_reg(np, 0, &reg_addr, &reg_size) || !reg_size)
+		return -EINVAL;
+
+	/*
+	 * Only the first part of the region is guaranteed to be mapped; the
+	 * merged tree we need sits near its start.  Stay well inside that and
+	 * copy a page at a time so an unmapped tail cannot fault the boot.
+	 */
+	size = min_t(u64, reg_size, SZ_128K);
+	buf = kvmalloc(size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	for (i = 0; i < size; i += PAGE_SIZE) {
+		size_t n = min_t(size_t, PAGE_SIZE, size - i);
+		void *p = memremap(reg_addr + i, n, MEMREMAP_WB);
+
+		if (!p) {
+			ret = -EFAULT;
+			goto out;
+		}
+		memcpy(buf + i, p, n);
+		memunmap(p);
+	}
+
+	for (i = 0; i + sizeof(struct fdt_header) <= size; i += 4) {
+		fdt = buf + i;
+		if (fdt_magic(fdt) != FDT_MAGIC || fdt_check_header(fdt) ||
+		    fdt_totalsize(fdt) > size - i)
+			continue;
+
+		off = fdt_path_offset(fdt, "/hypervisor");
+		if (off < 0)
+			continue;
+
+		for (rm_off = fdt_first_subnode(fdt, off); rm_off >= 0;
+		     rm_off = fdt_next_subnode(fdt, rm_off)) {
+			const char *compat = fdt_getprop(fdt, rm_off, "compatible", &len);
+
+			if (!compat ||
+			    !fdt_stringlist_contains(compat, len, "gunyah-resource-manager"))
+				continue;
+
+			reg = fdt_getprop(fdt, rm_off, "reg", &len);
+			if (!reg || len != 4 * sizeof(__be32))
+				continue;
+
+			irq = fdt_getprop(fdt, rm_off, "interrupts", &len);
+			if (!irq || len != 6 * sizeof(__be32))
+				continue;
+
+			if (fdt32_to_cpu(irq[0]) != 0 || fdt32_to_cpu(irq[3]) != 0 ||
+			    fdt32_to_cpu(irq[1]) > U32_MAX - 32 ||
+			    fdt32_to_cpu(irq[4]) > U32_MAX - 32)
+				continue;
+
+			*tx_capid = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
+			*rx_capid = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
+			*tx_virq = fdt32_to_cpu(irq[1]) + 32;
+			*rx_virq = fdt32_to_cpu(irq[4]) + 32;
+			ret = 0;
+			goto out;
+		}
+	}
+
+out:
+	kvfree(buf);
+	return ret;
+}
+
 static int gunyah_rm_get_of_info(struct gunyah_rm *rm)
 {
 	struct device_node *gunyah_np __free(device_node) = NULL;
@@ -810,6 +910,41 @@ static int gunyah_rm_get_of_info(struct gunyah_rm *rm)
 	rm->rx_ghrsc.irq = ret;
 
 	of_node_put(rm_np);
+	return 0;
+}
+
+/**
+ * gunyah_rm_get_xbl_info() - recover rm-rpc resources from XBL's merged DT
+ *
+ * The resource manager publishes the rm-rpc capabilities by overlaying its
+ * DT onto the one it hands to the VM.  When XBL boots Linux directly that
+ * overlay lands in XBL's own DT log buffer instead, and the capability IDs
+ * are reallocated on every boot.  Read them (and the virtual IRQs) back out
+ * of the merged tree.
+ */
+static int gunyah_rm_get_xbl_info(struct gunyah_rm *rm)
+{
+	u32 tx_virq, rx_virq;
+	int ret;
+
+	ret = gunyah_rm_info_from_xbl(&rm->tx_ghrsc.capid, &rm->rx_ghrsc.capid,
+				      &tx_virq, &rx_virq);
+	if (ret)
+		return ret;
+
+	rm->tx_ghrsc.type = GUNYAH_RESOURCE_TYPE_MSGQ_TX;
+	ret = gunyah_rm_alloc_irq(rm, tx_virq);
+	if (ret <= 0)
+		return -EINVAL;
+	rm->tx_ghrsc.irq = ret;
+
+	rm->rx_ghrsc.type = GUNYAH_RESOURCE_TYPE_MSGQ_RX;
+	ret = gunyah_rm_alloc_irq(rm, rx_virq);
+	if (ret <= 0)
+		return -EINVAL;
+	rm->rx_ghrsc.irq = ret;
+
+	pr_info("Using rm-rpc resources from XBL merged DT\n");
 	return 0;
 }
 
@@ -897,6 +1032,35 @@ err:
 	return NOTIFY_BAD;
 }
 
+/**
+ * gunyah_rm_has_demand_paging() - can this RM fault guest pages in on demand?
+ * @rm: resource manager handle
+ */
+bool gunyah_rm_has_demand_paging(struct gunyah_rm *rm)
+{
+	return !rm->no_demand_paging;
+}
+EXPORT_SYMBOL_GPL(gunyah_rm_has_demand_paging);
+
+/**
+ * gunyah_rm_probe_features() - detect optional RM capabilities
+ * @rm: resource manager handle
+ *
+ * RMs older than VM_SET_DEMAND_PAGING cannot fault guest pages in on
+ * demand, so the VM manager must have all guest memory shared before the
+ * VM starts.  Probe once at init: the query is cheap and harmless.
+ */
+static void gunyah_rm_probe_features(struct gunyah_rm *rm)
+{
+	int ret;
+
+	/* Zero ranges: this cannot change any VM state on any RM version. */
+	ret = gunyah_rm_vm_set_demand_paging(rm, 0, 0, NULL);
+	rm->no_demand_paging = (ret == -EOPNOTSUPP);
+	if (rm->no_demand_paging)
+		pr_info("RM has no VM_SET_DEMAND_PAGING; guest memory will be shared up-front\n");
+}
+
 static struct gunyah_rm *__rm;
 
 static int __init gunyah_rm_init(void)
@@ -931,6 +1095,8 @@ static int __init gunyah_rm_init(void)
 	ret = gunyah_rm_probe_info_area(rm);
 	if (ret == -ENOENT) {
 		ret = gunyah_rm_get_of_info(rm);
+		if (ret)
+			ret = gunyah_rm_get_xbl_info(rm);
 	} else if (!ret) {
 		rm->pm_nb.notifier_call = gunyah_rm_hibernation_restore;
 		ret = register_pm_notifier(&rm->pm_nb);
@@ -965,6 +1131,8 @@ static int __init gunyah_rm_init(void)
 		pr_err("Failed to register gunyah misc device\n");
 		goto free_rx_irq;
 	}
+
+	gunyah_rm_probe_features(rm);
 
 	ret = gunyah_adev_init(rm, "gh_rm_core");
 	if (ret) {

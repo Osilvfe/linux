@@ -41,6 +41,9 @@ static inline int gunyah_vm_fill_boot_context(struct gunyah_vm *ghvm)
 	void *entry;
 	int ret;
 
+	if (!gunyah_rm_has_demand_paging(ghvm->rm))
+		return 0;
+
 	xa_for_each(&ghvm->boot_context, id, entry) {
 		reg_set = (id >> GUNYAH_VM_BOOT_CONTEXT_REG_SHIFT) & 0xff;
 		reg_index = id & 0xff;
@@ -109,25 +112,97 @@ static long gunyah_vm_set_auth_type(struct gunyah_vm *ghvm,
 
 static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 {
+	struct gunyah_vm_binding *b;
+	struct gunyah_vm_binding *other;
+	unsigned long index = 0;
+	unsigned long reg;
+	u64 image_offset = 0;
+	u64 *entry;
+	u64 dtb_offset;
+	int ret = 0;
 	/*
 	 * VMs use dtb mem parcel as the config image parcel as they
 	 * don't have any explicit auth image/metadata
 	 */
 
-	ghvm->config_image.parcel.start = gunyah_gpa_to_gfn(ghvm->dtb.config.guest_phys_addr);
-	ghvm->config_image.parcel.pages = gunyah_gpa_to_gfn(ghvm->dtb.config.size);
-
-	ghvm->config_image.image_offset = 0;
+	/*
+	 * The config image parcel is what RM shares with the VM and what
+	 * VM_CONFIGURE describes.  It must cover the guest's RAM as well as
+	 * the DTB, otherwise RM hands the VM an address space containing only
+	 * the device tree: the guest's very first instruction fetch has no
+	 * backing page.  Widen the parcel to the userspace binding that holds
+	 * the DTB and express the DTB position as an offset inside it.
+	 */
+	down_read(&ghvm->bindings_lock);
+	if (!gunyah_rm_has_demand_paging(ghvm->rm)) {
+		if (!ghvm->dtb.config.size ||
+		    !PAGE_ALIGNED(ghvm->dtb.config.guest_phys_addr) ||
+		    !PAGE_ALIGNED(ghvm->dtb.config.size)) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		b = mtree_load(&ghvm->bindings,
+			       gunyah_gpa_to_gfn(ghvm->dtb.config.guest_phys_addr));
+		if (!b || b->mem_type != VM_MEM_USER) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		if (!(b->flags & GUNYAH_MEM_ALLOW_EXEC)) {
+			ret = -EACCES;
+			goto unlock;
+		}
+		dtb_offset = ghvm->dtb.config.guest_phys_addr - b->guest_phys_addr;
+		if (dtb_offset >= b->size ||
+		    ghvm->dtb.config.size > b->size - dtb_offset) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		mt_for_each(&ghvm->bindings, other, index, ULONG_MAX) {
+			if (other != b) {
+				ret = -EOPNOTSUPP;
+				goto unlock;
+			}
+		}
+		xa_for_each(&ghvm->boot_context, reg, entry) {
+			if (reg != GUNYAH_VM_BOOT_CONTEXT_REG(REG_SET_PC, 0)) {
+				ret = -EOPNOTSUPP;
+				goto unlock;
+			}
+			if (!IS_ALIGNED(*entry, sizeof(u32)) ||
+			    *entry < b->guest_phys_addr ||
+			    *entry - b->guest_phys_addr >= b->size) {
+				ret = -EINVAL;
+				goto unlock;
+			}
+			image_offset = *entry - b->guest_phys_addr;
+		}
+		ghvm->config_image.parcel.start =
+			gunyah_gpa_to_gfn(b->guest_phys_addr);
+		ghvm->config_image.parcel.pages =
+			gunyah_gpa_to_gfn(b->size);
+		ghvm->config_image.dtb_offset = dtb_offset;
+	} else {
+		ghvm->config_image.parcel.start =
+			gunyah_gpa_to_gfn(ghvm->dtb.config.guest_phys_addr);
+		ghvm->config_image.parcel.pages =
+			gunyah_gpa_to_gfn(ghvm->dtb.config.size);
+		ghvm->config_image.dtb_offset = ghvm->dtb.config.guest_phys_addr -
+			gunyah_gfn_to_gpa(ghvm->config_image.parcel.start);
+	}
+	ghvm->config_image.image_offset = image_offset;
 	ghvm->config_image.image_size = 0;
-	ghvm->config_image.dtb_offset = ghvm->dtb.config.guest_phys_addr -
-				gunyah_gfn_to_gpa(ghvm->config_image.parcel.start);
 	ghvm->config_image.dtb_size = ghvm->dtb.config.size;
-	return 0;
+unlock:
+	up_read(&ghvm->bindings_lock);
+	return ret;
 }
 
 static int gunyah_generic_pre_vm_init(struct gunyah_vm *ghvm)
 {
 	int ret;
+
+	if (!gunyah_rm_has_demand_paging(ghvm->rm))
+		return 0;
 
 	ret = gunyah_setup_demand_paging(ghvm, 0, ULONG_MAX);
 	if (ret) {
@@ -153,14 +228,16 @@ static int gunyah_generic_pre_vm_start(struct gunyah_vm *ghvm)
 {
 	int ret;
 
-	ret = gunyah_vm_parcel_to_paged(ghvm, &ghvm->config_image.parcel.parcel,
-				ghvm->config_image.parcel.start,
-				ghvm->config_image.parcel.pages);
-	if (ret)
-		return ret;
+	if (gunyah_rm_has_demand_paging(ghvm->rm)) {
+		ret = gunyah_vm_parcel_to_paged(ghvm, &ghvm->config_image.parcel.parcel,
+						ghvm->config_image.parcel.start,
+						ghvm->config_image.parcel.pages);
+		if (ret)
+			return ret;
+	}
 
 	if (ghvm->auth != GUNYAH_RM_VM_AUTH_NONE)
-		return ret;
+		return 0;
 
 	ret = gunyah_vm_fill_boot_context(ghvm);
 	if (ret) {
@@ -173,6 +250,9 @@ static int gunyah_generic_pre_vm_start(struct gunyah_vm *ghvm)
 
 void gunyah_generic_vm_start_fail(struct gunyah_vm *ghvm)
 {
+	if (!gunyah_rm_has_demand_paging(ghvm->rm))
+		return;
+
 	/**
 	 * need to rollback parcel_to_paged because RM is still
 	 * tracking the parcel
@@ -801,6 +881,7 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 {
 	struct gunyah_rm_hyp_resources *resources = NULL;
 	struct gunyah_resource *ghrsc;
+	int cleanup_ret;
 	int ret, i, n;
 	u16 vmid = 0;
 
@@ -925,10 +1006,10 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 	kfree(resources);
 	return ret;
 err_dealloc_vmid:
-	ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
-	if (ret)
+	cleanup_ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
+	if (cleanup_ret)
 		dev_warn(ghvm->parent,
-			 "Failed to deallocate vmid: %d\n", ret);
+			 "Failed to deallocate vmid: %d\n", cleanup_ret);
 err_rm_notifier_unregister:
 	gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
 err:

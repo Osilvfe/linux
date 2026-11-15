@@ -19,6 +19,7 @@ int gunyah_rm_notifier_register(struct gunyah_rm *rm,
 int gunyah_rm_notifier_unregister(struct gunyah_rm *rm,
 				  struct notifier_block *nb);
 struct device *gunyah_rm_get(struct gunyah_rm *rm);
+bool gunyah_rm_has_demand_paging(struct gunyah_rm *rm);
 void gunyah_rm_put(struct gunyah_rm *rm);
 
 struct gunyah_rm_vm_exited_payload {
