@@ -8,6 +8,8 @@
  * device policy here; qcom_battmgr.c should contain only integration hooks.
  */
 
+#include "qcom_battmgr_caihong_protocol.inc"
+
 struct qcom_battmgr_oneplus_cp_run_ctx {
 	struct completion done;
 	struct power_supply *cp_psy;
@@ -258,6 +260,71 @@ static bool qcom_battmgr_oneplus_has_pps(struct qcom_battmgr *battmgr,
 
 	return false;
 }
+
+/*
+ * A PD contract alone does not make a source a PPS source: a VOOC adapter can
+ * settle a plain fixed PD contract before it starts its own handshake.  Only
+ * skip VOOC when the charger actually advertises a programmable APDO.
+ */
+int qcom_battmgr_caihong_source_has_pps(void)
+{
+	static const char * const names[] = {
+		"qcom-battmgr-bat",
+	};
+	struct power_supply *psy;
+	struct qcom_battmgr *battmgr;
+	int ret;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		psy = power_supply_get_by_name(names[i]);
+		if (!psy)
+			continue;
+		battmgr = power_supply_get_drvdata(psy);
+		if (!battmgr) {
+			power_supply_put(psy);
+			continue;
+		}
+		mutex_lock(&battmgr->oneplus_lock);
+		ret = qcom_battmgr_oneplus_pps_request(battmgr);
+		if (!ret)
+			ret = qcom_battmgr_oneplus_has_pps(battmgr,
+				BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MV,
+				BATTMGR_ONEPLUS_CP_DUAL_PPS_MA);
+		mutex_unlock(&battmgr->oneplus_lock);
+		power_supply_put(psy);
+		return ret;
+	}
+
+	return -ENODEV;
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_caihong_source_has_pps);
+
+int qcom_battmgr_caihong_source_present(void)
+{
+	struct power_supply *psy;
+	struct qcom_battmgr *battmgr;
+	int ret;
+
+	psy = power_supply_get_by_name("qcom-battmgr-usb");
+	if (!psy)
+		return -ENODEV;
+	battmgr = power_supply_get_drvdata(psy);
+	if (!battmgr || !battmgr->oneplus_charge_control) {
+		ret = -EOPNOTSUPP;
+		goto out_put;
+	}
+	mutex_lock(&battmgr->oneplus_lock);
+	ret = battmgr->service_up ? qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_USB_PROPERTY_GET, BATTMGR_ONEPLUS_USB_IN_STATUS, 0) : -EHOSTDOWN;
+	if (!ret)
+		ret = !!(battmgr->oneplus_usb_in_status & 0xff);
+	mutex_unlock(&battmgr->oneplus_lock);
+out_put:
+	power_supply_put(psy);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_caihong_source_present);
 
 static u32 qcom_battmgr_oneplus_pps_current_limit(
 	struct qcom_battmgr *battmgr, u32 voltage_mv, u32 policy_max_ma)
@@ -1162,6 +1229,17 @@ static const struct attribute_group qcom_battmgr_oneplus_ffc_group = {
 	.attrs = qcom_battmgr_oneplus_ffc_attrs,
 };
 
+static int qcom_battmgr_caihong_update_usb_property(
+	struct qcom_battmgr *battmgr, enum power_supply_property psp)
+{
+	if (!battmgr->oneplus_charge_control ||
+	    psp != POWER_SUPPLY_PROP_USB_TYPE)
+		return -EOPNOTSUPP;
+
+	return qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, 0);
+}
+
 static int qcom_battmgr_caihong_update_battery_property(
 	struct qcom_battmgr *battmgr, enum power_supply_property psp)
 {
@@ -1327,6 +1405,7 @@ static DEVICE_ATTR_RO(oneplus_power_diagnostics);
 static struct attribute *qcom_battmgr_oneplus_otg_attrs[] = {
 	&dev_attr_oneplus_otg_diagnostics.attr,
 	&dev_attr_oneplus_power_diagnostics.attr,
+	&dev_attr_oneplus_fastchg_status.attr,
 	NULL,
 };
 
@@ -1603,6 +1682,21 @@ static int qcom_battmgr_oneplus_require_cp_active_bounded(
 	int ret;
 
 	ret = qcom_battmgr_oneplus_require_cp_active(cp_psy, ibus_ua);
+	/*
+	 * ONLINE and STATUS are separate power-supply reads.  While a session is
+	 * running, one of them can transiently report a stopped pump even though
+	 * both keep delivering (measured mid-session at 63 s).  Confirm that edge
+	 * for a few samples before treating it as a real shutdown; genuine
+	 * removals stay low and are still fatal after the window.
+	 */
+	for (attempt = 0; attempt < BATTMGR_ONEPLUS_CP_DUAL_STATE_RECHECKS &&
+			  ret == -EIO; attempt++) {
+		msleep(BATTMGR_ONEPLUS_CP_DUAL_STATE_RECHECK_MS);
+		(*range_rechecks)++;
+		ret = qcom_battmgr_oneplus_require_cp_active(cp_psy, ibus_ua);
+		if (!ret)
+			(*range_recoveries)++;
+	}
 	if (ret && ret != -ERANGE)
 		return ret;
 	if (!ret && *ibus_ua <= ibus_max_ua)
@@ -3629,6 +3723,22 @@ static bool qcom_battmgr_oneplus_dual_auto_pack_satisfied(
 	return battmgr->status.status != POWER_SUPPLY_STATUS_CHARGING;
 }
 
+static bool qcom_battmgr_oneplus_source_cleanup_safe_locked(
+	struct qcom_battmgr *battmgr, int restore_rc)
+{
+	int ret;
+
+	if (!restore_rc)
+		return true;
+	ret = qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_USB_PROPERTY_GET, BATTMGR_ONEPLUS_USB_IN_STATUS, 0);
+	if (ret || (battmgr->oneplus_usb_in_status & 0xff))
+		return false;
+	ret = qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, 0);
+	return !ret && battmgr->usb.voltage_now < 1000000;
+}
+
 static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 					      size_t count, bool automatic)
 {
@@ -3755,6 +3865,7 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	u32 target_ceiling_ua = 4500000;
 	u32 buck_reserve_ua = 0;
 	u32 buck_reserve_uv = 0;
+	u32 protocol_generation;
 
 	unsigned int i;
 	int cleanup_ret;
@@ -3783,7 +3894,17 @@ static ssize_t qcom_battmgr_oneplus_dual_run(struct qcom_battmgr *battmgr,
 	profile = qcom_battmgr_oneplus_pps_profile(automatic && continuous &&
 		caihong_pps_high_current && battmgr->oneplus_pps_read_buffer &&
 		of_machine_is_compatible("oneplus,caihong"));
+	ret = qcom_battmgr_caihong_protocol_claim(CAIHONG_CHARGE_PPS,
+						&protocol_generation);
+	if (ret) {
+		mutex_unlock(&battmgr->oneplus_lock);
+		return ret;
+	}
 	WRITE_ONCE(caihong_pps_high_current_active, profile.experimental);
+	if (automatic)
+		dev_info(battmgr->dev,
+			 "automatic PPS dual session start (continuous=%u)\n",
+			 continuous);
 	battmgr->oneplus_dual_experimental_high_current = profile.experimental;
 	battmgr->oneplus_dual_effective_target_ua = profile.target_ua;
 	battmgr->oneplus_dual_running = true;
@@ -5166,6 +5287,11 @@ cleanup_cp:
 	battmgr->oneplus_dual_running = false;
 	battmgr->oneplus_dual_valid = true;
 	battmgr->oneplus_dual_stop_requested = false;
+	qcom_battmgr_caihong_protocol_release(CAIHONG_CHARGE_PPS,
+		protocol_generation, false,
+		!primary_cleanup_rc && !secondary_cleanup_rc &&
+		!final_primary_off_rc && !final_secondary_off_rc &&
+		qcom_battmgr_oneplus_source_cleanup_safe_locked(battmgr, source_restore_rc));
 	mutex_unlock(&battmgr->oneplus_lock);
 
 	return ret ? ret : count;
@@ -5719,87 +5845,43 @@ out_unlock:
 static int qcom_battmgr_oneplus_dual_auto_connected_locked(
 	struct qcom_battmgr *battmgr, bool *connected)
 {
-	struct power_supply *primary_psy;
-	struct power_supply *secondary_psy;
-	union power_supply_propval val;
-	bool cp_connected = false;
-	bool usb_online = false;
-	int cp_ret = -ENODEV;
-	int usb_ret;
+	int ret;
 
 	*connected = false;
-	usb_ret = qcom_battmgr_oneplus_request_property(battmgr,
-		BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
-	if (!usb_ret)
-		usb_online = battmgr->usb.online;
-
-	primary_psy = power_supply_get_by_name(
-		BATTMGR_ONEPLUS_PRIMARY_CP_NAME);
-	secondary_psy = power_supply_get_by_name(
-		BATTMGR_ONEPLUS_SECONDARY_CP_NAME);
-	if (!primary_psy || !secondary_psy) {
-		if (secondary_psy)
-			power_supply_put(secondary_psy);
-		if (primary_psy)
-			power_supply_put(primary_psy);
-		return -EAGAIN;
-	}
-
-	cp_ret = power_supply_get_property(primary_psy,
-		POWER_SUPPLY_PROP_PRESENT, &val);
-	if (!cp_ret && val.intval) {
-		cp_ret = power_supply_get_property(primary_psy,
-			POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
-		if (!cp_ret && val.intval >=
-				BATTMGR_ONEPLUS_DUAL_AUTO_VBUS_MIN_UV)
-			cp_connected = true;
-	}
-	power_supply_put(secondary_psy);
-	power_supply_put(primary_psy);
-
-	if (usb_ret && cp_ret)
-		return usb_ret;
-
-	/* A live physical input masks firmware-online transition glitches. */
-	*connected = (!usb_ret && usb_online) || (!cp_ret && cp_connected);
+	ret = qcom_battmgr_oneplus_request_property(battmgr,
+		BATTMGR_USB_PROPERTY_GET, BATTMGR_ONEPLUS_USB_IN_STATUS, 0);
+	if (ret)
+		return ret;
+	*connected = !!(battmgr->oneplus_usb_in_status & 0xff);
 
 	return 0;
 }
 
-static bool qcom_battmgr_oneplus_dual_auto_pps_ready_locked(
+static int qcom_battmgr_oneplus_dual_auto_pps_ready_locked(
 	struct qcom_battmgr *battmgr)
 {
 	u32 limit_ma;
-	u32 reserve_ua;
-	u32 current_ua;
 	int ret;
 
 	if (!battmgr->service_up)
-		return false;
+		return -EHOSTDOWN;
 
 	ret = qcom_battmgr_oneplus_pps_request(battmgr);
 	if (ret)
-		return false;
+		return ret;
 
 	limit_ma = qcom_battmgr_oneplus_pps_current_limit(
 		battmgr, BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MV,
 		BATTMGR_ONEPLUS_CP_DUAL_VENDOR_PPS_MAX_MA);
-	current_ua = READ_ONCE(battmgr->usb.current_now);
-	if (!current_ua || current_ua > 5000000)
-		return false;
-	reserve_ua = max_t(u32, 500000, current_ua);
-
-	return limit_ma * 1000 > reserve_ua &&
-	       limit_ma * 1000 - reserve_ua >=
-		       BATTMGR_ONEPLUS_CP_DUAL_BOOST_HANDOFF_MIN_UA;
+	return limit_ma >= BATTMGR_ONEPLUS_CP_DUAL_PPS_MA;
 }
 
-static void qcom_battmgr_oneplus_dual_auto_wait_pps_ready(
+static int qcom_battmgr_oneplus_dual_auto_wait_pps_ready(
 	struct qcom_battmgr *battmgr)
 {
 	unsigned int check;
 	unsigned int stable = 0;
-	bool ready;
+	int ret = -EAGAIN;
 
 	for (check = 0; check < BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_CHECKS;
 	     check++) {
@@ -5808,24 +5890,21 @@ static void qcom_battmgr_oneplus_dual_auto_wait_pps_ready(
 		    !battmgr->oneplus_dual_auto_run ||
 		    battmgr->oneplus_dual_auto_cancel_requested) {
 			mutex_unlock(&battmgr->oneplus_lock);
-			return;
+			return -ECANCELED;
 		}
-		ready = qcom_battmgr_oneplus_dual_auto_pps_ready_locked(battmgr);
+		ret = qcom_battmgr_oneplus_dual_auto_pps_ready_locked(battmgr);
 		mutex_unlock(&battmgr->oneplus_lock);
-		if (ready) {
+		if (ret > 0) {
 			if (++stable >=
 			    BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_STABLE_CHECKS)
-				return;
+				return 0;
 		} else {
 			stable = 0;
 		}
 		msleep(BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MS);
 	}
 
-	dev_info(battmgr->dev,
-		 "automatic PPS capability not ready after %u ms; trying bounded session\n",
-		 BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_CHECKS *
-			 BATTMGR_ONEPLUS_DUAL_AUTO_PPS_READY_MS);
+	return ret < 0 ? ret : -EOPNOTSUPP;
 }
 
 static int qcom_battmgr_oneplus_dual_auto_wait_connected(
@@ -5835,13 +5914,6 @@ static int qcom_battmgr_oneplus_dual_auto_wait_connected(
 	unsigned int check;
 	int ret;
 
-	/*
-	 * A completed window deliberately turns both pumps off and restores fixed
-	 * 5 V.  Firmware USB_ONLINE and the pump-side VBUS observation can both be
-	 * transiently unavailable at that exact boundary.  Give the same one-second
-	 * cadence and two-sample confirmation used by the attach watcher a chance
-	 * to distinguish that protocol edge from a real cable removal.
-	 */
 	for (check = 0;
 	     check < BATTMGR_ONEPLUS_DUAL_AUTO_OFFLINE_CHECKS;
 	     check++) {
@@ -5903,8 +5975,15 @@ static void qcom_battmgr_oneplus_dual_auto_run_worker(
 
 		if (continuous && caihong_pps_high_current &&
 		    battmgr->oneplus_pps_read_buffer &&
-		    of_machine_is_compatible("oneplus,caihong"))
-			qcom_battmgr_oneplus_dual_auto_wait_pps_ready(battmgr);
+		    of_machine_is_compatible("oneplus,caihong")) {
+			ret = qcom_battmgr_oneplus_dual_auto_wait_pps_ready(battmgr);
+			if (ret) {
+				dev_info(battmgr->dev,
+					 "automatic PPS dual skipped: capability rc=%zd\n",
+					 ret);
+				break;
+			}
+		}
 
 		/*
 		 * The watcher may queue a start before the gauge has answered at
@@ -5923,9 +6002,6 @@ static void qcom_battmgr_oneplus_dual_auto_run_worker(
 			break;
 		}
 
-		dev_info(battmgr->dev,
-			 "automatic PPS dual session start (continuous=%u)\n",
-			 continuous);
 		ret = qcom_battmgr_oneplus_dual_run(battmgr, 1, true);
 		dev_info(battmgr->dev,
 			 "automatic PPS dual session end rc=%zd\n", ret);
@@ -5933,6 +6009,25 @@ static void qcom_battmgr_oneplus_dual_auto_run_worker(
 		mutex_lock(&battmgr->oneplus_lock);
 		if (ret >= 0)
 			battmgr->oneplus_dual_auto_windows_completed++;
+		if ((ret == -EIO || ret == -ECANCELED) &&
+		    battmgr->oneplus_dual_auto_enabled &&
+		    !battmgr->oneplus_dual_auto_cancel_requested &&
+		    !battmgr->oneplus_charge_inhibit) {
+			if (battmgr->oneplus_dual_auto_retries <
+			    BATTMGR_ONEPLUS_DUAL_AUTO_RETRY_LIMIT) {
+				battmgr->oneplus_dual_auto_retries++;
+				mutex_unlock(&battmgr->oneplus_lock);
+				dev_info(battmgr->dev,
+					 "automatic PPS dual retry %u/%u after rc=%zd\n",
+					 battmgr->oneplus_dual_auto_retries,
+					 BATTMGR_ONEPLUS_DUAL_AUTO_RETRY_LIMIT,
+					 ret);
+				msleep(BATTMGR_ONEPLUS_DUAL_AUTO_RETRY_MS);
+				continue;
+			}
+		}
+		if (ret >= 0)
+			battmgr->oneplus_dual_auto_retries = 0;
 		full_confirmed = battmgr->oneplus_dual_hold_full_confirmed;
 		if (full_confirmed)
 			battmgr->oneplus_dual_auto_full_stop = true;
@@ -5968,6 +6063,10 @@ static void qcom_battmgr_oneplus_dual_auto_run_worker(
 	mutex_lock(&battmgr->oneplus_lock);
 	battmgr->oneplus_dual_auto_last_rc = ret < 0 ? ret : 0;
 	battmgr->oneplus_dual_auto_run = false;
+	if (ret == -EBUSY || ret == -EAGAIN) {
+		battmgr->oneplus_dual_auto_armed = true;
+		battmgr->oneplus_dual_auto_connected = false;
+	}
 	mutex_unlock(&battmgr->oneplus_lock);
 }
 
@@ -5982,6 +6081,8 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 	bool service_recovered = false;
 	bool deferred = false;
 	bool queued;
+	bool source_changed = false;
+	u32 generation;
 	int ret;
 
 	mutex_lock(&battmgr->oneplus_lock);
@@ -6025,20 +6126,30 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 		battmgr->oneplus_dual_auto_last_rc = ret;
 		goto out_unlock;
 	}
+	generation = qcom_battmgr_caihong_source_generation();
+	if (generation != battmgr->oneplus_dual_auto_source_generation) {
+		battmgr->oneplus_dual_auto_source_generation = generation;
+		battmgr->oneplus_dual_auto_cap_known = false;
+		battmgr->oneplus_dual_auto_pps_available = false;
+		battmgr->oneplus_dual_auto_connected = false;
+		if (battmgr->oneplus_dual_auto_run) {
+			battmgr->oneplus_dual_auto_cancel_requested = true;
+			if (battmgr->oneplus_dual_running &&
+			    !battmgr->oneplus_dual_stop_requested) {
+				battmgr->oneplus_dual_stop_requested = true;
+				battmgr->oneplus_dual_auto_stops++;
+				stop = true;
+			}
+		}
+		battmgr->oneplus_dual_auto_armed = true;
+		source_changed = true;
+	}
 	if (!battmgr->oneplus_dual_auto_run &&
 	    (battmgr->oneplus_dual_auto_last_rc == -EHOSTDOWN ||
 	     battmgr->oneplus_dual_auto_last_rc == -EINPROGRESS))
 		battmgr->oneplus_dual_auto_last_rc = 0;
 
 	if (!connected) {
-		/*
-		 * Remember even a short loss of the physical input.  The debounce
-		 * below still gates tearing down a running session, but a cable
-		 * that is out for less than the debounce window must not be
-		 * forgotten: otherwise replugging the same adapter leaves the
-		 * watcher armed=false and no PPS session ever starts again.
-		 */
-		battmgr->oneplus_dual_auto_detach_seen = true;
 		if (battmgr->oneplus_dual_auto_offline_checks <
 		    BATTMGR_ONEPLUS_DUAL_AUTO_OFFLINE_CHECKS)
 			battmgr->oneplus_dual_auto_offline_checks++;
@@ -6069,27 +6180,26 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 		goto out_unlock;
 	}
 	battmgr->oneplus_dual_auto_offline_checks = 0;
-	if (battmgr->oneplus_dual_auto_detach_seen) {
-		/*
-		 * Only reinterpret the edge as a fresh attach when nothing owns
-		 * the controller; otherwise keep the flag set so the arming still
-		 * happens on the first idle tick after the old session unwinds.
-		 * At boot the source has not enumerated yet, so the early
-		 * "offline" samples must not arm a second start while a
-		 * continuous session is already running: that produced a
-		 * permanent "controller busy" retry loop.
-		 */
-		if (!battmgr->oneplus_dual_auto_run &&
-		    !battmgr->oneplus_dual_running &&
-		    !battmgr->oneplus_secondary_running &&
-		    !battmgr->oneplus_policy_running &&
-		    !battmgr->oneplus_pps_5m_running) {
-			battmgr->oneplus_dual_auto_detach_seen = false;
-			battmgr->oneplus_dual_auto_connected = false;
-			battmgr->oneplus_dual_auto_armed = true;
+	if (!battmgr->oneplus_dual_auto_run &&
+	    !battmgr->oneplus_dual_running &&
+	    !battmgr->oneplus_secondary_running &&
+	    !battmgr->oneplus_policy_running &&
+	    !battmgr->oneplus_pps_5m_running) {
+		ret = qcom_battmgr_oneplus_dual_auto_pps_ready_locked(battmgr);
+		if (ret >= 0) {
+			if (battmgr->oneplus_dual_auto_cap_known &&
+			    battmgr->oneplus_dual_auto_pps_available != !!ret) {
+				battmgr->oneplus_dual_auto_connected = false;
+				battmgr->oneplus_dual_auto_armed = true;
+				source_changed = true;
+				dev_info(battmgr->dev,
+					 "charger capability changed: PPS %u -> %u; rearming protocol selection\n",
+					 battmgr->oneplus_dual_auto_pps_available, !!ret);
+			}
+			battmgr->oneplus_dual_auto_cap_known = true;
+			battmgr->oneplus_dual_auto_pps_available = !!ret;
 		}
 	}
-
 	if (!battmgr->oneplus_dual_auto_connected &&
 	    battmgr->oneplus_dual_auto_armed) {
 		battmgr->oneplus_dual_auto_armed = false;
@@ -6098,7 +6208,6 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 		    battmgr->oneplus_secondary_running ||
 		    battmgr->oneplus_policy_running ||
 		    battmgr->oneplus_pps_5m_running) {
-			battmgr->oneplus_dual_auto_last_rc = -EBUSY;
 			/* A VOOC probe or another one-shot policy can own the
 			 * controller at plug-in.  Keep the request armed so the
 			 * next watcher tick can start PPS once it is free. */
@@ -6107,6 +6216,11 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 			if (battmgr->oneplus_dual_auto_last_rc != -EBUSY)
 				dev_info(battmgr->dev,
 					 "automatic PPS dual start deferred: controller busy\n");
+			battmgr->oneplus_dual_auto_last_rc = -EBUSY;
+		} else if (!battmgr->oneplus_dual_auto_pps_available ||
+			   !qcom_battmgr_caihong_pps_allowed()) {
+			battmgr->oneplus_dual_auto_armed = true;
+			deferred = true;
 		} else if (qcom_battmgr_oneplus_dual_auto_pack_satisfied(battmgr)) {
 			/*
 			 * At a full or charge-terminated pack the pumps refuse the
@@ -6124,6 +6238,7 @@ static void qcom_battmgr_oneplus_dual_auto_watch_worker(
 			battmgr->oneplus_dual_auto_cancel_requested = false;
 			battmgr->oneplus_dual_auto_windows_started = 0;
 			battmgr->oneplus_dual_auto_windows_completed = 0;
+			battmgr->oneplus_dual_auto_retries = 0;
 			battmgr->oneplus_dual_auto_full_stop = false;
 			queued = queue_work(system_long_wq,
 				&battmgr->oneplus_dual_auto_run_work);
@@ -6146,6 +6261,8 @@ out_unlock:
 	mutex_unlock(&battmgr->oneplus_lock);
 	if (service_recovered)
 		schedule_work(&battmgr->enable_work);
+	if (source_changed)
+		power_supply_changed(battmgr->usb_psy);
 	if (stop)
 		qcom_battmgr_oneplus_dual_request_stop(battmgr);
 	if (reschedule && READ_ONCE(battmgr->oneplus_dual_auto_enabled))
@@ -6230,13 +6347,13 @@ static ssize_t qcom_battmgr_oneplus_dual_auto_store(
 			battmgr->oneplus_dual_auto_connected = false;
 			battmgr->oneplus_dual_auto_cancel_requested = false;
 			battmgr->oneplus_dual_auto_full_stop = false;
-			battmgr->oneplus_dual_auto_detach_seen = false;
 			battmgr->oneplus_dual_auto_attempts = 0;
 			battmgr->oneplus_dual_auto_starts = 0;
 			battmgr->oneplus_dual_auto_stops = 0;
 			battmgr->oneplus_dual_auto_offline_checks = 0;
 			battmgr->oneplus_dual_auto_windows_started = 0;
 			battmgr->oneplus_dual_auto_windows_completed = 0;
+			battmgr->oneplus_dual_auto_retries = 0;
 			if (battmgr->service_up)
 				ret = qcom_battmgr_oneplus_dual_auto_connected_locked(
 					battmgr, &connected);
@@ -6309,6 +6426,8 @@ static ssize_t oneplus_pps_dual_auto_continuous_store(
 		battmgr, enable, true, count);
 }
 static DEVICE_ATTR_RW(oneplus_pps_dual_auto_continuous);
+
+#include "qcom_battmgr_caihong_pd.inc"
 
 static void qcom_battmgr_oneplus_policy_worker(struct work_struct *work)
 {
@@ -6820,15 +6939,50 @@ static bool qcom_battmgr_caihong_handle_response(struct qcom_battmgr *battmgr,
 						  const void *data, size_t len)
 {
 	const struct qcom_battmgr_message *resp = data;
-	u32 opcode = le32_to_cpu(resp->hdr.opcode);
+	u32 opcode;
 	u32 notification;
 	u32 property;
 	u32 result;
 	size_t payload_len;
 
+	if (len < sizeof(resp->hdr))
+		return false;
+	opcode = le32_to_cpu(resp->hdr.opcode);
+
+	if (opcode == BATTMGR_USB_PROPERTY_GET &&
+	    battmgr->oneplus_charge_control &&
+	    len >= sizeof(resp->hdr) + sizeof(resp->intval.property) &&
+	    (le32_to_cpu(resp->intval.property) == USB_ADAP_TYPE ||
+	     le32_to_cpu(resp->intval.property) == BATTMGR_ONEPLUS_USB_IN_STATUS)) {
+		payload_len = len - sizeof(resp->hdr);
+		if (payload_len != sizeof(resp->intval)) {
+			battmgr->error = -EMSGSIZE;
+		} else if (le32_to_cpu(resp->intval.result)) {
+			battmgr->error = -EREMOTEIO;
+		} else {
+			if (le32_to_cpu(resp->intval.property) == USB_ADAP_TYPE) {
+				battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
+			} else {
+				battmgr->oneplus_usb_in_status = le32_to_cpu(resp->intval.value);
+				caihong_protocol_input(!!(battmgr->oneplus_usb_in_status & 0xff));
+			}
+			battmgr->error = 0;
+		}
+		goto out_complete;
+	}
+
 	if (opcode == BATTMGR_ONEPLUS_PPS_READ_BUFFER &&
 	    battmgr->oneplus_pps_read_buffer) {
 		qcom_battmgr_caihong_pps_callback(battmgr, data, len);
+		return true;
+	}
+
+	if (opcode == BATTMGR_NOTIFICATION && battmgr->oneplus_charge_control &&
+	    len == sizeof(resp->hdr) + sizeof(resp->notification) &&
+	    le32_to_cpu(resp->notification) == BATTMGR_ONEPLUS_NOTIFY_PD_SVOOC) {
+		caihong_protocol_pd_svooc();
+		dev_info(battmgr->dev, "PD-SVOOC adapter identified by firmware\n");
+		power_supply_changed(battmgr->usb_psy);
 		return true;
 	}
 
@@ -6840,12 +6994,14 @@ static bool qcom_battmgr_caihong_handle_response(struct qcom_battmgr *battmgr,
 		notification = le32_to_cpu(resp->notification) & 0xff;
 		switch (notification) {
 		case BATTMGR_ONEPLUS_NOTIFY_OTG_ENABLE:
+			caihong_protocol_reset(true);
 			battmgr->oneplus_otg_enable_events++;
 			WRITE_ONCE(battmgr->oneplus_otg_vbus_requested, true);
 			mod_delayed_work(system_wq,
 					 &battmgr->oneplus_otg_event_work, 0);
 			break;
 		case BATTMGR_ONEPLUS_NOTIFY_OTG_DISABLE:
+			caihong_protocol_reset(false);
 			battmgr->oneplus_otg_disable_events++;
 			WRITE_ONCE(battmgr->oneplus_otg_vbus_requested, false);
 			mod_delayed_work(system_wq,
@@ -6874,7 +7030,6 @@ static bool qcom_battmgr_caihong_handle_response(struct qcom_battmgr *battmgr,
 		return false;
 
 	payload_len = len - sizeof(struct pmic_glink_hdr);
-	property = le32_to_cpu(resp->intval.property);
 	if (payload_len != sizeof(resp->intval)) {
 		dev_warn(battmgr->dev,
 			 "invalid OnePlus SET response length for %#x: %zd\n",
@@ -6882,6 +7037,7 @@ static bool qcom_battmgr_caihong_handle_response(struct qcom_battmgr *battmgr,
 		battmgr->error = -EMSGSIZE;
 		goto out_complete;
 	}
+	property = le32_to_cpu(resp->intval.property);
 
 	if (!battmgr->oneplus_ext_pending ||
 	    opcode != battmgr->oneplus_ext_opcode ||
@@ -6918,6 +7074,8 @@ static void qcom_battmgr_caihong_notifications_ready(
 static void qcom_battmgr_caihong_service_event(struct qcom_battmgr *battmgr,
 						bool service_up)
 {
+	if (!service_up && READ_ONCE(battmgr->oneplus_charge_control))
+		caihong_protocol_reset(false);
 	if (READ_ONCE(battmgr->oneplus_charge_control)) {
 		WRITE_ONCE(battmgr->oneplus_charge_dirty, true);
 		mod_delayed_work(system_freezable_wq, &battmgr->oneplus_charge_work, 0);
@@ -7136,6 +7294,10 @@ static int qcom_battmgr_caihong_register(struct qcom_battmgr *battmgr)
 	CAIHONG_ADD_GROUP(battmgr->oneplus_ffc_policy,
 			  &qcom_battmgr_oneplus_ffc_group,
 			  "OnePlus FFC policy");
+	CAIHONG_ADD_GROUP(battmgr->oneplus_charge_control &&
+			  battmgr->oneplus_pps_read_buffer && caihong_pd_fixed_test,
+			  &qcom_battmgr_oneplus_pd_fixed_test_group,
+			  "OnePlus fixed PD test");
 
 #undef CAIHONG_ADD_GROUP
 

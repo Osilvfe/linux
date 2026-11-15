@@ -46,6 +46,12 @@ static inline int qcom_battmgr_caihong_update_battery_property(
 	return -EOPNOTSUPP;
 }
 
+static inline int qcom_battmgr_caihong_update_usb_property(
+	struct qcom_battmgr *battmgr, enum power_supply_property psp)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline void qcom_battmgr_caihong_cache_vbat(
 	struct qcom_battmgr *battmgr, u32 val)
 {

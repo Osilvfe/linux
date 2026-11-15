@@ -434,6 +434,8 @@ struct sc8547_device {
 	bool vooc_cable_online;
 	bool vooc_cable_state_known;
 	bool vooc_source_blocked;
+	u32 vooc_source_generation;
+	bool vooc_cleanup_failed;
 	bool vooc_charge_inhibited;
 	u8 vooc_cable_absent_count;
 	u8 vooc_active_current_code;
@@ -1427,10 +1429,20 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 	atomic_set(&sc->policy_cancel, 0);
 
 	ret = sc8547_prepare_vendor_pps_startup(sc, &touched);
-	if (!ret)
+	if (!ret) {
 		sc->pps_prepared = true;
-	else if (touched)
+		/*
+		 * PPS now owns the input path.  A VOOC probe queued by the
+		 * attach edge would suspend the port for 1.5 s and cancel this
+		 * session, so drop the pending request; the cable watcher
+		 * re-arms it after a real detach.
+		 */
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		sc->vooc_auto_retry_count = 0;
+		cancel_delayed_work(&sc->vooc_retry_work);
+	} else if (touched) {
 		sc8547_restore_idle_profile(sc);
+	}
 out:
 	mutex_unlock(&sc->lock);
 	return ret;
@@ -2588,13 +2600,14 @@ static int sc8547_vooc_check_usb_source(void)
 	case POWER_SUPPLY_USB_TYPE_C:
 		return -EBUSY;
 	case POWER_SUPPLY_USB_TYPE_DCP:
+	case POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID:
+		return 0;
 	case POWER_SUPPLY_USB_TYPE_PD:
 	case POWER_SUPPLY_USB_TYPE_PD_DRP:
 	case POWER_SUPPLY_USB_TYPE_PD_PPS:
 	case POWER_SUPPLY_USB_TYPE_PD_SPR_AVS:
 	case POWER_SUPPLY_USB_TYPE_PD_PPS_SPR_AVS:
-	case POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID:
-		return 0;
+		return qcom_battmgr_caihong_vooc_pd_allowed();
 	default:
 		return -EAGAIN;
 	}
@@ -2671,6 +2684,7 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 	saved_reg07 = reg;
 	if (reg & SC8547_CHG_EN)
 	{
+		sc->vooc_cleanup_failed = true;
 		ret = -EBUSY;
 		goto out_qos;
 	}
@@ -2899,6 +2913,11 @@ static int sc8547_vooc_session(struct sc8547_device *sc)
 	ret = -ETIMEDOUT;
 	start = ktime_get();
 	while (elapsed_us < timeout_us) {
+		if (continuous_session && sc->vooc_source_generation !=
+		    qcom_battmgr_caihong_source_generation()) {
+			ret = -ENODEV;
+			break;
+		}
 		if (atomic_read(&sc->policy_cancel)) {
 			ret = -ECANCELED;
 			break;
@@ -3553,6 +3572,8 @@ sample_adc:
 
 out_cleanup:
 	secondary_disable_ret = sc8547_vooc_secondary_disable(&secondary_state);
+	if (secondary_disable_ret)
+		sc->vooc_cleanup_failed = true;
 	if (secondary_disable_ret) {
 		if (!ret)
 			ret = secondary_disable_ret;
@@ -3561,6 +3582,8 @@ out_cleanup:
 		int cp_disable_ret;
 
 		cp_disable_ret = sc8547_set_charge_enabled(sc, false);
+		if (cp_disable_ret)
+			sc->vooc_cleanup_failed = true;
 		if (cp_disable_ret)
 			dev_warn(sc->dev,
 				 "VOOC CP disable during cleanup failed: %d\n",
@@ -3586,6 +3609,8 @@ out_cleanup:
 	if (cleanup_ret && !ret)
 		ret = cleanup_ret;
 	if (cleanup_ret)
+		sc->vooc_cleanup_failed = true;
+	if (cleanup_ret)
 		dev_warn(sc->dev, "VOOC session cleanup failed: %d\n", cleanup_ret);
 	restore_ret = 0;
 	/* Reset may change the low control bits; preserve the idle baseline. */
@@ -3593,6 +3618,8 @@ out_cleanup:
 					 saved_reg07);
 	if (reg07_restore_ret && !ret)
 		ret = reg07_restore_ret;
+	if (reg07_restore_ret)
+		sc->vooc_cleanup_failed = true;
 	if (reg07_restore_ret)
 		dev_warn(sc->dev, "VOOC charge control restore failed: %d\n",
 			 reg07_restore_ret);
@@ -3616,6 +3643,8 @@ out_cleanup:
 	if (restore_ret && !ret)
 		ret = restore_ret;
 	if (restore_ret)
+		sc->vooc_cleanup_failed = true;
+	if (restore_ret)
 		dev_warn(sc->dev, "VOOC fast config restore failed: %d\n",
 			 restore_ret);
 	/* REG09 and REG3B are also touched for the vendor PHY setup. */
@@ -3632,6 +3661,8 @@ out_cleanup:
 		ret = restore_ret;
 	if (restore_ret)
 		dev_warn(sc->dev, "VOOC PHY setup restore failed: %d\n", restore_ret);
+	if (restore_ret)
+		sc->vooc_cleanup_failed = true;
 	if (charger_suspended && usb_psy) {
 		union power_supply_propval pval = {
 			/* Remove the vendor WIRED_CHARGE_SUSPEND vote. */
@@ -3643,6 +3674,8 @@ out_cleanup:
 				POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &pval);
 		if (unsuspend_ret && !ret)
 			ret = unsuspend_ret;
+		if (unsuspend_ret)
+			sc->vooc_cleanup_failed = true;
 		if (unsuspend_ret)
 			dev_warn(sc->dev,
 				 "USB input limit restore failed: %d\n", unsuspend_ret);
@@ -3680,6 +3713,8 @@ out_cleanup:
 	}
 	if (cleanup_vbus_uv > SC8547_VOOC_MAX_VBUS_UV && !ret)
 		ret = -EOVERFLOW;
+	if (cleanup_vbus_uv > SC8547_VOOC_MAX_VBUS_UV)
+		sc->vooc_cleanup_failed = true;
 
 	if (ret == -EOVERFLOW)
 		dev_warn(sc->dev,
@@ -3712,7 +3747,6 @@ static int sc8547_vooc_usb_online(void)
 
 	return val.intval ? 1 : 0;
 }
-
 /*
  * The vendor WIRED_CHARGE_SUSPEND vote is also used to restart an adapter
  * which is still waiting in its previous VOOC state.  A direct PHY reset is
@@ -3785,6 +3819,7 @@ static int sc8547_vooc_restart_adapter(struct sc8547_device *sc)
 			dev_warn(sc->dev,
 				 "VOOC USB restart restore failed: remove=%d fallback=%d\n",
 				restore_ret, fallback_ret);
+			sc->vooc_cleanup_failed = true;
 			ret = restore_ret;
 		}
 	} else {
@@ -3822,11 +3857,18 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	bool dpdm_normalized = false;
 	bool dpdm_preselected = false;
 	bool session_started = false;
+	u32 protocol_generation;
 
 	if (!READ_ONCE(sc->vooc_auto_retry))
 		return;
 	if (atomic_cmpxchg(&sc->vooc_retry_running, 0, 1))
 		return;
+	if (sc->vooc_source_generation !=
+	    qcom_battmgr_caihong_source_generation()) {
+		atomic_set(&sc->vooc_retry_running, 0);
+		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work, 0);
+		return;
+	}
 
 	ret = sc8547_vooc_check_usb_source();
 	if (ret) {
@@ -3835,6 +3877,8 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 		atomic_set(&sc->vooc_retry_running, 0);
 		if (ret == -EBUSY)
 			dev_info(sc->dev, "VOOC skipped: USB data port\n");
+		if (ret == -EBUSY)
+			qcom_battmgr_caihong_vooc_skip(sc->vooc_source_generation);
 		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
 				 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
 		return;
@@ -3902,14 +3946,41 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	/* The vendor recovery path first returns the USB switch to normal mode,
 	 * then cycles the input suspend vote, waits for the adapter MCU to leave its
 	 * previous VOOC state, and only afterwards re-arms the VOOC PHY. */
+	ret = qcom_battmgr_caihong_protocol_claim(CAIHONG_CHARGE_VOOC,
+						  &protocol_generation);
+	if (ret) {
+		if (ret == -EBUSY || ret == -EAGAIN)
+			sc8547_queue_vooc_retry(sc,
+						msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+		else
+			WRITE_ONCE(sc->vooc_auto_retry, false);
+		mutex_unlock(&sc->lock);
+		atomic_set(&sc->vooc_retry_running, 0);
+		return;
+	}
+	sc->vooc_cleanup_failed = false;
+	if (protocol_generation != sc->vooc_source_generation) {
+		qcom_battmgr_caihong_protocol_release(CAIHONG_CHARGE_VOOC,
+						      protocol_generation, true, true);
+		mutex_unlock(&sc->lock);
+		atomic_set(&sc->vooc_retry_running, 0);
+		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work, 0);
+		return;
+	}
 	ret = wcd939x_usbss_set_vooc_dpdm(false);
+	if (ret)
+		sc->vooc_cleanup_failed = true;
 	if (!ret) {
 		dpdm_normalized = true;
-		msleep(SC8547_VOOC_REACTIVE_SETTLE_MS);
-		ret = sc8547_vooc_restart_adapter(sc);
+		if (sc->vooc_auto_retry_count || sc->vooc_recovery_retry_count) {
+			msleep(SC8547_VOOC_REACTIVE_SETTLE_MS);
+			ret = sc8547_vooc_restart_adapter(sc);
+		}
 	}
 	if (!ret)
 		ret = sc8547_vooc_check_usb_source();
+	if (!ret && protocol_generation != qcom_battmgr_caihong_source_generation())
+		ret = -ENODEV;
 	if (!ret) {
 		/* The board's USBSS needs the VOOC analog path selected before the
 		 * SC8547 PHY reset to generate the adapter's first frame.  This is
@@ -3920,7 +3991,8 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 			dpdm_preselected = true;
 	}
 	if (!ret && (!READ_ONCE(sc->vooc_auto_retry) ||
-		     atomic_read(&sc->policy_cancel)))
+		     atomic_read(&sc->policy_cancel) ||
+		     protocol_generation != qcom_battmgr_caihong_source_generation()))
 		ret = -ECANCELED;
 	if (!ret) {
 		session_started = true;
@@ -3929,14 +4001,18 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 	}
 	if (session_started && sc->vooc_last_rx_count)
 		sc->vooc_session_rx_seen = true;
-	if ((dpdm_normalized || dpdm_preselected) && !session_started)
-		wcd939x_usbss_set_vooc_dpdm(false);
+	if ((dpdm_normalized || dpdm_preselected) &&
+	    wcd939x_usbss_set_vooc_dpdm(false))
+		sc->vooc_cleanup_failed = true;
 	retry_max = ret == -EAGAIN ? SC8547_VOOC_PRE_MODEL_RETRY_MAX :
 		SC8547_VOOC_AUTO_RETRY_MAX;
 	retry_delay_ms = ret == -EAGAIN ?
 		SC8547_VOOC_PRE_MODEL_RETRY_DELAY_MS :
 		SC8547_VOOC_AUTO_RETRY_DELAY_MS;
-	if (ret == -ECANCELED && !READ_ONCE(sc->vooc_auto_retry)) {
+	if (sc->vooc_cleanup_failed) {
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		dev_err(sc->dev, "VOOC cleanup unsafe; protocol fallback blocked\n");
+	} else if (ret == -ECANCELED && !READ_ONCE(sc->vooc_auto_retry)) {
 		sc->vooc_auto_retry_count = 0;
 		dev_info(sc->dev, "VOOC automatic session cancelled by request\n");
 	} else if (!ret) {
@@ -4000,6 +4076,12 @@ static void sc8547_vooc_retry_workfn(struct work_struct *work)
 		WRITE_ONCE(sc->vooc_auto_retry, false);
 		sc->vooc_auto_retry_count = 0;
 	}
+	qcom_battmgr_caihong_protocol_release(CAIHONG_CHARGE_VOOC,
+					      protocol_generation,
+		READ_ONCE(sc->vooc_auto_retry) || sc->vooc_policy_full ||
+		ret == -EALREADY || ret == -ECANCELED || ret == -EOVERFLOW ||
+		ret == -ERANGE,
+		!sc->vooc_cleanup_failed);
 	mutex_unlock(&sc->lock);
 	atomic_set(&sc->vooc_retry_running, 0);
 }
@@ -4010,9 +4092,11 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 						struct sc8547_device, vooc_cable_work);
 	bool was_online = READ_ONCE(sc->vooc_cable_online);
 	bool initial_check = !READ_ONCE(sc->vooc_cable_state_known);
+	u32 generation = qcom_battmgr_caihong_source_generation();
 	unsigned long retry_delay;
 	int online;
 	int vbus_uv;
+	int present;
 	int ret;
 
 	if (sc8547_charge_is_inhibited()) {
@@ -4027,6 +4111,10 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		was_online = false;
 	}
 
+	present = qcom_battmgr_caihong_source_present();
+	if (present < 0 && present != -EOPNOTSUPP)
+		goto recheck;
+	generation = qcom_battmgr_caihong_source_generation();
 	online = sc8547_vooc_usb_online();
 	vbus_uv = sc8547_get_vbus_uv(sc);
 	if (online < 0 && vbus_uv < 0) {
@@ -4036,10 +4124,8 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	}
 	WRITE_ONCE(sc->vooc_cable_state_known, true);
 
-	/* battmgr intentionally reports offline while the USB buck input is
-	 * suspended for VOOC.  A live SC8547 VBUS distinguishes that transition
-	 * from a physical cable removal. */
-	if (online <= 0 && vbus_uv < SC8547_VOOC_CABLE_PRESENT_UV) {
+	if (!present || (present == -EOPNOTSUPP && online <= 0 &&
+			 vbus_uv >= 0 && vbus_uv < SC8547_VOOC_CABLE_PRESENT_UV)) {
 		/*
 		 * A PPS session owns the input path.  Firmware and VBUS both drop
 		 * while the source is being retargeted, and cancelling the session
@@ -4104,21 +4190,29 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		if (ret == -EBUSY && !READ_ONCE(sc->vooc_source_blocked))
 			dev_info(sc->dev, "VOOC skipped: USB data port\n");
 		WRITE_ONCE(sc->vooc_source_blocked, true);
+		if (ret == -EBUSY)
+			qcom_battmgr_caihong_vooc_skip(generation);
 		WRITE_ONCE(sc->vooc_auto_retry, false);
 		cancel_delayed_work(&sc->vooc_retry_work);
 		if (READ_ONCE(sc->vooc_initialized))
 			atomic_set(&sc->policy_cancel, 1);
-		if (ret != -EBUSY)
-			mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
-					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+				 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
 		return;
 	}
 	if (READ_ONCE(sc->vooc_source_blocked)) {
 		WRITE_ONCE(sc->vooc_source_blocked, false);
 		was_online = false;
 	}
-	if (was_online)
-		return;
+	if (atomic_read(&sc->vooc_retry_running) ||
+	    READ_ONCE(sc->vooc_initialized) ||
+	    atomic_read(&sc->pps_running) || READ_ONCE(sc->pps_prepared))
+		goto recheck;
+	if (was_online && sc->vooc_source_generation == generation)
+		goto recheck;
+	if (!initial_check && sc->vooc_source_generation == generation)
+		generation = qcom_battmgr_caihong_source_changed(generation);
+	sc->vooc_source_generation = generation;
 
 	sc8547_vooc_reset_curve(sc);
 	atomic_set(&sc->policy_cancel, 0);
@@ -4134,6 +4228,9 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		 jiffies_to_msecs(retry_delay),
 		 online, vbus_uv);
 	sc8547_queue_vooc_retry(sc, retry_delay);
+recheck:
+	mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+			 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
 }
 
 static int sc8547_vooc_psy_notifier(struct notifier_block *nb,
@@ -5249,7 +5346,11 @@ static int sc8547_resume(struct device *dev)
 	mutex_lock(&sc->psy_lock);
 	sc->suspended = false;
 	mutex_unlock(&sc->psy_lock);
-	if (!sc->vooc_capable || !sc->vooc_resume_retry)
+	if (!sc->vooc_capable)
+		return 0;
+	mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
+			 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+	if (!sc->vooc_resume_retry)
 		return 0;
 
 	sc->vooc_resume_retry = false;

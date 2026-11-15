@@ -1009,6 +1009,10 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
 	unsigned int prop;
 	int ret;
 
+	ret = qcom_battmgr_caihong_update_usb_property(battmgr, psp);
+	if (ret != -EOPNOTSUPP)
+		return ret;
+
 	if (psp >= ARRAY_SIZE(sm8350_usb_prop_map))
 		return -EINVAL;
 
