@@ -157,6 +157,7 @@ struct gunyah_vm {
 		struct gunyah_vm_parcel parcel;
 	} fw;
 	struct xarray boot_context;
+	struct gunyah_vm_parcel *shared_parcels;
 };
 
 int gunyah_vm_mmio_write(struct gunyah_vm *ghvm, u64 addr, u32 len, u64 data);

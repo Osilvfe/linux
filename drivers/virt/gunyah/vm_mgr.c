@@ -102,6 +102,10 @@ static long gunyah_vm_set_auth_type(struct gunyah_vm *ghvm,
 {
 	struct gunyah_auth_vm_mgr *auth_vm;
 
+	guard(rwsem_write)(&ghvm->status_lock);
+	if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE)
+		return -EBUSY;
+
 	auth_vm = gunyah_get_auth_vm_mgr(auth_desc->type);
 	if (IS_ERR(auth_vm))
 		return PTR_ERR(auth_vm);
@@ -151,6 +155,12 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 			ret = -EACCES;
 			goto unlock;
 		}
+		if (b->share_type != VM_MEM_LEND) {
+			dev_warn(ghvm->parent,
+				 "Legacy RM requires a lent configuration image\n");
+			ret = -EOPNOTSUPP;
+			goto unlock;
+		}
 		dtb_offset = ghvm->dtb.config.guest_phys_addr - b->guest_phys_addr;
 		if (dtb_offset >= b->size ||
 		    ghvm->dtb.config.size > b->size - dtb_offset) {
@@ -158,8 +168,17 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 			goto unlock;
 		}
 		mt_for_each(&ghvm->bindings, other, index, ULONG_MAX) {
-			if (other != b) {
+			if (other == b)
+				continue;
+			if (other->mem_type != VM_MEM_USER ||
+			    other->share_type != VM_MEM_SHARE) {
 				ret = -EOPNOTSUPP;
+				goto unlock;
+			}
+			if ((other->flags & (GUNYAH_MEM_ALLOW_READ |
+					     GUNYAH_MEM_ALLOW_WRITE)) !=
+			    (GUNYAH_MEM_ALLOW_READ | GUNYAH_MEM_ALLOW_WRITE)) {
+				ret = -EACCES;
 				goto unlock;
 			}
 		}
@@ -202,7 +221,8 @@ static int gunyah_generic_pre_vm_init(struct gunyah_vm *ghvm)
 	int ret;
 
 	if (!gunyah_rm_has_demand_paging(ghvm->rm))
-		return 0;
+		return gunyah_share_range_as_parcels(ghvm, 0, ULONG_MAX,
+						     &ghvm->shared_parcels);
 
 	ret = gunyah_setup_demand_paging(ghvm, 0, ULONG_MAX);
 	if (ret) {
@@ -1058,12 +1078,17 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 	switch (cmd) {
 	case GUNYAH_VM_SET_DTB_CONFIG: {
 		struct gunyah_vm_dtb_config dtb_config;
+		u64 end;
+
+		guard(rwsem_write)(&ghvm->status_lock);
+		if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE)
+			return -EBUSY;
 
 		if (copy_from_user(&dtb_config, argp, sizeof(dtb_config)))
 			return -EFAULT;
 
-		if (overflows_type(dtb_config.guest_phys_addr + dtb_config.size,
-				   u64))
+		if (check_add_overflow(dtb_config.guest_phys_addr,
+				       dtb_config.size, &end))
 			return -EOVERFLOW;
 
 		ghvm->dtb.config = dtb_config;
@@ -1073,12 +1098,17 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 	}
 	case GH_VM_ANDROID_SET_FW_CONFIG: {
 		struct gunyah_vm_firmware_config fw_config;
+		u64 end;
+
+		guard(rwsem_write)(&ghvm->status_lock);
+		if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE)
+			return -EBUSY;
 
 		if (copy_from_user(&fw_config, argp, sizeof(fw_config)))
 			return -EFAULT;
 
-		if (overflows_type(fw_config.guest_phys_addr + fw_config.size,
-							u64))
+		if (check_add_overflow(fw_config.guest_phys_addr,
+				       fw_config.size, &end))
 			return -EOVERFLOW;
 
 		ghvm->fw.config = fw_config;
@@ -1260,6 +1290,7 @@ static void _gunyah_vm_put(struct kref *kref)
 	}
 
 	WARN_ON(gunyah_reclaim_parcels(ghvm, 0, ULONG_MAX));
+	kfree(ghvm->shared_parcels);
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
 		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));

@@ -216,11 +216,16 @@ int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 	loff_t max_size;
 	int ret = 0;
 
+	guard(rwsem_read)(&ghvm->status_lock);
+	if (!gunyah_rm_has_demand_paging(ghvm->rm) &&
+	    ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE)
+		return -EBUSY;
+
 	if (!cma_map->size || !PAGE_ALIGNED(cma_map->size) ||
 		!PAGE_ALIGNED(cma_map->guest_addr))
 		return -EINVAL;
 
-	if (overflows_type(cma_map->guest_addr + cma_map->size, u64))
+	if (check_add_overflow(cma_map->guest_addr, cma_map->size, &end))
 		return -EOVERFLOW;
 
 	/*
