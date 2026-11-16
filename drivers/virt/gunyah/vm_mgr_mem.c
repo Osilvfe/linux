@@ -608,7 +608,7 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	}
 	parcel->n_mem_entries = entries;
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
-	if (ret)
+	if (ret && parcel->mem_handle == GUNYAH_MEM_HANDLE_INVAL)
 		goto free_mem_entries;
 
 	retained = 0;
@@ -726,8 +726,10 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 	goto unlock;
 
 free_acl:
-	kfree(parcel->acl_entries);
-	parcel->acl_entries = NULL;
+	if (b->vm_parcel != vm_parcel) {
+		kfree(parcel->acl_entries);
+		parcel->acl_entries = NULL;
+	}
 unlock:
 	up_write(&ghvm->bindings_lock);
 	return ret;
@@ -902,6 +904,8 @@ int gunyah_share_range_as_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
 		if (ret) {
 			dev_err(ghvm->parent, "Failed to share parcel of %llx: %d\n",
 								parcel_start, ret);
+			if (b->vm_parcel == &(*parcels)[count])
+				count++;
 			goto rollback;
 		}
 		count++;

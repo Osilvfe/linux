@@ -396,6 +396,7 @@ static void gunyah_rm_process_reply(struct gunyah_rm *rm, const void *msg,
 	const struct gunyah_rm_rpc_reply_hdr *reply_hdr = msg;
 	struct gunyah_rm_message *message;
 	u16 seq_id;
+	int ret;
 
 	seq_id = le16_to_cpu(reply_hdr->hdr.seq);
 	message = xa_load(&rm->call_xarray, seq_id);
@@ -415,15 +416,20 @@ static void gunyah_rm_process_reply(struct gunyah_rm *rm, const void *msg,
 
 	if (rm->active_rx_message) {
 		pr_err("Unexpected new reply, still processing an active message\n");
+		if (rm->active_rx_message == message) {
+			gunyah_rm_abort_message(rm);
+			return;
+		}
 		gunyah_rm_abort_message(rm);
 	}
 
-	if (gunyah_rm_init_message_payload(message, msg, sizeof(*reply_hdr),
-					   msg_size)) {
-		pr_err("Failed to alloc message buffer for sequence %d\n",
-			seq_id);
+	ret = gunyah_rm_init_message_payload(message, msg, sizeof(*reply_hdr),
+					     msg_size);
+	if (ret) {
+		pr_err("Failed to initialize reply for sequence %d: %d\n",
+		       seq_id, ret);
 		/* Send message complete and error the client. */
-		message->reply.ret = -ENOMEM;
+		message->reply.ret = ret;
 		gunyah_rm_complete_reply(rm, message);
 		return;
 	}
@@ -450,7 +456,9 @@ static void gunyah_rm_process_cont(struct gunyah_rm *rm,
 	 */
 	if (message->msg_id != le32_to_cpu(hdr->msg_id) ||
 	    message->num_fragments !=
-		    FIELD_GET(RM_RPC_FRAGMENTS_MASK, hdr->type)) {
+		    FIELD_GET(RM_RPC_FRAGMENTS_MASK, hdr->type) ||
+	    (message->type == RM_RPC_TYPE_REPLY &&
+	     message->reply.seq != le16_to_cpu(hdr->seq))) {
 		gunyah_rm_abort_message(rm);
 		return;
 	}

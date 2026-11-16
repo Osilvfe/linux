@@ -269,6 +269,8 @@ enum gunyah_rm_mem_type {
  * @mem_entries: An array of regions to be associated with the memory parcel. Addresses should be
  *               (intermediate) physical addresses from Linux's perspective.
  * @mem_handle: On success, filled with memory handle that RM allocates for this memory parcel
+ * @rm_reclaimed: RM has reclaimed the parcel, but platform cleanup may still be pending.
+ * @n_reclaimed_mem_entries: Number of leading platform memory ranges already reclaimed.
  */
 struct gunyah_rm_mem_parcel {
 	enum gunyah_rm_mem_type mem_type;
@@ -278,6 +280,8 @@ struct gunyah_rm_mem_parcel {
 	size_t n_mem_entries;
 	struct gunyah_rm_mem_entry *mem_entries;
 	u32 mem_handle;
+	bool rm_reclaimed;
+	size_t n_reclaimed_mem_entries;
 };
 
 enum gunyah_pagetable_access {

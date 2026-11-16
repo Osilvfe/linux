@@ -60,7 +60,7 @@ int gunyah_rm_platform_reclaim_demand_page(struct gunyah_rm *rm, u16 vmid,
 	int ret = 0;
 
 	down_read(&rm_platform_ops_lock);
-	if (rm_platform_ops && rm_platform_ops->pre_demand_page)
+	if (rm_platform_ops && rm_platform_ops->release_demand_page)
 		ret = rm_platform_ops->release_demand_page(rm, vmid, access,
 							   folio);
 	up_read(&rm_platform_ops_lock);

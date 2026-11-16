@@ -255,6 +255,8 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	if (!msg)
 		return -ENOMEM;
 
+	p->rm_reclaimed = false;
+	p->n_reclaimed_mem_entries = 0;
 	ret = gunyah_rm_platform_pre_mem_share(rm, p);
 	if (ret) {
 		kfree(msg);
@@ -298,10 +300,8 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 		ret = gunyah_rm_mem_append(
 			rm, p->mem_handle, &p->mem_entries[initial_mem_entries],
 			p->n_mem_entries - initial_mem_entries);
-		if (ret) {
-			gunyah_rm_mem_reclaim(rm, p);
+		if (ret && !gunyah_rm_mem_reclaim(rm, p))
 			p->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
-		}
 	}
 
 	return ret;
@@ -323,11 +323,13 @@ int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
 	};
 	int ret;
 
-	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_MEM_RECLAIM, &req, sizeof(req),
-			     NULL, NULL);
-	/* Only call platform mem reclaim hooks if we reclaimed the memory */
-	if (ret)
-		return ret;
+	if (!parcel->rm_reclaimed) {
+		ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_MEM_RECLAIM, &req,
+				     sizeof(req), NULL, NULL);
+		if (ret)
+			return ret;
+		parcel->rm_reclaimed = true;
+	}
 
 	return gunyah_rm_platform_post_mem_reclaim(rm, parcel);
 }

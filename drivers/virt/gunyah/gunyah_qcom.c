@@ -7,21 +7,83 @@
 #include <linux/gunyah.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/overflow.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
 
 #define QCOM_SCM_RM_MANAGED_VMID 0x3A
 #define QCOM_SCM_MAX_MANAGED_VMID 0x3F
 
+static int qcom_scm_gunyah_mem_entry_compare(const void *first, const void *second)
+{
+	const struct gunyah_rm_mem_entry *left = first, *right = second;
+	u64 left_addr = le64_to_cpu(left->phys_addr);
+	u64 right_addr = le64_to_cpu(right->phys_addr);
+
+	return (left_addr > right_addr) - (left_addr < right_addr);
+}
+
+static int qcom_scm_gunyah_mem_entries(struct gunyah_rm_mem_parcel *parcel,
+				       struct gunyah_rm_mem_entry **result,
+				       size_t *count)
+{
+	struct gunyah_rm_mem_entry *entries;
+	u64 address, size, end, previous_end = 0;
+	size_t index, retained = 0;
+	int ret = -EINVAL;
+
+	entries = kvmalloc_array(parcel->n_mem_entries, sizeof(*entries), GFP_KERNEL);
+	if (!entries)
+		return -ENOMEM;
+
+	memcpy(entries, parcel->mem_entries,
+	       array_size(parcel->n_mem_entries, sizeof(*entries)));
+	sort(entries, parcel->n_mem_entries, sizeof(*entries),
+	     qcom_scm_gunyah_mem_entry_compare, NULL);
+	for (index = 0; index < parcel->n_mem_entries; index++) {
+		address = le64_to_cpu(entries[index].phys_addr);
+		size = le64_to_cpu(entries[index].size);
+		if (!size)
+			goto free_entries;
+		if (check_add_overflow(address, size, &end)) {
+			ret = -EOVERFLOW;
+			goto free_entries;
+		}
+		if (retained && address < previous_end)
+			goto free_entries;
+		if (retained && address == previous_end)
+			entries[retained - 1].size =
+				cpu_to_le64(end - le64_to_cpu(entries[retained - 1].phys_addr));
+		else
+			entries[retained++] = entries[index];
+		previous_end = end;
+	}
+	*result = entries;
+	*count = retained;
+	return 0;
+
+free_entries:
+	kvfree(entries);
+	return ret;
+}
+
 static int
 qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 				 struct gunyah_rm_mem_parcel *mem_parcel)
 {
 	struct qcom_scm_vmperm *new_perms __free(kfree) = NULL;
+	struct gunyah_rm_mem_entry *mem_entries __free(kvfree) = NULL;
+	size_t n_mem_entries;
 	u64 src, src_cpy;
 	int ret = 0, i, n;
 	u16 vmid;
+
+	ret = qcom_scm_gunyah_mem_entries(mem_parcel, &mem_entries, &n_mem_entries);
+	if (ret)
+		return ret;
 
 	new_perms = kcalloc(mem_parcel->n_acl_entries, sizeof(*new_perms),
 			    GFP_KERNEL);
@@ -44,11 +106,11 @@ qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 
 	src = BIT_ULL(QCOM_SCM_VMID_HLOS);
 
-	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
+	for (i = 0; i < n_mem_entries; i++) {
 		src_cpy = src;
 		ret = qcom_scm_assign_mem(
-			le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
-			le64_to_cpu(mem_parcel->mem_entries[i].size), &src_cpy,
+			le64_to_cpu(mem_entries[i].phys_addr),
+			le64_to_cpu(mem_entries[i].size), &src_cpy,
 			new_perms, mem_parcel->n_acl_entries);
 		if (ret)
 			break;
@@ -74,8 +136,8 @@ qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 	for (i--; i >= 0; i--) {
 		src_cpy = src;
 		WARN_ON_ONCE(qcom_scm_assign_mem(
-			le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
-			le64_to_cpu(mem_parcel->mem_entries[i].size), &src_cpy,
+			le64_to_cpu(mem_entries[i].phys_addr),
+			le64_to_cpu(mem_entries[i].size), &src_cpy,
 			new_perms, 1));
 	}
 
@@ -87,9 +149,15 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 				    struct gunyah_rm_mem_parcel *mem_parcel)
 {
 	struct qcom_scm_vmperm new_perms;
+	struct gunyah_rm_mem_entry *mem_entries __free(kvfree) = NULL;
 	u64 src = 0, src_cpy;
-	int ret = 0, i, n;
+	size_t entry, n_mem_entries;
+	int ret, n;
 	u16 vmid;
+
+	ret = qcom_scm_gunyah_mem_entries(mem_parcel, &mem_entries, &n_mem_entries);
+	if (ret)
+		return ret;
 
 	new_perms.vmid = QCOM_SCM_VMID_HLOS;
 	new_perms.perm = QCOM_SCM_PERM_EXEC | QCOM_SCM_PERM_WRITE |
@@ -103,16 +171,20 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 			src |= (1ull << QCOM_SCM_RM_MANAGED_VMID);
 	}
 
-	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
+	for (entry = mem_parcel->n_reclaimed_mem_entries;
+	     entry < n_mem_entries; entry++) {
 		src_cpy = src;
 		ret = qcom_scm_assign_mem(
-			le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
-			le64_to_cpu(mem_parcel->mem_entries[i].size), &src_cpy,
+			le64_to_cpu(mem_entries[entry].phys_addr),
+			le64_to_cpu(mem_entries[entry].size), &src_cpy,
 			&new_perms, 1);
 		WARN_ON_ONCE(ret);
+		if (ret)
+			return ret;
+		mem_parcel->n_reclaimed_mem_entries = entry + 1;
 	}
 
-	return ret;
+	return 0;
 }
 
 static int
