@@ -35,6 +35,7 @@
 #define GUNYAH_EVENT_DESTROY_VM 1
 #define GUNYAH_VM_STATUS_TIMEOUT_MS 30000
 #define GUNYAH_VM_RECLAIM_ATTEMPTS 3
+#define GUNYAH_VM_STATE_RECOVERY_ATTEMPTS 3
 
 static DEFINE_XARRAY(gunyah_vm_functions);
 static DEFINE_XARRAY(gunyah_auth_vm_mgr);
@@ -1389,6 +1390,46 @@ unlock:
 	return 0;
 }
 
+static int gunyah_vm_recover_rm_state(struct gunyah_vm *ghvm)
+{
+	unsigned int attempt;
+	int ret;
+
+	for (attempt = 0; attempt < GUNYAH_VM_STATE_RECOVERY_ATTEMPTS;
+	     attempt++) {
+		switch (READ_ONCE(ghvm->vm_status)) {
+		case GUNYAH_RM_VM_STATUS_AUTH:
+			ret = gunyah_vm_authenticate(ghvm);
+			if (ret)
+				dev_warn(ghvm->parent,
+					 "Retry VM %u authentication for cleanup: %d\n",
+					 ghvm->vmid, ret);
+			break;
+		case GUNYAH_RM_VM_STATUS_INIT:
+			ret = gunyah_rm_vm_init(ghvm->rm, ghvm->vmid);
+			if (ret)
+				dev_warn(ghvm->parent,
+					 "Retry VM %u initialization for cleanup: %d\n",
+					 ghvm->vmid, ret);
+			break;
+		default:
+			return 0;
+		}
+
+		ret = gunyah_vm_refresh_rm_status(ghvm);
+		if (ret)
+			return ret;
+		if (READ_ONCE(ghvm->vm_status) != GUNYAH_RM_VM_STATUS_AUTH &&
+		    READ_ONCE(ghvm->vm_status) != GUNYAH_RM_VM_STATUS_INIT)
+			return 0;
+	}
+
+	dev_err(ghvm->parent,
+		"VM %u did not reach a resettable RM state after cleanup attempts\n",
+		ghvm->vmid);
+	return -EBUSY;
+}
+
 static void _gunyah_vm_put(struct kref *kref)
 {
 	struct gunyah_vm *ghvm = container_of(kref, struct gunyah_vm, kref);
@@ -1411,6 +1452,9 @@ static void _gunyah_vm_put(struct kref *kref)
 	}
 	if (ghvm->vmid != GUNYAH_VMID_INVAL) {
 		ret = gunyah_vm_refresh_rm_status(ghvm);
+		if (ret)
+			goto quarantine;
+		ret = gunyah_vm_recover_rm_state(ghvm);
 		if (ret)
 			goto quarantine;
 	}
