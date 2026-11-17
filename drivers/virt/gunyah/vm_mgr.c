@@ -8,7 +8,9 @@
 
 #include <linux/anon_inodes.h>
 #include <linux/compat.h>
+#include <linux/delay.h>
 #include <linux/file.h>
+#include <linux/jiffies.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/xarray.h>
@@ -31,9 +33,13 @@
 
 #define GUNYAH_EVENT_CREATE_VM 0
 #define GUNYAH_EVENT_DESTROY_VM 1
+#define GUNYAH_VM_STATUS_TIMEOUT_MS 30000
+#define GUNYAH_VM_RECLAIM_ATTEMPTS 3
 
 static DEFINE_XARRAY(gunyah_vm_functions);
 static DEFINE_XARRAY(gunyah_auth_vm_mgr);
+static LIST_HEAD(gunyah_quarantined_vms);
+static DEFINE_MUTEX(gunyah_quarantined_vms_lock);
 
 static inline int gunyah_vm_fill_boot_context(struct gunyah_vm *ghvm)
 {
@@ -121,6 +127,7 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 	unsigned long index = 0;
 	unsigned long reg;
 	u64 image_offset = 0;
+	u64 end;
 	u64 *entry;
 	u64 dtb_offset;
 	int ret = 0;
@@ -201,10 +208,20 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 			gunyah_gpa_to_gfn(b->size);
 		ghvm->config_image.dtb_offset = dtb_offset;
 	} else {
+		if (!ghvm->dtb.config.size) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		if (check_add_overflow(ghvm->dtb.config.guest_phys_addr,
+				       ghvm->dtb.config.size, &end)) {
+			ret = -EOVERFLOW;
+			goto unlock;
+		}
 		ghvm->config_image.parcel.start =
 			gunyah_gpa_to_gfn(ghvm->dtb.config.guest_phys_addr);
 		ghvm->config_image.parcel.pages =
-			gunyah_gpa_to_gfn(ghvm->dtb.config.size);
+			gunyah_gpa_to_gfn(end - 1) -
+			ghvm->config_image.parcel.start + 1;
 		ghvm->config_image.dtb_offset = ghvm->dtb.config.guest_phys_addr -
 			gunyah_gfn_to_gpa(ghvm->config_image.parcel.start);
 	}
@@ -270,6 +287,8 @@ static int gunyah_generic_pre_vm_start(struct gunyah_vm *ghvm)
 
 void gunyah_generic_vm_start_fail(struct gunyah_vm *ghvm)
 {
+	int ret;
+
 	if (!gunyah_rm_has_demand_paging(ghvm->rm))
 		return;
 
@@ -277,9 +296,11 @@ void gunyah_generic_vm_start_fail(struct gunyah_vm *ghvm)
 	 * need to rollback parcel_to_paged because RM is still
 	 * tracking the parcel
 	 */
-	gunyah_vm_mm_erase_range(ghvm,
-		ghvm->config_image.parcel.start,
-		ghvm->config_image.parcel.pages);
+	ret = gunyah_vm_restore_parcel(ghvm, &ghvm->config_image.parcel);
+	if (ret) {
+		ghvm->mm_unknown = true;
+		dev_err(ghvm->parent, "Failed to restore config image parcel: %d\n", ret);
+	}
 }
 
 static struct gunyah_auth_vm_mgr_ops generic_vm_ops = {
@@ -711,10 +732,10 @@ static int gunyah_vm_rm_notification_exited(struct gunyah_vm *ghvm, void *data)
 	down_write(&ghvm->status_lock);
 	ghvm->vm_status = GUNYAH_RM_VM_STATUS_EXITED;
 	ghvm->exit_info.type = le16_to_cpu(payload->exit_type);
-	ghvm->exit_info.reason_size = le32_to_cpu(payload->exit_reason_size);
+	ghvm->exit_info.reason_size = min(GUNYAH_VM_MAX_EXIT_REASON_SIZE,
+					  le32_to_cpu(payload->exit_reason_size));
 	memcpy(&ghvm->exit_info.reason, payload->exit_reason,
-	       min(GUNYAH_VM_MAX_EXIT_REASON_SIZE,
-		   ghvm->exit_info.reason_size));
+	       ghvm->exit_info.reason_size);
 	up_write(&ghvm->status_lock);
 	wake_up(&ghvm->vm_status_wait);
 
@@ -757,18 +778,25 @@ static void gunyah_uevent_notify_change(unsigned int type, struct gunyah_vm *ghv
 	kfree(env);
 }
 
-static void gunyah_vm_stop(struct gunyah_vm *ghvm)
+static int gunyah_vm_stop(struct gunyah_vm *ghvm)
 {
 	int ret;
 
-	if (ghvm->vm_status == GUNYAH_RM_VM_STATUS_RUNNING) {
+	if (READ_ONCE(ghvm->vm_status) == GUNYAH_RM_VM_STATUS_RUNNING) {
 		ret = gunyah_rm_vm_stop(ghvm->rm, ghvm->vmid);
 		if (ret)
-			dev_warn(ghvm->parent, "Failed to stop VM: %d\n", ret);
+			return ret;
 	}
 
-	wait_event(ghvm->vm_status_wait,
-		   ghvm->vm_status != GUNYAH_RM_VM_STATUS_RUNNING);
+	if (!wait_event_timeout(ghvm->vm_status_wait,
+				READ_ONCE(ghvm->vm_status) != GUNYAH_RM_VM_STATUS_RUNNING,
+				msecs_to_jiffies(GUNYAH_VM_STATUS_TIMEOUT_MS)))
+		return -ETIMEDOUT;
+
+	if (READ_ONCE(ghvm->vm_status) != GUNYAH_RM_VM_STATUS_EXITED &&
+	    READ_ONCE(ghvm->vm_status) != GUNYAH_RM_VM_STATUS_RESET)
+		return -EIO;
+	return 0;
 }
 
 static inline void setup_extent_ticket(struct gunyah_vm *ghvm,
@@ -790,6 +818,14 @@ static __must_check struct gunyah_vm *gunyah_vm_alloc(struct gunyah_rm *rm)
 	if (!ghvm)
 		return ERR_PTR(-ENOMEM);
 
+	ghvm->platform_ref = gunyah_rm_platform_get();
+	if (IS_ERR(ghvm->platform_ref)) {
+		int ret = PTR_ERR(ghvm->platform_ref);
+
+		kfree(ghvm);
+		return ERR_PTR(ret);
+	}
+
 	ghvm->parent = gunyah_rm_get(rm);
 	ghvm->vmid = GUNYAH_VMID_INVAL;
 	ghvm->rm = rm;
@@ -802,11 +838,14 @@ static __must_check struct gunyah_vm *gunyah_vm_alloc(struct gunyah_rm *rm)
 	ghvm->vm_status = GUNYAH_RM_VM_STATUS_NO_STATE;
 
 	INIT_LIST_HEAD(&ghvm->functions);
+	INIT_LIST_HEAD(&ghvm->quarantine_list);
 	mutex_init(&ghvm->fn_lock);
 	mutex_init(&ghvm->resources_lock);
 	INIT_LIST_HEAD(&ghvm->resources);
 	INIT_LIST_HEAD(&ghvm->resource_tickets);
 	xa_init(&ghvm->boot_context);
+	xa_init(&ghvm->folio_states);
+	xa_init(&ghvm->folio_gfns);
 
 	init_rwsem(&ghvm->mmio_handler_lock);
 	ghvm->mmio_handler_root = RB_ROOT;
@@ -901,20 +940,31 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 {
 	struct gunyah_rm_hyp_resources *resources = NULL;
 	struct gunyah_resource *ghrsc;
+	u64 config_start, config_size, config_offset, image_offset, dtb_offset;
 	int cleanup_ret;
 	int ret, i, n;
 	u16 vmid = 0;
 
+	if (current->mm != ghvm->mm_s)
+		return -EPERM;
+
 	down_write(&ghvm->status_lock);
+	if (ghvm->mm_unknown || gunyah_rm_is_failed(ghvm->rm)) {
+		ret = -EIO;
+		goto err;
+	}
 	if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE) {
 		up_write(&ghvm->status_lock);
 		return 0;
 	}
 
 	ghvm->nb.notifier_call = gunyah_vm_rm_notification;
-	ret = gunyah_rm_notifier_register(ghvm->rm, &ghvm->nb);
-	if (ret)
-		goto err;
+	if (!ghvm->notifier_registered) {
+		ret = gunyah_rm_notifier_register(ghvm->rm, &ghvm->nb);
+		if (ret)
+			goto err;
+		ghvm->notifier_registered = true;
+	}
 
 	ret = gunyah_vm_pre_alloc_vmid(ghvm);
 	if (ret)
@@ -922,7 +972,7 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 
 	ret = gunyah_rm_alloc_vmid(ghvm->rm, vmid);
 	if (ret < 0)
-		goto err_rm_notifier_unregister;
+		goto err;
 
 	ghvm->vmid = vmid ? vmid : ret;
 	gunyah_uevent_notify_change(GUNYAH_EVENT_CREATE_VM, ghvm);
@@ -946,6 +996,7 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 
 	ghvm->vm_status = GUNYAH_RM_VM_STATUS_LOAD;
 
+	config_start = ghvm->config_image.parcel.start;
 	ret = gunyah_share_parcel(ghvm, &ghvm->config_image.parcel,
 					&ghvm->config_image.parcel.start,
 					&ghvm->config_image.parcel.pages);
@@ -955,11 +1006,35 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		goto err;
 	}
 
+	/* GUP can extend the parcel backwards to cover a complete folio. */
+	if (ghvm->config_image.parcel.start > config_start) {
+		ret = -EINVAL;
+		goto err;
+	}
+	if (check_shl_overflow(ghvm->config_image.parcel.pages, PAGE_SHIFT,
+			       &config_size) ||
+	    check_shl_overflow(config_start - ghvm->config_image.parcel.start,
+			       PAGE_SHIFT, &config_offset) ||
+	    check_add_overflow(ghvm->config_image.image_offset, config_offset,
+			       &image_offset) ||
+	    check_add_overflow(ghvm->config_image.dtb_offset, config_offset,
+			       &dtb_offset)) {
+		ret = -EOVERFLOW;
+		goto err;
+	}
+	if (image_offset >= config_size ||
+	    ghvm->config_image.image_size > config_size - image_offset ||
+	    dtb_offset > config_size ||
+	    ghvm->config_image.dtb_size > config_size - dtb_offset) {
+		ret = -EINVAL;
+		goto err;
+	}
+
 	ret = gunyah_rm_vm_configure(ghvm->rm, ghvm->vmid, ghvm->auth,
 				     ghvm->config_image.parcel.parcel.mem_handle,
-				     ghvm->config_image.image_offset,
+				     image_offset,
 				     ghvm->config_image.image_size,
-				     ghvm->config_image.dtb_offset,
+				     dtb_offset,
 				     ghvm->config_image.dtb_size);
 	if (ret) {
 		dev_warn(ghvm->parent, "Failed to configure VM: %d\n", ret);
@@ -1030,11 +1105,12 @@ err_dealloc_vmid:
 	if (cleanup_ret)
 		dev_warn(ghvm->parent,
 			 "Failed to deallocate vmid: %d\n", cleanup_ret);
-err_rm_notifier_unregister:
-	gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
+	else
+		ghvm->vmid = GUNYAH_VMID_INVAL;
 err:
 	/* gunyah_vm_free will handle releasing resources and reclaiming memory */
-	gunyah_vm_start_fail(ghvm);
+	if (!gunyah_rm_is_failed(ghvm->rm))
+		gunyah_vm_start_fail(ghvm);
 	up_write(&ghvm->status_lock);
 	kfree(resources);
 	return ret;
@@ -1163,14 +1239,20 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 	}
 	case GH_VM_RECLAIM_REGION: {
 		struct gunyah_address_range range;
+		u64 end;
+
+		guard(rwsem_read)(&ghvm->status_lock);
 
 		/* only allow owner task to remove memory */
 		if (ghvm->mm_s != current->mm)
 			return -EPERM;
 		if (copy_from_user(&range, argp, sizeof(range)))
 			return -EFAULT;
-		if (!PAGE_ALIGNED(range.size) || !PAGE_ALIGNED(range.guest_phys_addr))
+		if (!range.size || !PAGE_ALIGNED(range.size) ||
+		    !PAGE_ALIGNED(range.guest_phys_addr))
 			return -EINVAL;
+		if (check_add_overflow(range.guest_phys_addr, range.size, &end))
+			return -EOVERFLOW;
 
 		r = gunyah_vm_reclaim_range(ghvm,
 					    gunyah_gpa_to_gfn(range.guest_phys_addr),
@@ -1230,6 +1312,48 @@ int __must_check gunyah_vm_get(struct gunyah_vm *ghvm)
 }
 EXPORT_SYMBOL_GPL(gunyah_vm_get);
 
+static void gunyah_vm_unregister_notifier(struct gunyah_vm *ghvm)
+{
+	if (ghvm->notifier_registered) {
+		gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
+		ghvm->notifier_registered = false;
+	}
+}
+
+static void gunyah_vm_quarantine(struct gunyah_vm *ghvm, int error)
+{
+	gunyah_vm_unregister_notifier(ghvm);
+	__module_get(THIS_MODULE);
+	mutex_lock(&gunyah_quarantined_vms_lock);
+	list_add_tail(&ghvm->quarantine_list, &gunyah_quarantined_vms);
+	mutex_unlock(&gunyah_quarantined_vms_lock);
+	dev_err(ghvm->parent,
+		"VM %u quarantined after error %d; resources retained until reboot\n",
+		ghvm->vmid, error);
+}
+
+static int gunyah_vm_reclaim_parcels(struct gunyah_vm *ghvm)
+{
+	unsigned int attempt;
+	int ret;
+
+	for (attempt = 0; attempt < GUNYAH_VM_RECLAIM_ATTEMPTS; attempt++) {
+		if (gunyah_rm_is_failed(ghvm->rm))
+			return -EIO;
+		ret = gunyah_reclaim_parcels(ghvm, 0, ULONG_MAX);
+		if (!ret)
+			return 0;
+		/* Only retry known transient failures while RM remains healthy. */
+		if (gunyah_rm_is_failed(ghvm->rm) ||
+		    !gunyah_vm_reclaim_retryable(ret))
+			return ret;
+		if (attempt + 1 < GUNYAH_VM_RECLAIM_ATTEMPTS)
+			msleep(20U << attempt);
+	}
+
+	return ret;
+}
+
 static void _gunyah_vm_put(struct kref *kref)
 {
 	struct gunyah_vm *ghvm = container_of(kref, struct gunyah_vm, kref);
@@ -1242,19 +1366,36 @@ static void _gunyah_vm_put(struct kref *kref)
 	 * We might race with a VM exit notification, but that's ok:
 	 * gh_rm_vm_stop() will just return right away.
 	 */
-	if (ghvm->vm_status == GUNYAH_RM_VM_STATUS_RUNNING)
-		gunyah_vm_stop(ghvm);
+	if (ghvm->mm_unknown || gunyah_rm_is_failed(ghvm->rm)) {
+		ret = -EIO;
+		goto quarantine;
+	}
+	if (READ_ONCE(ghvm->vm_status) == GUNYAH_RM_VM_STATUS_RESET_FAILED) {
+		ret = -EIO;
+		goto quarantine;
+	}
+	if (READ_ONCE(ghvm->vm_status) == GUNYAH_RM_VM_STATUS_RUNNING) {
+		ret = gunyah_vm_stop(ghvm);
+		if (ret)
+			goto quarantine;
+	}
 
 	gunyah_vm_remove_functions(ghvm);
 
-	/**
-	 * If this fails, we're going to lose the memory for good and is
-	 * BUG_ON-worthy, but not unrecoverable (we just lose memory).
-	 * This call should always succeed though because the VM is in not
-	 * running and RM will let us reclaim all the memory.
-	 */
-	WARN_ON(gunyah_vm_reclaim_range(ghvm, 0, U64_MAX));
-	WARN_ON(!mtree_empty(&ghvm->mm));
+	ret = gunyah_vm_reclaim_range(ghvm, 0, U64_MAX);
+	if (ret)
+		goto quarantine;
+	if (WARN_ON(!mtree_empty(&ghvm->mm))) {
+		ret = -EBUSY;
+		goto quarantine;
+	}
+	if (WARN_ON(!xa_empty(&ghvm->folio_states) ||
+		    !xa_empty(&ghvm->folio_gfns))) {
+		ret = -EBUSY;
+		goto quarantine;
+	}
+	xa_destroy(&ghvm->folio_states);
+	xa_destroy(&ghvm->folio_gfns);
 	mtree_destroy(&ghvm->mm);
 
 	/* clang-format off */
@@ -1267,7 +1408,7 @@ static void _gunyah_vm_put(struct kref *kref)
 
 	ret = gunyah_vm_pre_vm_reset(ghvm);
 	if (ret)
-		dev_err(ghvm->parent, "Failed pre reset the vm: %d\n", ret);
+		goto quarantine;
 
 	gunyah_vm_clean_resources(ghvm);
 
@@ -1275,21 +1416,35 @@ static void _gunyah_vm_put(struct kref *kref)
 	    ghvm->vm_status == GUNYAH_RM_VM_STATUS_READY ||
 	    ghvm->vm_status == GUNYAH_RM_VM_STATUS_INIT_FAILED) {
 		ret = gunyah_rm_vm_reset(ghvm->rm, ghvm->vmid);
-		/* clang-format off */
-		if (!ret)
-			wait_event(ghvm->vm_status_wait,
-				   (ghvm->vm_status == GUNYAH_RM_VM_STATUS_RESET) ||
-				   (ghvm->vm_status == GUNYAH_RM_VM_STATUS_RESET_FAILED));
-		else
-			dev_err(ghvm->parent, "Failed to reset the vm: %d\n", ret);
+		if (ret)
+			goto quarantine;
+		if (!wait_event_timeout(
+			    ghvm->vm_status_wait,
+			    READ_ONCE(ghvm->vm_status) == GUNYAH_RM_VM_STATUS_RESET ||
+			    READ_ONCE(ghvm->vm_status) == GUNYAH_RM_VM_STATUS_RESET_FAILED,
+			    msecs_to_jiffies(GUNYAH_VM_STATUS_TIMEOUT_MS))) {
+			ret = -ETIMEDOUT;
+			goto quarantine;
+		}
+		if (READ_ONCE(ghvm->vm_status) != GUNYAH_RM_VM_STATUS_RESET) {
+			ret = -EIO;
+			goto quarantine;
+		}
 
 		ret = gunyah_vm_post_vm_reset(ghvm);
 		if (ret)
-			dev_err(ghvm->parent, "Failed post reset the vm: %d\n", ret);
-		/* clang-format on */
+			goto quarantine;
 	}
 
-	WARN_ON(gunyah_reclaim_parcels(ghvm, 0, ULONG_MAX));
+	ret = gunyah_vm_reclaim_parcels(ghvm);
+	if (ret)
+		goto quarantine;
+	if (ghvm->vmid != GUNYAH_VMID_INVAL) {
+		ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
+		if (ret)
+			goto quarantine;
+	}
+	gunyah_vm_unregister_notifier(ghvm);
 	kfree(ghvm->shared_parcels);
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
@@ -1303,23 +1458,24 @@ static void _gunyah_vm_put(struct kref *kref)
 	mtree_destroy(&ghvm->bindings);
 	gunyah_uevent_notify_change(GUNYAH_EVENT_DESTROY_VM, ghvm);
 
-	if (ghvm->vm_status > GUNYAH_RM_VM_STATUS_NO_STATE) {
-		gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
-
-		ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
-		if (ret)
-			dev_warn(ghvm->parent,
-				 "Failed to deallocate vmid: %d\n", ret);
-	}
-
 	xa_for_each(&ghvm->boot_context, index, entry)
 		kfree(entry);
 
 	gunyah_put_auth_vm_mgr(ghvm);
 	xa_destroy(&ghvm->boot_context);
+	/* Converted parcels have no binding left to free their descriptors. */
+	if (ghvm->config_image.parcel.paged) {
+		kfree(ghvm->config_image.parcel.parcel.mem_entries);
+		kfree(ghvm->config_image.parcel.parcel.acl_entries);
+	}
+	gunyah_rm_platform_put(ghvm->platform_ref);
 	gunyah_rm_put(ghvm->rm);
 	mmdrop(ghvm->mm_s);
 	kfree(ghvm);
+	return;
+
+quarantine:
+	gunyah_vm_quarantine(ghvm, ret);
 }
 
 void gunyah_vm_put(struct gunyah_vm *ghvm)
@@ -1353,6 +1509,8 @@ static long gunyah_dev_ioctl_create_vm(struct gunyah_rm *rm, unsigned long arg)
 	/* arg reserved for future use. */
 	if (arg)
 		return -EINVAL;
+	if (gunyah_rm_is_failed(rm))
+		return -EIO;
 
 	ghvm = gunyah_vm_alloc(rm);
 	if (IS_ERR(ghvm))
@@ -1377,6 +1535,19 @@ static long gunyah_dev_ioctl_create_vm(struct gunyah_rm *rm, unsigned long arg)
 err_put_fd:
 	put_unused_fd(fd);
 err_destroy_vm:
+	/* The VM was never published, so only local allocations exist. */
+	gunyah_vm_remove_resource_ticket(ghvm, &ghvm->addrspace_ticket);
+	gunyah_vm_remove_resource_ticket(ghvm, &ghvm->host_shared_extent_ticket);
+	gunyah_vm_remove_resource_ticket(ghvm, &ghvm->host_private_extent_ticket);
+	gunyah_vm_remove_resource_ticket(ghvm, &ghvm->guest_shared_extent_ticket);
+	gunyah_vm_remove_resource_ticket(ghvm, &ghvm->guest_private_extent_ticket);
+	mtree_destroy(&ghvm->mm);
+	mtree_destroy(&ghvm->bindings);
+	xa_destroy(&ghvm->boot_context);
+	xa_destroy(&ghvm->folio_states);
+	xa_destroy(&ghvm->folio_gfns);
+	mmdrop(ghvm->mm_s);
+	gunyah_rm_platform_put(ghvm->platform_ref);
 	gunyah_rm_put(ghvm->rm);
 	kfree(ghvm);
 	return err;

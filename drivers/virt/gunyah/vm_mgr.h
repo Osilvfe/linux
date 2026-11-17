@@ -24,8 +24,14 @@
 
 struct gunyah_vm_parcel {
 	u64 start, pages;
+	bool paged;
 	struct gunyah_rm_mem_parcel parcel;
 };
+
+static inline bool gunyah_vm_reclaim_retryable(int error)
+{
+	return error == -EBUSY || error == -EAGAIN || error == -ENOMEM;
+}
 
 struct gunyah_vm_binding {
 	enum { VM_MEM_USER, VM_MEM_CMA } mem_type;
@@ -67,6 +73,9 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
  *            numbers; entries are &struct gunyah_gmem_binding
  * @bindings_lock: For serialization to @bindings
  * @mm_s: Userspace tied to this vm
+ * @folio_states: Partial ownership transitions, serialized by each folio lock
+ * @folio_gfns: Reverse index rejecting folio aliases within this VM
+ * @mm_unknown: Failed local ownership rollback prohibits further teardown
  * @addrspace_ticket: Resource ticket to the capability for guest VM's
  *                    address space
  * @host_private_extent_ticket: Resource ticket to the capability for our
@@ -88,8 +97,11 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
  *                     Entries are &struct gunyah_vm_io_handler
  * @mmio_handler_lock: Serialization of traversing @mmio_handler_root
  * @rm: Pointer to the resource manager struct to make RM calls
+ * @platform_ref: Platform provider held until final teardown, including quarantine.
  * @parent: For logging
  * @nb: Notifier block for RM notifications
+ * @notifier_registered: RM notifier remains registered until final VM teardown
+ * @quarantine_list: Retains a VM whose remote state cannot be safely released
  * @vm_status: Current state of the VM, as last reported by RM
  * @vm_status_wait: Wait queue for status @vm_status changes
  * @status_lock: Serializing state transitions
@@ -127,8 +139,11 @@ struct gunyah_vm {
 	struct rw_semaphore mmio_handler_lock;
 
 	struct gunyah_rm *rm;
+	struct gunyah_rm_platform_ref *platform_ref;
 
 	struct notifier_block nb;
+	bool notifier_registered;
+	struct list_head quarantine_list;
 	enum gunyah_rm_vm_status vm_status;
 	wait_queue_head_t vm_status_wait;
 	struct rw_semaphore status_lock;
@@ -157,6 +172,9 @@ struct gunyah_vm {
 		struct gunyah_vm_parcel parcel;
 	} fw;
 	struct xarray boot_context;
+	struct xarray folio_states;
+	struct xarray folio_gfns;
+	bool mm_unknown;
 	struct gunyah_vm_parcel *shared_parcels;
 };
 
@@ -225,8 +243,10 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 			      struct gunyah_rm_mem_parcel *parcel, u64 gfn,
 			      u64 nr);
 void gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);
+int gunyah_vm_restore_parcel(struct gunyah_vm *ghvm,
+			     struct gunyah_vm_parcel *parcel);
 int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
-			    u64 gfn, bool share, bool write);
+			    u64 gfn, bool share, bool write, bool *retained);
 int gunyah_vm_reclaim_folio(struct gunyah_vm *ghvm, u64 gfn, struct folio *folio);
 void gunyah_generic_vm_start_fail(struct gunyah_vm *ghvm);
 int gunyah_vm_reclaim_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);

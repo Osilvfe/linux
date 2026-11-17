@@ -8,6 +8,7 @@
 
 #include <linux/completion.h>
 #include <linux/gunyah.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
@@ -58,6 +59,7 @@ struct gunyah_rm_rpc_reply_hdr {
 } __packed;
 
 #define GUNYAH_RM_MSGQ_MSG_SIZE 240
+#define GUNYAH_RM_RPC_TIMEOUT_MS 30000
 #define GUNYAH_RM_PAYLOAD_SIZE \
 	(GUNYAH_RM_MSGQ_MSG_SIZE - sizeof(struct gunyah_rm_rpc_hdr))
 
@@ -140,10 +142,23 @@ struct gunyah_rm_message {
  * @recv_msg: cached allocation for Rx messages
  * @send_msg: cached allocation for Tx messages. Must hold @send_lock to manipulate.
  * @send_lock: synchronization to allow only one request to be sent at a time
+ * @recv_lock: synchronization of reply parsing and cancellation
+ * @failed: request outcome is unknown; no further RPCs are permitted
  * @send_ready: completed when we know Tx message queue can take more messages
  * @nh: notifier chain for clients interested in RM notification messages
+ * @adev: auxiliary device for RM clients
+ * @adev_released: signals that no references to the embedded auxiliary device remain
  * @miscdev: /dev/gunyah
  * @parent_fwnode: Parent IRQ fwnode to translate Gunyah hwirqs to Linux irqs
+ * @pm_nb: hibernation notifier for info-area resources
+ * @pm_registered: @pm_nb was successfully registered
+ * @cma_registered: the optional CMA driver was successfully registered
+ * @ready: initialization completed; published with release/acquire ordering
+ * @tx_irq_requested: TX interrupt handler is installed
+ * @rx_irq_requested: RX interrupt handler is installed
+ * @tx_irq_wake: TX interrupt has a wake reference
+ * @rx_irq_wake: RX interrupt has a wake reference
+ * @no_demand_paging: RM requires all guest memory to be shared up-front
  */
 struct gunyah_rm {
 	struct gunyah_resource tx_ghrsc;
@@ -156,14 +171,24 @@ struct gunyah_rm {
 	unsigned char recv_msg[GUNYAH_RM_MSGQ_MSG_SIZE];
 	unsigned char send_msg[GUNYAH_RM_MSGQ_MSG_SIZE];
 	struct mutex send_lock;
+	struct mutex recv_lock;
+	bool failed;
 	struct completion send_ready;
 	struct blocking_notifier_head nh;
 
 	struct auxiliary_device adev;
+	struct completion adev_released;
 	struct miscdevice miscdev;
 	struct fwnode_handle *parent_fwnode;
 
 	struct notifier_block pm_nb;
+	bool pm_registered;
+	bool cma_registered;
+	bool ready;
+	bool tx_irq_requested;
+	bool rx_irq_requested;
+	bool tx_irq_wake;
+	bool rx_irq_wake;
 
 	/* RM predates VM_SET_DEMAND_PAGING: share all guest memory up-front */
 	bool no_demand_paging;
@@ -313,20 +338,84 @@ static inline void gunyah_rm_complete_reply(struct gunyah_rm *rm,
 
 static void gunyah_rm_abort_message(struct gunyah_rm *rm)
 {
-	kfree(rm->active_rx_message->payload);
+	struct gunyah_rm_message *message = rm->active_rx_message;
 
-	switch (rm->active_rx_message->type) {
+	rm->active_rx_message = NULL;
+	kfree(message->payload);
+	message->payload = NULL;
+
+	switch (message->type) {
 	case RM_RPC_TYPE_REPLY:
-		rm->active_rx_message->reply.ret = -EIO;
-		gunyah_rm_complete_reply(rm, rm->active_rx_message);
+		message->reply.ret = -EIO;
+		gunyah_rm_complete_reply(rm, message);
 		break;
 	case RM_RPC_TYPE_NOTIF:
 		fallthrough;
 	default:
-		kfree(rm->active_rx_message);
+		kfree(message);
 	}
+}
 
-	rm->active_rx_message = NULL;
+bool gunyah_rm_is_failed(struct gunyah_rm *rm)
+{
+	return READ_ONCE(rm->failed);
+}
+
+static void __gunyah_rm_mark_failed(struct gunyah_rm *rm)
+{
+	lockdep_assert_held(&rm->recv_lock);
+	if (rm->failed)
+		return;
+
+	WRITE_ONCE(rm->failed, true);
+	if (rm->active_rx_message)
+		gunyah_rm_abort_message(rm);
+	pr_err("RM connection failed; reboot required before creating more VMs\n");
+}
+
+void gunyah_rm_mark_failed(struct gunyah_rm *rm)
+{
+	mutex_lock(&rm->recv_lock);
+	__gunyah_rm_mark_failed(rm);
+	mutex_unlock(&rm->recv_lock);
+}
+
+static bool gunyah_rm_cancel_call(struct gunyah_rm *rm,
+				  struct gunyah_rm_message *message,
+				  bool fail_transport)
+{
+	bool pending;
+
+	mutex_lock(&rm->recv_lock);
+	pending = !completion_done(&message->reply.seq_done);
+	if (pending) {
+		xa_erase(&rm->call_xarray, message->reply.seq);
+		if (rm->active_rx_message == message)
+			rm->active_rx_message = NULL;
+		kfree(message->payload);
+		message->payload = NULL;
+		if (fail_transport)
+			__gunyah_rm_mark_failed(rm);
+	}
+	mutex_unlock(&rm->recv_lock);
+	return pending;
+}
+
+static bool gunyah_rm_validate_notif(const struct gunyah_rm_message *message)
+{
+	const struct gunyah_rm_vm_exited_payload *exited = message->payload;
+
+	switch (message->msg_id) {
+	case GUNYAH_RM_NOTIFICATION_VM_STATUS:
+		return message->size == sizeof(struct gunyah_rm_vm_status_payload);
+	case GUNYAH_RM_NOTIFICATION_VM_EXITED:
+		if (message->size < sizeof(*exited))
+			return false;
+		return le32_to_cpu(exited->exit_reason_size) <=
+		       message->size - sizeof(*exited);
+	default:
+		return true;
+	}
 }
 
 static inline void gunyah_rm_try_complete_message(struct gunyah_rm *rm)
@@ -336,25 +425,31 @@ static inline void gunyah_rm_try_complete_message(struct gunyah_rm *rm)
 	if (!message || message->fragments_received != message->num_fragments)
 		return;
 
+	rm->active_rx_message = NULL;
 	switch (message->type) {
 	case RM_RPC_TYPE_REPLY:
 		gunyah_rm_complete_reply(rm, message);
 		break;
 	case RM_RPC_TYPE_NOTIF:
-		blocking_notifier_call_chain(&rm->nh, message->msg_id,
-					     message->payload);
+		mutex_unlock(&rm->recv_lock);
+		if (gunyah_rm_validate_notif(message))
+			blocking_notifier_call_chain(&rm->nh, message->msg_id,
+						     message->payload);
+		else
+			pr_err_ratelimited("Invalid notification %08x payload size %zu\n",
+					   message->msg_id, message->size);
 
 		kfree(message->payload);
 		kfree(message);
+		mutex_lock(&rm->recv_lock);
 		break;
 	default:
 		pr_err_ratelimited("Invalid message type (%u) received\n",
 				   message->type);
+		rm->active_rx_message = message;
 		gunyah_rm_abort_message(rm);
 		break;
 	}
-
-	rm->active_rx_message = NULL;
 }
 
 static void gunyah_rm_process_notif(struct gunyah_rm *rm, const void *msg,
@@ -492,8 +587,8 @@ static irqreturn_t gunyah_rm_rx(int irq, void *data)
 			return IRQ_HANDLED;
 		}
 
-		if (len < sizeof(*hdr)) {
-			pr_err_ratelimited("Too small message received. size=%ld\n", len);
+		if (len < sizeof(*hdr) || len > sizeof(rm->recv_msg)) {
+			pr_err_ratelimited("Invalid RM message size: %zu\n", len);
 			continue;
 		}
 
@@ -504,6 +599,11 @@ static irqreturn_t gunyah_rm_rx(int irq, void *data)
 			return IRQ_HANDLED;
 		}
 
+		mutex_lock(&rm->recv_lock);
+		if (rm->failed) {
+			mutex_unlock(&rm->recv_lock);
+			continue;
+		}
 		switch (FIELD_GET(RM_RPC_TYPE_MASK, hdr->type)) {
 		case RM_RPC_TYPE_NOTIF:
 			gunyah_rm_process_notif(rm, msg, len);
@@ -518,8 +618,9 @@ static irqreturn_t gunyah_rm_rx(int irq, void *data)
 		default:
 			pr_err("Invalid message type (%lu) received\n",
 				FIELD_GET(RM_RPC_TYPE_MASK, hdr->type));
-			return IRQ_HANDLED;
+			break;
 		}
+		mutex_unlock(&rm->recv_lock);
 	} while (ready);
 
 	return IRQ_HANDLED;
@@ -534,33 +635,47 @@ static irqreturn_t gunyah_rm_tx(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int gunyah_rm_msgq_send(struct gunyah_rm *rm, size_t size, bool push)
+static unsigned long gunyah_rm_time_left(unsigned long deadline)
+{
+	unsigned long now = jiffies;
+
+	return time_after(deadline, now) ? deadline - now : 0;
+}
+
+static int gunyah_rm_msgq_send(struct gunyah_rm *rm, size_t size, bool push,
+			       unsigned long deadline)
 {
 	const u64 tx_flags = push ? GUNYAH_HYPERCALL_MSGQ_TX_FLAGS_PUSH : 0;
 	enum gunyah_error gunyah_error;
 	void *data = &rm->send_msg[0];
+	unsigned long timeout;
 	bool ready;
 
 	lockdep_assert_held(&rm->send_lock);
 
 again:
-	wait_for_completion(&rm->send_ready);
+	timeout = gunyah_rm_time_left(deadline);
+	if (!timeout || !wait_for_completion_timeout(&rm->send_ready, timeout))
+		return -ETIMEDOUT;
 	gunyah_error = gunyah_hypercall_msgq_send(rm->tx_ghrsc.capid, size,
 						  data, tx_flags, &ready);
 
 	/* Should never happen because Linux properly tracks the ready-state of the msgq */
 	if (WARN_ON(gunyah_error == GUNYAH_ERROR_MSGQUEUE_FULL))
 		goto again;
+	if (gunyah_error != GUNYAH_ERROR_OK)
+		return gunyah_error_remap(gunyah_error);
 
 	if (ready)
 		complete(&rm->send_ready);
 
-	return gunyah_error_remap(gunyah_error);
+	return 0;
 }
 
 static int gunyah_rm_send_request(struct gunyah_rm *rm, u32 message_id,
 				  const void *req_buf, size_t req_buf_size,
-				  struct gunyah_rm_message *message)
+				  struct gunyah_rm_message *message,
+				  unsigned long deadline)
 {
 	size_t buf_size_remaining = req_buf_size;
 	const void *req_buf_curr = req_buf;
@@ -603,7 +718,7 @@ static int gunyah_rm_send_request(struct gunyah_rm *rm, u32 message_id,
 		/* Only the last message should have push flag set */
 		push = !buf_size_remaining;
 		ret = gunyah_rm_msgq_send(rm, sizeof(*hdr) + payload_size,
-					  push);
+					  push, deadline);
 		if (ret)
 			break;
 
@@ -628,6 +743,7 @@ static int gunyah_rm_send_request(struct gunyah_rm *rm, u32 message_id,
  * response, the function returns the payload. The size of the payload is set in
  * resp_buf_size. The resp_buf must be freed by the caller when 0 is returned
  * and resp_buf_size != 0.
+ * If both response pointers are NULL, a successful reply must have no payload.
  *
  * req_buf should be not NULL for req_buf_size >0. If req_buf_size == 0,
  * req_buf *can* be NULL and no additional payload is sent.
@@ -639,12 +755,17 @@ int gunyah_rm_call(struct gunyah_rm *rm, u32 message_id, const void *req_buf,
 		   size_t req_buf_size, void **resp_buf, size_t *resp_buf_size)
 {
 	struct gunyah_rm_message message = { 0 };
+	unsigned long deadline;
 	u32 seq_id;
 	int ret;
 
 	/* message_id 0 is reserved. req_buf_size implies req_buf is not NULL */
 	if (!rm || !message_id || (!req_buf && req_buf_size))
 		return -EINVAL;
+	if (resp_buf)
+		*resp_buf = NULL;
+	if (resp_buf_size)
+		*resp_buf_size = 0;
 
 	message.type = RM_RPC_TYPE_REPLY;
 	message.msg_id = message_id;
@@ -652,37 +773,43 @@ int gunyah_rm_call(struct gunyah_rm *rm, u32 message_id, const void *req_buf,
 	message.reply.seq_done =
 		COMPLETION_INITIALIZER_ONSTACK(message.reply.seq_done);
 
+	mutex_lock(&rm->send_lock);
+	if (gunyah_rm_is_failed(rm)) {
+		ret = -EIO;
+		goto out;
+	}
+	deadline = jiffies + msecs_to_jiffies(GUNYAH_RM_RPC_TIMEOUT_MS);
+
 	/* Allocate a new seq number for this message */
+	mutex_lock(&rm->recv_lock);
 	ret = xa_alloc_cyclic(&rm->call_xarray, &seq_id, &message, xa_limit_16b,
 			      &rm->next_seq, GFP_KERNEL);
+	if (ret >= 0)
+		message.reply.seq = lower_16_bits(seq_id);
+	mutex_unlock(&rm->recv_lock);
 	if (ret < 0)
-		return ret;
-	message.reply.seq = lower_16_bits(seq_id);
+		goto out;
 
-	mutex_lock(&rm->send_lock);
 	/* Send the request to the Resource Manager */
 	ret = gunyah_rm_send_request(rm, message_id, req_buf, req_buf_size,
-				     &message);
+				     &message, deadline);
 	if (ret < 0) {
 		pr_warn("Failed to send request. Error: %d\n", ret);
-		/*
-		 * Request never reached RM, so the RX thread will never see
-		 * this seq. Erase it here; every other path to "out" got here
-		 * via wait_for_completion(), meaning the RX thread already
-		 * erased it before completing us.
-		 */
-		xa_erase(&rm->call_xarray, message.reply.seq);
+		if (gunyah_rm_cancel_call(rm, &message, ret != -E2BIG))
+			goto out;
+	} else if (!wait_for_completion_timeout(&message.reply.seq_done,
+					      gunyah_rm_time_left(deadline)) &&
+		   gunyah_rm_cancel_call(rm, &message, true)) {
+		pr_err("RM request %08x sequence %u timed out\n", message_id,
+		       message.reply.seq);
+		ret = -ETIMEDOUT;
 		goto out;
 	}
 
-	/*
-	 * Wait for response. Uninterruptible because rollback based on what RM did to VM
-	 * requires us to know how RM handled the call.
-	 */
-	wait_for_completion(&message.reply.seq_done);
-
 	/* Check for internal (kernel) error waiting for the response */
+	ret = 0;
 	if (message.reply.ret) {
+		gunyah_rm_mark_failed(rm);
 		ret = message.reply.ret;
 		goto out;
 	}
@@ -692,7 +819,16 @@ int gunyah_rm_call(struct gunyah_rm *rm, u32 message_id, const void *req_buf,
 		pr_warn("RM rejected message %08x. Error: %d\n",
 			 message_id, message.reply.rm_error);
 		ret = gunyah_rm_error_remap(message.reply.rm_error);
+		if (ret == -EBADMSG)
+			gunyah_rm_mark_failed(rm);
 		kfree(message.payload);
+		goto out;
+	}
+
+	if (!resp_buf && !resp_buf_size && message.size) {
+		gunyah_rm_mark_failed(rm);
+		kfree(message.payload);
+		ret = -EBADMSG;
 		goto out;
 	}
 
@@ -740,6 +876,15 @@ void gunyah_rm_put(struct gunyah_rm *rm)
 }
 EXPORT_SYMBOL_GPL(gunyah_rm_put);
 
+static int gunyah_dev_open(struct inode *inode, struct file *filp)
+{
+	struct miscdevice *miscdev = filp->private_data;
+	struct gunyah_rm *rm = container_of(miscdev, struct gunyah_rm, miscdev);
+
+	/* misc_register() precedes auxiliary device setup, which can fail. */
+	return smp_load_acquire(&rm->ready) ? 0 : -ENODEV;
+}
+
 static long gunyah_dev_ioctl(struct file *filp, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -752,6 +897,7 @@ static long gunyah_dev_ioctl(struct file *filp, unsigned int cmd,
 static const struct file_operations gunyah_dev_fops = {
 	/* clang-format off */
 	.owner		= THIS_MODULE,
+	.open		= gunyah_dev_open,
 	.unlocked_ioctl	= gunyah_dev_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 	.llseek		= noop_llseek,
@@ -917,7 +1063,6 @@ static int gunyah_rm_get_of_info(struct gunyah_rm *rm)
 		return -EINVAL;
 	rm->rx_ghrsc.irq = ret;
 
-	of_node_put(rm_np);
 	return 0;
 }
 
@@ -958,7 +1103,9 @@ static int gunyah_rm_get_xbl_info(struct gunyah_rm *rm)
 
 static void gunyah_adev_release(struct device *dev)
 {
-	/* no-op */
+	struct gunyah_rm *rm = container_of(dev, struct gunyah_rm, adev.dev);
+
+	complete(&rm->adev_released);
 }
 
 static int gunyah_adev_init(struct gunyah_rm *rm, const char *name)
@@ -970,6 +1117,7 @@ static int gunyah_adev_init(struct gunyah_rm *rm, const char *name)
 	adev->dev.platform_data = rm;
 	adev->dev.parent = rm->miscdev.this_device;
 	adev->dev.release = gunyah_adev_release;
+	init_completion(&rm->adev_released);
 	ret = auxiliary_device_init(adev);
 	if (ret)
 		return ret;
@@ -977,10 +1125,68 @@ static int gunyah_adev_init(struct gunyah_rm *rm, const char *name)
 	ret = auxiliary_device_add(adev);
 	if (ret) {
 		auxiliary_device_uninit(adev);
+		wait_for_completion(&rm->adev_released);
 		return ret;
 	}
 
 	return ret;
+}
+
+static void gunyah_adev_uninit(struct gunyah_rm *rm)
+{
+	auxiliary_device_delete(&rm->adev);
+	auxiliary_device_uninit(&rm->adev);
+	wait_for_completion(&rm->adev_released);
+}
+
+static void gunyah_rm_free_irqs(struct gunyah_rm *rm)
+{
+	if (rm->rx_irq_wake) {
+		disable_irq_wake(rm->rx_ghrsc.irq);
+		rm->rx_irq_wake = false;
+	}
+	if (rm->rx_irq_requested) {
+		free_irq(rm->rx_ghrsc.irq, rm);
+		rm->rx_irq_requested = false;
+	}
+	if (rm->tx_irq_wake) {
+		disable_irq_wake(rm->tx_ghrsc.irq);
+		rm->tx_irq_wake = false;
+	}
+	if (rm->tx_irq_requested) {
+		free_irq(rm->tx_ghrsc.irq, rm);
+		rm->tx_irq_requested = false;
+	}
+	if (rm->rx_ghrsc.irq > 0) {
+		irq_dispose_mapping(rm->rx_ghrsc.irq);
+		rm->rx_ghrsc.irq = 0;
+	}
+	if (rm->tx_ghrsc.irq > 0) {
+		irq_dispose_mapping(rm->tx_ghrsc.irq);
+		rm->tx_ghrsc.irq = 0;
+	}
+}
+
+static int gunyah_rm_request_irqs(struct gunyah_rm *rm)
+{
+	int ret;
+
+	ret = request_threaded_irq(rm->tx_ghrsc.irq, NULL, gunyah_rm_tx,
+				   IRQF_ONESHOT, "gunyah_rm_tx", rm);
+	if (ret)
+		return ret;
+	rm->tx_irq_requested = true;
+	rm->tx_irq_wake = !enable_irq_wake(rm->tx_ghrsc.irq);
+	/* Assume RM is ready to receive messages from us. */
+	complete(&rm->send_ready);
+
+	ret = request_threaded_irq(rm->rx_ghrsc.irq, NULL, gunyah_rm_rx,
+				   IRQF_ONESHOT, "gunyah_rm_rx", rm);
+	if (ret)
+		return ret;
+	rm->rx_irq_requested = true;
+	rm->rx_irq_wake = !enable_irq_wake(rm->rx_ghrsc.irq);
+	return 0;
 }
 
 static int gunyah_rm_hibernation_restore(struct notifier_block *nb,
@@ -994,10 +1200,7 @@ static int gunyah_rm_hibernation_restore(struct notifier_block *nb,
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
 		/* Cleanup stale data from pre-hibernation */
-		free_irq(rm->tx_ghrsc.irq, rm);
-		irq_dispose_mapping(rm->tx_ghrsc.irq);
-		free_irq(rm->rx_ghrsc.irq, rm);
-		irq_dispose_mapping(rm->rx_ghrsc.irq);
+		gunyah_rm_free_irqs(rm);
 		gunyah_unmap_addrspace_info_area();
 		break;
 	case PM_POST_HIBERNATION:
@@ -1013,29 +1216,16 @@ static int gunyah_rm_hibernation_restore(struct notifier_block *nb,
 			goto err;
 		}
 
-		enable_irq_wake(rm->tx_ghrsc.irq);
-		ret = request_threaded_irq(rm->tx_ghrsc.irq, NULL,
-				gunyah_rm_tx, IRQF_ONESHOT,
-				"gunyah_rm_tx", rm);
+		ret = gunyah_rm_request_irqs(rm);
 		if (ret)
 			goto err;
-		/* assume RM is ready to receive messages from us */
-		complete(&rm->send_ready);
-
-		enable_irq_wake(rm->rx_ghrsc.irq);
-		ret = request_threaded_irq(rm->rx_ghrsc.irq, NULL,
-				gunyah_rm_rx, IRQF_ONESHOT,
-				"gunyah_rm_rx", rm);
-		if (ret) {
-			free_irq(rm->tx_ghrsc.irq, rm);
-			goto err;
-		}
 		break;
 	default:
 		return NOTIFY_DONE;
 	}
 	return NOTIFY_OK;
 err:
+	gunyah_rm_free_irqs(rm);
 	gunyah_unmap_addrspace_info_area();
 	return NOTIFY_BAD;
 }
@@ -1073,7 +1263,7 @@ static struct gunyah_rm *__rm;
 
 static int __init gunyah_rm_init(void)
 {
-	struct device_node *parent_irq_node;
+	struct device_node *parent_irq_node __free(device_node) = NULL;
 	struct gunyah_rm *rm __free(kfree) = NULL;
 	int ret;
 
@@ -1081,21 +1271,20 @@ static int __init gunyah_rm_init(void)
 	if (!rm)
 		return -ENOMEM;
 
-	of_node_get(of_root);
 	parent_irq_node = of_irq_find_parent(of_root);
 	if (!parent_irq_node) {
 		pr_err("Failed to find interrupt parent of resource manager\n");
 		return -ENODEV;
 	}
-	of_node_put(of_root);
 
-	rm->parent_fwnode = of_fwnode_handle(parent_irq_node);
+	rm->parent_fwnode = fwnode_handle_get(of_fwnode_handle(parent_irq_node));
 	if (!rm->parent_fwnode) {
 		pr_err("Failed to find interrupt parent domain of resource manager\n");
 		return -ENODEV;
 	}
 
 	mutex_init(&rm->send_lock);
+	mutex_init(&rm->recv_lock);
 	init_completion(&rm->send_ready);
 	BLOCKING_INIT_NOTIFIER_HEAD(&rm->nh);
 	xa_init_flags(&rm->call_xarray, XA_FLAGS_ALLOC);
@@ -1103,32 +1292,21 @@ static int __init gunyah_rm_init(void)
 	ret = gunyah_rm_probe_info_area(rm);
 	if (ret == -ENOENT) {
 		ret = gunyah_rm_get_of_info(rm);
-		if (ret)
+		if (ret) {
+			gunyah_rm_free_irqs(rm);
 			ret = gunyah_rm_get_xbl_info(rm);
+		}
 	} else if (!ret) {
 		rm->pm_nb.notifier_call = gunyah_rm_hibernation_restore;
-		ret = register_pm_notifier(&rm->pm_nb);
-		if (ret)
-			pr_err("Failed to register pm notifier\n");
 	}
 	if (ret)
-		return ret;
+		goto free_irqs;
 
-	enable_irq_wake(rm->tx_ghrsc.irq);
-	ret = request_threaded_irq(rm->tx_ghrsc.irq, NULL,
-					 gunyah_rm_tx, IRQF_ONESHOT,
-					 "gunyah_rm_tx", rm);
+	ret = gunyah_rm_request_irqs(rm);
 	if (ret)
-		return ret;
-	/* assume RM is ready to receive messages from us */
-	complete(&rm->send_ready);
+		goto free_irqs;
 
-	enable_irq_wake(rm->rx_ghrsc.irq);
-	ret = request_threaded_irq(rm->rx_ghrsc.irq, NULL,
-					 gunyah_rm_rx, IRQF_ONESHOT,
-					 "gunyah_rm_rx", rm);
-	if (ret)
-		goto free_tx_irq;
+	gunyah_rm_probe_features(rm);
 
 	rm->miscdev.name = "gunyah";
 	rm->miscdev.minor = MISC_DYNAMIC_MINOR;
@@ -1137,10 +1315,8 @@ static int __init gunyah_rm_init(void)
 	ret = misc_register(&rm->miscdev);
 	if (ret) {
 		pr_err("Failed to register gunyah misc device\n");
-		goto free_rx_irq;
+		goto free_irqs;
 	}
-
-	gunyah_rm_probe_features(rm);
 
 	ret = gunyah_adev_init(rm, "gh_rm_core");
 	if (ret) {
@@ -1151,15 +1327,34 @@ static int __init gunyah_rm_init(void)
 	ret = gunyah_cma_mem_init();
 	if (ret)
 		pr_err("Failed to register gunyah CMA device\n");
+	else
+		rm->cma_registered = true;
+
+	if (rm->pm_nb.notifier_call) {
+		ret = register_pm_notifier(&rm->pm_nb);
+		if (ret) {
+			pr_err("Failed to register pm notifier\n");
+			goto uninit_adev;
+		}
+		rm->pm_registered = true;
+	}
 
 	__rm = no_free_ptr(rm);
+	/* No fallible setup may follow publication to userspace. */
+	smp_store_release(&__rm->ready, true);
 	return 0;
+uninit_adev:
+	if (rm->cma_registered)
+		gunyah_cma_mem_exit();
+	gunyah_adev_uninit(rm);
 deregister_misc:
 	misc_deregister(&rm->miscdev);
-free_rx_irq:
-	free_irq(rm->rx_ghrsc.irq, rm);
-free_tx_irq:
-	free_irq(rm->tx_ghrsc.irq, rm);
+free_irqs:
+	gunyah_rm_free_irqs(rm);
+	if (rm->active_rx_message)
+		gunyah_rm_abort_message(rm);
+	xa_destroy(&rm->call_xarray);
+	fwnode_handle_put(rm->parent_fwnode);
 	return ret;
 }
 module_init(gunyah_rm_init);
@@ -1173,11 +1368,18 @@ static void __exit gunyah_rm_exit(void)
 	if (!rm)
 		return;
 
-	gunyah_cma_mem_exit();
-	auxiliary_device_delete(&rm->adev);
+	if (rm->pm_registered)
+		unregister_pm_notifier(&rm->pm_nb);
+	if (rm->cma_registered)
+		gunyah_cma_mem_exit();
+	gunyah_adev_uninit(rm);
 	misc_deregister(&rm->miscdev);
-	free_irq(rm->rx_ghrsc.irq, rm);
-	free_irq(rm->tx_ghrsc.irq, rm);
+	gunyah_rm_free_irqs(rm);
+	if (rm->active_rx_message)
+		gunyah_rm_abort_message(rm);
+	xa_destroy(&rm->call_xarray);
+	fwnode_handle_put(rm->parent_fwnode);
+	kfree(rm);
 }
 module_exit(gunyah_rm_exit);
 

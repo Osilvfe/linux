@@ -18,6 +18,7 @@
 #include <uapi/linux/gunyah.h>
 
 struct gunyah_vm;
+struct gunyah_rm_platform_ref;
 
 int __must_check gunyah_vm_get(struct gunyah_vm *ghvm);
 void gunyah_vm_put(struct gunyah_vm *ghvm);
@@ -269,8 +270,11 @@ enum gunyah_rm_mem_type {
  * @mem_entries: An array of regions to be associated with the memory parcel. Addresses should be
  *               (intermediate) physical addresses from Linux's perspective.
  * @mem_handle: On success, filled with memory handle that RM allocates for this memory parcel
- * @rm_reclaimed: RM has reclaimed the parcel, but platform cleanup may still be pending.
+ * @rm_reclaimed: No RM reclaim remains, but platform cleanup may still be pending.
+ * @rm_unknown: RM may hold the memory without having returned a valid handle.
+ * @n_shared_mem_entries: Number of leading platform memory ranges successfully shared.
  * @n_reclaimed_mem_entries: Number of leading platform memory ranges already reclaimed.
+ * @platform_ref: Borrowed provider reference held by the owning VM.
  */
 struct gunyah_rm_mem_parcel {
 	enum gunyah_rm_mem_type mem_type;
@@ -281,7 +285,10 @@ struct gunyah_rm_mem_parcel {
 	struct gunyah_rm_mem_entry *mem_entries;
 	u32 mem_handle;
 	bool rm_reclaimed;
+	bool rm_unknown;
+	size_t n_shared_mem_entries;
 	size_t n_reclaimed_mem_entries;
+	struct gunyah_rm_platform_ref *platform_ref;
 };
 
 enum gunyah_pagetable_access {
@@ -296,7 +303,15 @@ enum gunyah_pagetable_access {
 	/* clang-format on */
 };
 
+/*
+ * VMs acquire the provider at creation and keep it through final teardown.
+ * unregister waits for these references, including quarantined VMs; it must
+ * not be called from a callback. Keep ops and its resources alive until it
+ * returns. A VM created without a provider does not adopt a later registration.
+ */
 struct gunyah_rm_platform_ops {
+	/* NULL for built-in providers. */
+	struct module *owner;
 	int (*pre_mem_share)(struct gunyah_rm *rm,
 			     struct gunyah_rm_mem_parcel *mem_parcel);
 	int (*post_mem_reclaim)(struct gunyah_rm *rm,

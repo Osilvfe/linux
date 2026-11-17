@@ -76,9 +76,9 @@ qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 {
 	struct qcom_scm_vmperm *new_perms __free(kfree) = NULL;
 	struct gunyah_rm_mem_entry *mem_entries __free(kvfree) = NULL;
-	size_t n_mem_entries;
+	size_t entry, n_mem_entries;
 	u64 src, src_cpy;
-	int ret = 0, i, n;
+	int ret, n;
 	u16 vmid;
 
 	ret = qcom_scm_gunyah_mem_entries(mem_parcel, &mem_entries, &n_mem_entries);
@@ -106,42 +106,18 @@ qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 
 	src = BIT_ULL(QCOM_SCM_VMID_HLOS);
 
-	for (i = 0; i < n_mem_entries; i++) {
+	for (entry = 0; entry < n_mem_entries; entry++) {
 		src_cpy = src;
 		ret = qcom_scm_assign_mem(
-			le64_to_cpu(mem_entries[i].phys_addr),
-			le64_to_cpu(mem_entries[i].size), &src_cpy,
+			le64_to_cpu(mem_entries[entry].phys_addr),
+			le64_to_cpu(mem_entries[entry].size), &src_cpy,
 			new_perms, mem_parcel->n_acl_entries);
 		if (ret)
-			break;
+			return ret;
+		mem_parcel->n_shared_mem_entries = entry + 1;
 	}
 
-	/* Did it work ok? */
-	if (!ret)
-		return 0;
-
-	src = 0;
-	for (n = 0; n < mem_parcel->n_acl_entries; n++) {
-		vmid = le16_to_cpu(mem_parcel->acl_entries[n].vmid);
-		if (vmid <= QCOM_SCM_MAX_MANAGED_VMID)
-			src |= BIT_ULL(vmid);
-		else
-			src |= BIT_ULL(QCOM_SCM_RM_MANAGED_VMID);
-	}
-
-	new_perms[0].vmid = QCOM_SCM_VMID_HLOS;
-	new_perms[0].perm = QCOM_SCM_PERM_EXEC | QCOM_SCM_PERM_WRITE |
-			    QCOM_SCM_PERM_READ;
-
-	for (i--; i >= 0; i--) {
-		src_cpy = src;
-		WARN_ON_ONCE(qcom_scm_assign_mem(
-			le64_to_cpu(mem_entries[i].phys_addr),
-			le64_to_cpu(mem_entries[i].size), &src_cpy,
-			new_perms, 1));
-	}
-
-	return ret;
+	return 0;
 }
 
 static int
@@ -155,9 +131,15 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 	int ret, n;
 	u16 vmid;
 
+	if (mem_parcel->n_reclaimed_mem_entries == mem_parcel->n_shared_mem_entries)
+		return 0;
+
 	ret = qcom_scm_gunyah_mem_entries(mem_parcel, &mem_entries, &n_mem_entries);
 	if (ret)
 		return ret;
+	if (mem_parcel->n_reclaimed_mem_entries > mem_parcel->n_shared_mem_entries ||
+	    mem_parcel->n_shared_mem_entries > n_mem_entries)
+		return -EINVAL;
 
 	new_perms.vmid = QCOM_SCM_VMID_HLOS;
 	new_perms.perm = QCOM_SCM_PERM_EXEC | QCOM_SCM_PERM_WRITE |
@@ -172,7 +154,7 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 	}
 
 	for (entry = mem_parcel->n_reclaimed_mem_entries;
-	     entry < n_mem_entries; entry++) {
+	     entry < mem_parcel->n_shared_mem_entries; entry++) {
 		src_cpy = src;
 		ret = qcom_scm_assign_mem(
 			le64_to_cpu(mem_entries[entry].phys_addr),
@@ -238,6 +220,7 @@ qcom_scm_gunyah_rm_release_demand_page(struct gunyah_rm *rm, u16 vmid,
 }
 
 static struct gunyah_rm_platform_ops qcom_scm_gunyah_rm_platform_ops = {
+	.owner = THIS_MODULE,
 	.pre_mem_share = qcom_scm_gunyah_rm_pre_mem_share,
 	.post_mem_reclaim = qcom_scm_gunyah_rm_post_mem_reclaim,
 	.pre_demand_page = qcom_scm_gunyah_rm_pre_demand_page,

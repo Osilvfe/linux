@@ -138,7 +138,7 @@ int gunyah_cma_reclaim_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *v
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
 	int ret;
 
-	if (parcel->mem_handle == GUNYAH_MEM_HANDLE_INVAL)
+	if (!gunyah_rm_mem_reclaim_needed(parcel))
 		return 0;
 
 	ret = gunyah_rm_mem_reclaim(ghvm->rm, parcel);
@@ -157,6 +157,7 @@ int gunyah_cma_reclaim_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *v
 	vm_parcel->start = 0;
 	vm_parcel->pages = 0;
 	b->vm_parcel = NULL;
+	fput(b->cma.file);
 	return ret;
 }
 
@@ -192,9 +193,10 @@ int gunyah_cma_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_
 							       page_offset)));
 
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
-	if (ret)
+	if (ret && !gunyah_rm_mem_reclaim_needed(parcel))
 		goto free_mem_entries;
 
+	get_file(b->cma.file);
 	vm_parcel->start = *gfn;
 	vm_parcel->pages = *nr;
 	b->vm_parcel = vm_parcel;

@@ -14,6 +14,9 @@
 
 struct gunyah_rm;
 
+bool gunyah_rm_is_failed(struct gunyah_rm *rm);
+void gunyah_rm_mark_failed(struct gunyah_rm *rm);
+
 int gunyah_rm_notifier_register(struct gunyah_rm *rm,
 				struct notifier_block *nb);
 int gunyah_rm_notifier_unregister(struct gunyah_rm *rm,
@@ -66,6 +69,14 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm,
 			struct gunyah_rm_mem_parcel *parcel);
 int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
 			  struct gunyah_rm_mem_parcel *parcel);
+
+static inline bool
+gunyah_rm_mem_reclaim_needed(const struct gunyah_rm_mem_parcel *parcel)
+{
+	return parcel->mem_handle != GUNYAH_MEM_HANDLE_INVAL ||
+		parcel->rm_unknown ||
+		parcel->n_shared_mem_entries > parcel->n_reclaimed_mem_entries;
+}
 
 int gunyah_rm_alloc_vmid(struct gunyah_rm *rm, u16 vmid);
 int gunyah_rm_dealloc_vmid(struct gunyah_rm *rm, u16 vmid);
@@ -150,11 +161,16 @@ int gunyah_rm_platform_pre_mem_share(struct gunyah_rm *rm,
 int gunyah_rm_platform_post_mem_reclaim(
 	struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *mem_parcel);
 
+struct gunyah_rm_platform_ref *gunyah_rm_platform_get(void);
+void gunyah_rm_platform_put(struct gunyah_rm_platform_ref *ref);
+
 int gunyah_rm_platform_pre_demand_page(struct gunyah_rm *rm, u16 vmid,
 				       enum gunyah_pagetable_access access,
-				       struct folio *folio);
+				       struct folio *folio,
+				       struct gunyah_rm_platform_ref *ref);
 int gunyah_rm_platform_reclaim_demand_page(struct gunyah_rm *rm, u16 vmid,
 					   enum gunyah_pagetable_access access,
-					   struct folio *folio);
+					   struct folio *folio,
+					   struct gunyah_rm_platform_ref *ref);
 
 #endif

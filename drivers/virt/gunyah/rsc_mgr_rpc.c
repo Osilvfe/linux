@@ -230,8 +230,10 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 
 	if (!p->acl_entries || !p->n_acl_entries || !p->mem_entries ||
 	    !p->n_mem_entries || p->n_acl_entries > U8_MAX ||
-	    p->mem_handle != GUNYAH_MEM_HANDLE_INVAL)
+	    gunyah_rm_mem_reclaim_needed(p))
 		return -EINVAL;
+	if (gunyah_rm_is_failed(rm))
+		return -EIO;
 
 	if (initial_mem_entries > GUNYAH_RM_MAX_MEM_ENTRIES) {
 		initial_mem_entries = GUNYAH_RM_MAX_MEM_ENTRIES;
@@ -255,11 +257,14 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	if (!msg)
 		return -ENOMEM;
 
-	p->rm_reclaimed = false;
+	p->rm_reclaimed = true;
+	p->rm_unknown = false;
+	p->n_shared_mem_entries = 0;
 	p->n_reclaimed_mem_entries = 0;
 	ret = gunyah_rm_platform_pre_mem_share(rm, p);
 	if (ret) {
 		kfree(msg);
+		gunyah_rm_mem_reclaim(rm, p);
 		return ret;
 	}
 
@@ -289,11 +294,21 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	kfree(msg);
 
 	if (ret) {
-		gunyah_rm_platform_post_mem_reclaim(rm, p);
+		p->rm_unknown = gunyah_rm_is_failed(rm);
+		gunyah_rm_mem_reclaim(rm, p);
 		return ret;
 	}
 
+	if (resp_size != sizeof(*resp) || !resp ||
+	    le32_to_cpu(*resp) == GUNYAH_MEM_HANDLE_INVAL) {
+		kfree(resp);
+		p->rm_unknown = true;
+		gunyah_rm_mark_failed(rm);
+		return -EBADMSG;
+	}
+
 	p->mem_handle = le32_to_cpu(*resp);
+	p->rm_reclaimed = false;
 	kfree(resp);
 
 	if (need_append) {
@@ -323,7 +338,12 @@ int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
 	};
 	int ret;
 
-	if (!parcel->rm_reclaimed) {
+	if (!gunyah_rm_mem_reclaim_needed(parcel))
+		return 0;
+	if (parcel->rm_unknown || gunyah_rm_is_failed(rm))
+		return -EIO;
+
+	if (parcel->mem_handle != GUNYAH_MEM_HANDLE_INVAL && !parcel->rm_reclaimed) {
 		ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_MEM_RECLAIM, &req,
 				     sizeof(req), NULL, NULL);
 		if (ret)
@@ -359,12 +379,23 @@ int gunyah_rm_alloc_vmid(struct gunyah_rm *rm, u16 vmid)
 		return ret;
 
 	if (!vmid) {
+		if (resp_size != sizeof(*resp_payload) || !resp)
+			goto malformed;
 		resp_payload = resp;
 		ret = le16_to_cpu(resp_payload->vmid);
-		kfree(resp);
+		if (!ret || ret == GUNYAH_VMID_INVAL)
+			goto malformed;
+	} else if (resp_size) {
+		goto malformed;
 	}
 
+	kfree(resp);
 	return ret;
+
+malformed:
+	kfree(resp);
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_alloc_vmid, ERRNO);
 
@@ -474,7 +505,8 @@ int gunyah_rm_vm_authenticate(struct gunyah_rm *rm, u16 vmid,
 			__func__, resp_payload_size);
 		kfree(resp);
 		kfree(req_buf);
-		return -EINVAL;
+		gunyah_rm_mark_failed(rm);
+		return -EBADMSG;
 	}
 
 	/* no need to free the resp as no payload is expected */
@@ -578,13 +610,11 @@ int gunyah_rm_get_hyp_resources(struct gunyah_rm *rm, u16 vmid,
 	if (ret)
 		return ret;
 
-	if (!resp_size)
-		return -EBADMSG;
-
-	if (resp_size < struct_size(resp, entries, 0) ||
+	if (!resp || resp_size < struct_size(resp, entries, 0) ||
 	    resp_size !=
 		    struct_size(resp, entries, le32_to_cpu(resp->n_entries))) {
 		kfree(resp);
+		gunyah_rm_mark_failed(rm);
 		return -EBADMSG;
 	}
 
@@ -614,6 +644,14 @@ int gunyah_rm_get_vmid(struct gunyah_rm *rm, u16 *vmid)
 			     (void **)&resp, &resp_size);
 	if (ret)
 		return ret;
+
+	if (resp_size != sizeof(*resp) || !resp ||
+	    !lower_16_bits(le32_to_cpu(*resp)) ||
+	    lower_16_bits(le32_to_cpu(*resp)) == GUNYAH_VMID_INVAL) {
+		kfree(resp);
+		gunyah_rm_mark_failed(rm);
+		return -EBADMSG;
+	}
 
 	*vmid = cached_vmid = lower_16_bits(le32_to_cpu(*resp));
 	kfree(resp);

@@ -15,11 +15,62 @@
 #define WRITE_TAG (1 << 0)
 #define SHARE_TAG (1 << 1)
 
+struct gunyah_folio_state {
+	struct folio *folio;
+	bool mapped;
+	bool donated;
+	bool platform_owned;
+};
+
 static inline struct gunyah_resource *
 __first_resource(struct gunyah_vm_resource_ticket *ticket)
 {
 	return list_first_entry_or_null(&ticket->resources,
 					struct gunyah_resource, list);
+}
+
+static int gunyah_vm_index_folio(struct gunyah_vm *ghvm, struct folio *folio,
+				 u64 gfn)
+{
+	void *existing = xa_load(&ghvm->folio_gfns, folio_pfn(folio));
+
+	if (gfn > (ULONG_MAX >> 1))
+		return -EOVERFLOW;
+	if (existing)
+		return xa_to_value(existing) == gfn ? -EAGAIN : -EEXIST;
+	return xa_insert(&ghvm->folio_gfns, folio_pfn(folio),
+			 xa_mk_value(gfn), GFP_KERNEL);
+}
+
+static int __gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr)
+{
+	struct folio *folio;
+	u64 off = gfn;
+	void *entry;
+	u64 remaining = nr;
+
+	/* Validate the complete prefix before dropping any parcel bookkeeping. */
+	while (remaining) {
+		entry = mtree_load(&ghvm->mm, off);
+		if (!entry)
+			return -ENOENT;
+		folio = xa_untag_pointer(entry);
+		entry = xa_load(&ghvm->folio_gfns, folio_pfn(folio));
+		if (!entry || xa_to_value(entry) != off ||
+		    folio_nr_pages(folio) > remaining ||
+		    xa_load(&ghvm->folio_states, off))
+			return -EINVAL;
+		remaining -= folio_nr_pages(folio);
+		off += folio_nr_pages(folio);
+	}
+	off = gfn;
+	while (nr) {
+		folio = xa_untag_pointer(mtree_erase(&ghvm->mm, off));
+		xa_erase(&ghvm->folio_gfns, folio_pfn(folio));
+		nr -= folio_nr_pages(folio);
+		off += folio_nr_pages(folio);
+	}
+	return 0;
 }
 
 /*
@@ -37,9 +88,14 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 	struct folio *folio;
 	pgoff_t off = 0;
 	u64 size;
+	u64 binding_start, binding_pages, last;
 	int ret = 0;
 
 	down_write(&ghvm->bindings_lock);
+	if (!nr || check_add_overflow(gfn, nr - 1, &last)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
 	b = mtree_load(&ghvm->bindings, gfn);
 	if (!b) {
 		WARN_ON("No backing binding for the parcel being paged");
@@ -48,9 +104,21 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 	}
 
 	vm_parcel = b->vm_parcel;
-	if (!vm_parcel) {
-		WARN_ON("No parcel found");
+	if (!vm_parcel || &vm_parcel->parcel != parcel || vm_parcel->paged) {
 		ret = -ENOENT;
+		goto unlock;
+	}
+	if (vm_parcel->start != gfn || vm_parcel->pages != nr) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	binding_start = gunyah_gpa_to_gfn(b->guest_phys_addr);
+	binding_pages = gunyah_gpa_to_gfn(b->size);
+	if (gfn < binding_start || gfn - binding_start >= binding_pages ||
+	    nr > binding_pages - (gfn - binding_start) ||
+	    !parcel->acl_entries || !parcel->n_acl_entries ||
+	    !parcel->mem_entries || !parcel->n_mem_entries) {
+		ret = -EINVAL;
 		goto unlock;
 	}
 
@@ -61,27 +129,48 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 
 	for (i = 0; i < parcel->n_mem_entries; i++) {
 		entry = &parcel->mem_entries[i];
-		size = entry->size;
+		size = le64_to_cpu(entry->size);
+		if (!size || !PAGE_ALIGNED(size) ||
+		    !PAGE_ALIGNED(le64_to_cpu(entry->phys_addr))) {
+			ret = -EINVAL;
+			goto rollback;
+		}
 		folio = pfn_folio(PHYS_PFN(le64_to_cpu(entry->phys_addr)));
 		while (size > 0) {
+			if (folio_size(folio) > size || folio_nr_pages(folio) > nr - off ||
+			    (size == le64_to_cpu(entry->size) &&
+			     folio_pfn(folio) != PHYS_PFN(le64_to_cpu(entry->phys_addr)))) {
+				ret = -EINVAL;
+				goto rollback;
+			}
+			ret = gunyah_vm_index_folio(ghvm, folio, gfn + off);
+			if (ret)
+				goto rollback;
 			ret = mtree_insert_range(&ghvm->mm, gfn + off,
 						 gfn + off + folio_nr_pages(folio) - 1,
 						 xa_tag_pointer(folio, tag),
 						 GFP_KERNEL);
 			if (ret) {
 				WARN_ON(ret != -ENOMEM);
-				gunyah_vm_mm_erase_range(ghvm, gfn, off - 1);
-				goto unlock;
+				xa_erase(&ghvm->folio_gfns, folio_pfn(folio));
+				goto rollback;
 			}
 			off += folio_nr_pages(folio);
 			size -= folio_size(folio);
 			folio = folio_next(folio);
 		}
 	}
-	BUG_ON(off != nr);
-	vm_parcel->start = 0;
+	if (off != nr) {
+		ret = -EINVAL;
+		goto rollback;
+	}
+	vm_parcel->paged = true;
 	b->vm_parcel = NULL;
+	goto unlock;
 
+rollback:
+	if (__gunyah_vm_mm_erase_range(ghvm, gfn, off))
+		ghvm->mm_unknown = true;
 unlock:
 	up_write(&ghvm->bindings_lock);
 	return ret;
@@ -97,19 +186,34 @@ unlock:
  */
 void gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr)
 {
-	struct folio *folio;
-	u64 off = gfn;
-	void *entry;
+	down_write(&ghvm->bindings_lock);
+	if (__gunyah_vm_mm_erase_range(ghvm, gfn, nr))
+		ghvm->mm_unknown = true;
+	up_write(&ghvm->bindings_lock);
+}
 
-	while (off < gfn + nr) {
-		entry = mtree_erase(&ghvm->mm, off);
-		if (!entry)
-			return;
-		folio = xa_untag_pointer(entry);
-		if (!folio)
-			return;
-		off += folio_nr_pages(folio);
+int gunyah_vm_restore_parcel(struct gunyah_vm *ghvm,
+			     struct gunyah_vm_parcel *parcel)
+{
+	struct gunyah_vm_binding *binding;
+	int ret = 0;
+
+	down_write(&ghvm->bindings_lock);
+	if (!parcel->paged)
+		goto unlock;
+	binding = mtree_load(&ghvm->bindings, parcel->start);
+	if (!binding || binding->vm_parcel) {
+		ret = -EINVAL;
+		goto unlock;
 	}
+	ret = __gunyah_vm_mm_erase_range(ghvm, parcel->start, parcel->pages);
+	if (!ret) {
+		binding->vm_parcel = parcel;
+		parcel->paged = false;
+	}
+unlock:
+	up_write(&ghvm->bindings_lock);
+	return ret;
 }
 
 static inline u32 donate_flags(bool share)
@@ -140,10 +244,72 @@ static inline u32 reclaim_flags(bool share, bool sync)
 	return flags;
 }
 
-int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
-			    u64 gfn, bool share, bool write)
+static int gunyah_vm_return_folio(struct gunyah_vm *ghvm,
+				  struct gunyah_folio_state *state, u64 gfn,
+				  bool share, bool write, bool sync)
 {
 	struct gunyah_resource *guest_extent, *host_extent, *addrspace;
+	u32 map_flags = BIT(GUNYAH_ADDRSPACE_MAP_FLAG_PARTIAL);
+	struct folio *folio = state->folio;
+	phys_addr_t pa = PFN_PHYS(folio_pfn(folio));
+	enum gunyah_pagetable_access access;
+	enum gunyah_error error;
+	int ret;
+
+	addrspace = __first_resource(&ghvm->addrspace_ticket);
+	if (share) {
+		guest_extent = __first_resource(&ghvm->guest_shared_extent_ticket);
+		host_extent = __first_resource(&ghvm->host_shared_extent_ticket);
+		map_flags |= BIT(GUNYAH_ADDRSPACE_MAP_FLAG_VMMIO);
+	} else {
+		guest_extent = __first_resource(&ghvm->guest_private_extent_ticket);
+		host_extent = __first_resource(&ghvm->host_private_extent_ticket);
+		map_flags |= BIT(GUNYAH_ADDRSPACE_MAP_FLAG_PRIVATE);
+	}
+	if (!sync)
+		map_flags |= BIT(GUNYAH_ADDRSPACE_MAP_FLAG_NOSYNC);
+	if ((state->mapped && !addrspace) ||
+	    ((state->mapped || state->donated) && (!guest_extent || !host_extent)))
+		return -ENODEV;
+
+	if (state->mapped) {
+		error = gunyah_hypercall_addrspace_unmap(addrspace->capid,
+							 guest_extent->capid,
+							 gunyah_gfn_to_gpa(gfn), map_flags,
+							 pa, folio_size(folio));
+		if (error != GUNYAH_ERROR_OK)
+			return gunyah_error_remap(error);
+		state->mapped = false;
+	}
+	if (state->donated) {
+		error = gunyah_hypercall_memextent_donate(reclaim_flags(share, sync),
+							  guest_extent->capid, host_extent->capid,
+							  pa, folio_size(folio));
+		if (error != GUNYAH_ERROR_OK)
+			return gunyah_error_remap(error);
+		state->donated = false;
+	}
+	if (state->platform_owned) {
+		if (share)
+			access = write ? GUNYAH_PAGETABLE_ACCESS_RW :
+					 GUNYAH_PAGETABLE_ACCESS_R;
+		else
+			access = write ? GUNYAH_PAGETABLE_ACCESS_RWX :
+					 GUNYAH_PAGETABLE_ACCESS_RX;
+		ret = gunyah_rm_platform_reclaim_demand_page(ghvm->rm, ghvm->vmid,
+							     access, folio, ghvm->platform_ref);
+		if (ret)
+			return ret;
+		state->platform_owned = false;
+	}
+	return 0;
+}
+
+int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
+			    u64 gfn, bool share, bool write, bool *retained)
+{
+	struct gunyah_resource *guest_extent, *host_extent, *addrspace;
+	struct gunyah_folio_state *state;
 	u32 map_flags = BIT(GUNYAH_ADDRSPACE_MAP_FLAG_PARTIAL);
 	u64 extent_attrs, gpa = gunyah_gfn_to_gpa(gfn);
 	phys_addr_t pa = PFN_PHYS(folio_pfn(folio));
@@ -151,7 +317,9 @@ int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 	size_t size = folio_size(folio);
 	enum gunyah_error gunyah_error;
 	unsigned long tag = 0;
-	int ret, tmp;
+	int ret, cleanup_ret;
+
+	*retained = false;
 
 	/* clang-format off */
 	if (share) {
@@ -177,13 +345,27 @@ int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 	if (write)
 		tag |= WRITE_TAG;
 
+	ret = gunyah_vm_index_folio(ghvm, folio, gfn);
+	if (ret)
+		return ret;
+	state = kzalloc_obj(*state);
+	if (!state) {
+		ret = -ENOMEM;
+		goto erase_index;
+	}
+	state->folio = folio;
 	ret = mtree_insert_range(&ghvm->mm, gfn,
 				 gfn + folio_nr_pages(folio) - 1,
 				 xa_tag_pointer(folio, tag), GFP_KERNEL);
 	if (ret == -EEXIST)
 		ret = -EAGAIN;
 	if (ret)
-		return ret;
+		goto free_state;
+	ret = xa_insert(&ghvm->folio_states, gfn, state, GFP_KERNEL);
+	if (ret)
+		goto erase_range;
+	/* The VM now owns the caller's pin, including on incomplete rollback. */
+	*retained = true;
 
 	if (share && write)
 		access = GUNYAH_PAGETABLE_ACCESS_RW;
@@ -195,9 +377,10 @@ int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 		access = GUNYAH_PAGETABLE_ACCESS_RX;
 
 	ret = gunyah_rm_platform_pre_demand_page(ghvm->rm, ghvm->vmid, access,
-						 folio);
+						 folio, ghvm->platform_ref);
 	if (ret)
-		goto reclaim_host;
+		goto rollback;
+	state->platform_owned = true;
 
 	gunyah_error = gunyah_hypercall_memextent_donate(donate_flags(share),
 							 host_extent->capid,
@@ -207,8 +390,9 @@ int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 		pr_err("Failed to donate memory for guest address 0x%016llx: %d\n",
 		       gpa, gunyah_error);
 		ret = gunyah_error_remap(gunyah_error);
-		goto platform_release;
+		goto rollback;
 	}
+	state->donated = true;
 
 	extent_attrs =
 		FIELD_PREP_CONST(GUNYAH_MEMEXTENT_MAPPING_TYPE,
@@ -223,132 +407,106 @@ int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 		pr_err("Failed to map guest address 0x%016llx: %d\n", gpa,
 		       gunyah_error);
 		ret = gunyah_error_remap(gunyah_error);
-		goto memextent_reclaim;
+		goto rollback;
 	}
+	state->mapped = true;
 
 	return 0;
-memextent_reclaim:
-	gunyah_error = gunyah_hypercall_memextent_donate(
-		reclaim_flags(share, true), guest_extent->capid,
-		host_extent->capid, pa, size);
-	if (gunyah_error != GUNYAH_ERROR_OK)
-		pr_err("Failed to reclaim memory donation for guest address 0x%016llx: %d\n",
-		       gpa, gunyah_error);
-platform_release:
-	tmp = gunyah_rm_platform_reclaim_demand_page(ghvm->rm, ghvm->vmid,
-						     access, folio);
-	if (tmp) {
-		pr_err("Platform failed to reclaim memory for guest address 0x%016llx: %d",
-		       gpa, tmp);
+rollback:
+	cleanup_ret = gunyah_vm_return_folio(ghvm, state, gfn, share, write, true);
+	if (cleanup_ret) {
+		pr_err_ratelimited("Failed to roll back guest folio at 0x%016llx: %d\n",
+				   gpa, cleanup_ret);
 		return ret;
 	}
-reclaim_host:
 	gunyah_folio_host_reclaim(folio);
+	xa_erase(&ghvm->folio_states, gfn);
+	*retained = false;
+erase_range:
 	mtree_erase(&ghvm->mm, gfn);
+free_state:
+	kfree(state);
+erase_index:
+	xa_erase(&ghvm->folio_gfns, folio_pfn(folio));
 	return ret;
 }
 
 static int __gunyah_vm_reclaim_folio_locked(struct gunyah_vm *ghvm, void *entry,
 					    u64 gfn, const bool sync)
 {
-	u32 map_flags = BIT(GUNYAH_ADDRSPACE_MAP_FLAG_PARTIAL);
-	struct gunyah_resource *guest_extent, *host_extent, *addrspace;
-	enum gunyah_pagetable_access access;
-	enum gunyah_error gunyah_error;
-	struct folio *folio;
-	bool write, share;
-	phys_addr_t pa;
-	size_t size;
+	struct folio *folio = xa_untag_pointer(entry);
+	struct gunyah_folio_state *state;
+	bool share = !!(xa_pointer_tag(entry) & SHARE_TAG);
+	bool write = !!(xa_pointer_tag(entry) & WRITE_TAG);
 	int ret;
 
-	addrspace = __first_resource(&ghvm->addrspace_ticket);
-	if (!addrspace)
-		return -ENODEV;
-
-	share = !!(xa_pointer_tag(entry) & SHARE_TAG);
-	write = !!(xa_pointer_tag(entry) & WRITE_TAG);
-	folio = xa_untag_pointer(entry);
-
-	if (!sync)
-		map_flags |= BIT(GUNYAH_ADDRSPACE_MAP_FLAG_NOSYNC);
-
-	/* clang-format off */
-	if (share) {
-		guest_extent = __first_resource(&ghvm->guest_shared_extent_ticket);
-		host_extent = __first_resource(&ghvm->host_shared_extent_ticket);
-		map_flags |= BIT(GUNYAH_ADDRSPACE_MAP_FLAG_VMMIO);
-	} else {
-		guest_extent = __first_resource(&ghvm->guest_private_extent_ticket);
-		host_extent = __first_resource(&ghvm->host_private_extent_ticket);
-		map_flags |= BIT(GUNYAH_ADDRSPACE_MAP_FLAG_PRIVATE);
+	state = xa_load(&ghvm->folio_states, gfn);
+	if (!state) {
+		/* Parcels converted to paging arrive with all stages complete. */
+		state = kzalloc_obj(*state);
+		if (!state)
+			return -ENOMEM;
+		state->folio = folio;
+		state->mapped = true;
+		state->donated = true;
+		state->platform_owned = true;
+		ret = xa_insert(&ghvm->folio_states, gfn, state, GFP_KERNEL);
+		if (ret) {
+			kfree(state);
+			return ret;
+		}
 	}
-	/* clang-format on */
-
-	pa = PFN_PHYS(folio_pfn(folio));
-	size = folio_size(folio);
-
-	gunyah_error = gunyah_hypercall_addrspace_unmap(addrspace->capid,
-							guest_extent->capid,
-							gunyah_gfn_to_gpa(gfn),
-							map_flags, pa, size);
-	if (gunyah_error != GUNYAH_ERROR_OK) {
-		pr_err_ratelimited(
-			"Failed to unmap guest address 0x%016llx: %d\n",
-			gunyah_gfn_to_gpa(gfn), gunyah_error);
-		ret = gunyah_error_remap(gunyah_error);
-		goto err;
-	}
-
-	gunyah_error = gunyah_hypercall_memextent_donate(
-		reclaim_flags(share, sync), guest_extent->capid,
-		host_extent->capid, pa, size);
-	if (gunyah_error != GUNYAH_ERROR_OK) {
-		pr_err_ratelimited(
-			"Failed to reclaim memory donation for guest address 0x%016llx: %d\n",
-			gunyah_gfn_to_gpa(gfn), gunyah_error);
-		ret = gunyah_error_remap(gunyah_error);
-		goto err;
-	}
-
-	if (share && write)
-		access = GUNYAH_PAGETABLE_ACCESS_RW;
-	else if (share && !write)
-		access = GUNYAH_PAGETABLE_ACCESS_R;
-	else if (!share && write)
-		access = GUNYAH_PAGETABLE_ACCESS_RWX;
-	else /* !share && !write */
-		access = GUNYAH_PAGETABLE_ACCESS_RX;
-
-	ret = gunyah_rm_platform_reclaim_demand_page(ghvm->rm, ghvm->vmid,
-						     access, folio);
+	if (WARN_ON(state->folio != folio))
+		return -EINVAL;
+	ret = gunyah_vm_return_folio(ghvm, state, gfn, share, write, sync);
 	if (ret) {
-		pr_err_ratelimited(
-			"Platform failed to reclaim memory for guest address 0x%016llx: %d",
-			gunyah_gfn_to_gpa(gfn), ret);
-		goto err;
+		pr_err_ratelimited("Failed to reclaim guest folio at 0x%016llx: %d\n",
+				   gunyah_gfn_to_gpa(gfn), ret);
+		return ret;
 	}
 
 	BUG_ON(mtree_erase(&ghvm->mm, gfn) != entry);
-
+	xa_erase(&ghvm->folio_states, gfn);
+	xa_erase(&ghvm->folio_gfns, folio_pfn(folio));
+	kfree(state);
+	gunyah_folio_host_reclaim(folio);
 	unpin_user_page(folio_page(folio, 0));
-	account_locked_vm(current->mm, 1, false);
+	account_locked_vm(ghvm->mm_s, 1, false);
 	return 0;
-err:
-	return ret;
 }
 
 int gunyah_vm_reclaim_folio(struct gunyah_vm *ghvm, u64 gfn, struct folio *folio)
 {
 	void *entry;
+	int ret = 0;
 
+	down_write(&ghvm->bindings_lock);
+	if (ghvm->mm_unknown) {
+		ret = -EIO;
+		goto unlock;
+	}
 	entry = mtree_load(&ghvm->mm, gfn);
 	if (!entry)
-		return 0;
+		goto unlock;
 
-	if (folio != xa_untag_pointer(entry))
-		return -EAGAIN;
+	if (folio != xa_untag_pointer(entry)) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	if (!xa_load(&ghvm->folio_gfns, folio_pfn(folio)) ||
+	    xa_to_value(xa_load(&ghvm->folio_gfns, folio_pfn(folio))) != gfn) {
+		ret = -EINVAL;
+		goto unlock;
+	}
 
-	return __gunyah_vm_reclaim_folio_locked(ghvm, entry, gfn, true);
+	folio_get(folio);
+	folio_lock(folio);
+	ret = __gunyah_vm_reclaim_folio_locked(ghvm, entry, gfn, true);
+	folio_unlock(folio);
+	folio_put(folio);
+unlock:
+	up_write(&ghvm->bindings_lock);
+	return ret;
 }
 
 int gunyah_vm_reclaim_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr)
@@ -358,11 +516,29 @@ int gunyah_vm_reclaim_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr)
 	int ret, ret2 = 0;
 	void *entry;
 	bool sync;
+	u64 last;
 
-	mt_for_each(&ghvm->mm, entry, next, gfn + nr) {
+	if (check_add_overflow(gfn, nr, &last))
+		return -EOVERFLOW;
+	down_write(&ghvm->bindings_lock);
+	if (ghvm->mm_unknown) {
+		ret2 = -EIO;
+		goto unlock;
+	}
+	/* A partial range must not donate or unpin an entire large folio. */
+	mt_for_each(&ghvm->mm, entry, next, last) {
+		folio = xa_untag_pointer(entry);
+		g = next - folio_nr_pages(folio);
+		if (g < gfn || folio_nr_pages(folio) - 1 > last - g) {
+			ret2 = -EINVAL;
+			goto unlock;
+		}
+	}
+	next = gfn;
+	mt_for_each(&ghvm->mm, entry, next, last) {
 		folio = xa_untag_pointer(entry);
 		g = next;
-		sync = !mt_find_after(&ghvm->mm, &g, gfn + nr);
+		sync = !mt_find_after(&ghvm->mm, &g, last);
 
 		g = next - folio_nr_pages(folio);
 		folio_get(folio);
@@ -373,10 +549,11 @@ int gunyah_vm_reclaim_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr)
 			ret = -EAGAIN;
 		folio_unlock(folio);
 		folio_put(folio);
-		if (ret && ret2 != -EAGAIN)
+		if (ret && (!ret2 || gunyah_vm_reclaim_retryable(ret2)))
 			ret2 = ret;
 	}
-
+unlock:
+	up_write(&ghvm->bindings_lock);
 	return ret2;
 }
 
@@ -439,9 +616,12 @@ static int gunyah_gup_demand_page(struct gunyah_vm *ghvm, struct gunyah_vm_bindi
 	unsigned long gfn = gunyah_gpa_to_gfn(gpa);
 	unsigned int gup_flags;
 	u64 offset;
+	u64 first, binding_start, binding_pages;
+	unsigned long page_offset;
 	int pinned, ret;
 	struct page *page;
 	struct folio *folio;
+	bool retained;
 
 	if (write && !(b->flags & GUNYAH_MEM_ALLOW_WRITE))
 		return -EPERM;
@@ -459,7 +639,7 @@ static int gunyah_gup_demand_page(struct gunyah_vm *ghvm, struct gunyah_vm_bindi
 					gup_flags, &page);
 
 	if (pinned != 1) {
-		ret = pinned;
+		ret = pinned < 0 ? pinned : -EFAULT;
 		goto unlock_page;
 	}
 
@@ -471,19 +651,37 @@ static int gunyah_gup_demand_page(struct gunyah_vm *ghvm, struct gunyah_vm_bindi
 	}
 
 	folio_lock(folio);
-	ret = gunyah_vm_provide_folio(ghvm, folio, gfn - folio_page_idx(folio, page),
+	page_offset = folio_page_idx(folio, page);
+	binding_start = gunyah_gpa_to_gfn(b->guest_phys_addr);
+	binding_pages = gunyah_gpa_to_gfn(b->size);
+	if (gfn < page_offset) {
+		ret = -EINVAL;
+		goto unlock_folio;
+	}
+	first = gfn - page_offset;
+	if (first < binding_start || first - binding_start >= binding_pages ||
+	    folio_nr_pages(folio) > binding_pages - (first - binding_start)) {
+		ret = -EINVAL;
+		goto unlock_folio;
+	}
+	ret = gunyah_vm_provide_folio(ghvm, folio, first,
 				      !(b->share_type == VM_MEM_LEND),
-				      !!(b->flags & GUNYAH_MEM_ALLOW_WRITE));
+				      !!(b->flags & GUNYAH_MEM_ALLOW_WRITE),
+				      &retained);
 	folio_unlock(folio);
 	if (ret) {
 		if (ret != -EAGAIN)
 			pr_err_ratelimited(
 				"Failed to provide folio for guest addr: %016llx: %d\n",
 				gpa, ret);
+		if (retained)
+			return ret;
 		goto unpin_page;
 	}
 	return ret;
 
+unlock_folio:
+	folio_unlock(folio);
 unpin_page:
 	unpin_user_page(page);
 unlock_page:
@@ -497,7 +695,14 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write)
 	struct gunyah_vm_binding *b;
 	int ret;
 
-	down_read(&ghvm->bindings_lock);
+	if (current->mm != ghvm->mm_s)
+		return -EPERM;
+
+	down_write(&ghvm->bindings_lock);
+	if (ghvm->mm_unknown) {
+		ret = -EIO;
+		goto unlock;
+	}
 	b = mtree_load(&ghvm->bindings, gfn);
 	if (!b) {
 		ret = -ENOENT;
@@ -512,7 +717,7 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write)
 	}
 
 unlock:
-	up_read(&ghvm->bindings_lock);
+	up_write(&ghvm->bindings_lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(gunyah_demand_page);
@@ -608,7 +813,7 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	}
 	parcel->n_mem_entries = entries;
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
-	if (ret && parcel->mem_handle == GUNYAH_MEM_HANDLE_INVAL)
+	if (ret && !gunyah_rm_mem_reclaim_needed(parcel))
 		goto free_mem_entries;
 
 	retained = 0;
@@ -672,6 +877,7 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 	}
 
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
+	parcel->platform_ref = ghvm->platform_ref;
 	if (b->share_type == VM_MEM_LEND) {
 		parcel->n_acl_entries = 1;
 		lend = true;
@@ -766,7 +972,7 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 	pgoff_t i;
 	int ret;
 
-	if (parcel->mem_handle == GUNYAH_MEM_HANDLE_INVAL)
+	if (!gunyah_rm_mem_reclaim_needed(parcel))
 		return 0;
 
 	ret = gunyah_rm_mem_reclaim(ghvm->rm, parcel);
@@ -841,7 +1047,8 @@ int gunyah_reclaim_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
 		if (!b->vm_parcel)
 			continue;
 		ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
-		if (ret)
+		/* Do not hide a permanent failure behind a later transient one. */
+		if (ret && (!ret2 || gunyah_vm_reclaim_retryable(ret2)))
 			ret2 = ret;
 	}
 
@@ -915,8 +1122,7 @@ int gunyah_share_range_as_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
 rollback:
 	/* Let's roll back.*/
 	while (count--) {
-		if ((*parcels)[count].parcel.mem_handle !=
-			GUNYAH_MEM_HANDLE_INVAL) {
+		if (gunyah_rm_mem_reclaim_needed(&(*parcels)[count].parcel)) {
 			ret_err = gunyah_reclaim_parcel(ghvm, &(*parcels)[count]);
 			if (ret_err) {
 				retained = true;
