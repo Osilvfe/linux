@@ -80,6 +80,8 @@ gunyah_rm_mem_reclaim_needed(const struct gunyah_rm_mem_parcel *parcel)
 
 int gunyah_rm_alloc_vmid(struct gunyah_rm *rm, u16 vmid);
 int gunyah_rm_dealloc_vmid(struct gunyah_rm *rm, u16 vmid);
+int gunyah_rm_vm_get_state(struct gunyah_rm *rm, u16 vmid,
+			   enum gunyah_rm_vm_status *vm_status);
 int gunyah_rm_vm_reset(struct gunyah_rm *rm, u16 vmid);
 int gunyah_rm_vm_start(struct gunyah_rm *rm, u16 vmid);
 int gunyah_rm_vm_stop(struct gunyah_rm *rm, u16 vmid);

@@ -1040,10 +1040,16 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		dev_warn(ghvm->parent, "Failed to configure VM: %d\n", ret);
 		goto err;
 	}
+	/* VM_CONFIG_IMAGE completes authentication or moves directly to INIT. */
+	if (ghvm->auth == GUNYAH_RM_VM_AUTH_QCOM_TRUSTED_VM)
+		ghvm->vm_status = GUNYAH_RM_VM_STATUS_AUTH;
+	else
+		ghvm->vm_status = GUNYAH_RM_VM_STATUS_INIT;
 
 	ret = gunyah_vm_authenticate(ghvm);
 	if (ret)
 		goto err;
+	ghvm->vm_status = GUNYAH_RM_VM_STATUS_INIT;
 
 	if (ghvm->fw.config.size > 0) {
 		ret = gunyah_rm_vm_set_firmware_mem(ghvm->rm, ghvm->vmid, &ghvm->fw.parcel.parcel,
@@ -1354,6 +1360,35 @@ static int gunyah_vm_reclaim_parcels(struct gunyah_vm *ghvm)
 	return ret;
 }
 
+static int gunyah_vm_refresh_rm_status(struct gunyah_vm *ghvm)
+{
+	enum gunyah_rm_vm_status rm_status;
+	enum gunyah_rm_vm_status local_status;
+	int ret;
+
+	local_status = READ_ONCE(ghvm->vm_status);
+	ret = gunyah_rm_vm_get_state(ghvm->rm, ghvm->vmid, &rm_status);
+	if (ret)
+		return ret;
+
+	down_write(&ghvm->status_lock);
+	if (READ_ONCE(ghvm->vm_status) != local_status) {
+		dev_warn(ghvm->parent,
+			 "VM %u state changed during RM query: local %u, RM %u\n",
+			 ghvm->vmid, ghvm->vm_status, rm_status);
+		goto unlock;
+	}
+	if (local_status != rm_status)
+		dev_warn(ghvm->parent,
+			 "VM %u state mismatch: local %u, RM %u\n",
+			 ghvm->vmid, local_status, rm_status);
+
+	WRITE_ONCE(ghvm->vm_status, rm_status);
+unlock:
+	up_write(&ghvm->status_lock);
+	return 0;
+}
+
 static void _gunyah_vm_put(struct kref *kref)
 {
 	struct gunyah_vm *ghvm = container_of(kref, struct gunyah_vm, kref);
@@ -1374,10 +1409,36 @@ static void _gunyah_vm_put(struct kref *kref)
 		ret = -EIO;
 		goto quarantine;
 	}
+	if (ghvm->vmid != GUNYAH_VMID_INVAL) {
+		ret = gunyah_vm_refresh_rm_status(ghvm);
+		if (ret)
+			goto quarantine;
+	}
 	if (READ_ONCE(ghvm->vm_status) == GUNYAH_RM_VM_STATUS_RUNNING) {
 		ret = gunyah_vm_stop(ghvm);
 		if (ret)
 			goto quarantine;
+	}
+	switch (READ_ONCE(ghvm->vm_status)) {
+	case GUNYAH_RM_VM_STATUS_NO_STATE:
+	case GUNYAH_RM_VM_STATUS_LOAD:
+	case GUNYAH_RM_VM_STATUS_READY:
+	case GUNYAH_RM_VM_STATUS_INIT_FAILED:
+	case GUNYAH_RM_VM_STATUS_EXITED:
+	case GUNYAH_RM_VM_STATUS_RESET:
+		break;
+	case GUNYAH_RM_VM_STATUS_AUTH:
+	case GUNYAH_RM_VM_STATUS_INIT:
+		dev_err(ghvm->parent,
+			"VM %u cannot be torn down in RM state %u; isolating until reboot\n",
+			ghvm->vmid, ghvm->vm_status);
+		ret = -EOPNOTSUPP;
+		goto quarantine;
+	case GUNYAH_RM_VM_STATUS_RESET_FAILED:
+	case GUNYAH_RM_VM_STATUS_RESETTING:
+	default:
+		ret = -EIO;
+		goto quarantine;
 	}
 
 	gunyah_vm_remove_functions(ghvm);

@@ -20,6 +20,7 @@
 #define GUNYAH_RM_RPC_VM_START			0x56000004
 #define GUNYAH_RM_RPC_VM_STOP			0x56000005
 #define GUNYAH_RM_RPC_VM_RESET			0x56000006
+#define GUNYAH_RM_RPC_VM_GET_STATE		0x56000017
 #define GUNYAH_RM_RPC_VM_CONFIG_IMAGE		0x56000009
 #define GUNYAH_RM_RPC_VM_AUTH_IMAGE		0x5600000A
 #define GUNYAH_RM_RPC_VM_INIT			0x5600000B
@@ -410,6 +411,66 @@ int gunyah_rm_dealloc_vmid(struct gunyah_rm *rm, u16 vmid)
 					  vmid);
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_dealloc_vmid, ERRNO);
+
+/**
+ * gunyah_rm_vm_get_state() - Query the resource manager's VM state
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM identifier allocated with gunyah_rm_alloc_vmid
+ * @vm_status: Set to the VM state reported by the resource manager
+ *
+ * Return: 0 on success; negative errno on failure.
+ */
+int gunyah_rm_vm_get_state(struct gunyah_rm *rm, u16 vmid,
+			   enum gunyah_rm_vm_status *vm_status)
+{
+	struct gunyah_rm_vm_common_vmid_req req_payload = {
+		.vmid = cpu_to_le16(vmid),
+	};
+	__le32 *resp;
+	size_t resp_size;
+	u8 state;
+	int ret;
+
+	if (!vm_status)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_GET_STATE, &req_payload,
+			     sizeof(req_payload), (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size != sizeof(*resp))
+		goto malformed;
+
+	state = le32_to_cpu(*resp) & 0xff;
+	switch (state) {
+	case GUNYAH_RM_VM_STATUS_NO_STATE:
+	case GUNYAH_RM_VM_STATUS_INIT:
+	case GUNYAH_RM_VM_STATUS_READY:
+	case GUNYAH_RM_VM_STATUS_RUNNING:
+	case GUNYAH_RM_VM_STATUS_PAUSED:
+	case GUNYAH_RM_VM_STATUS_LOAD:
+	case GUNYAH_RM_VM_STATUS_AUTH:
+	case GUNYAH_RM_VM_STATUS_INIT_FAILED:
+	case GUNYAH_RM_VM_STATUS_EXITED:
+	case GUNYAH_RM_VM_STATUS_RESETTING:
+	case GUNYAH_RM_VM_STATUS_RESET:
+	case GUNYAH_RM_VM_STATUS_RESET_FAILED:
+		break;
+	default:
+		goto malformed;
+	}
+
+	*vm_status = state;
+	kfree(resp);
+	return 0;
+
+malformed:
+	kfree(resp);
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_get_state, ERRNO);
 
 /**
  * gunyah_rm_vm_reset() - Reset a VM's resources
