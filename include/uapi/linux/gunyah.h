@@ -41,6 +41,132 @@ struct gunyah_create_mem_args {
 	_IOW(GUNYAH_IOCTL_TYPE, 0x8, \
 	     struct gunyah_create_mem_args)
 
+/**
+ * enum gunyah_device_resource_type - Resource descriptor types reported by RM
+ * @GUNYAH_DEVICE_RESOURCE_MMIO: MMIO aperture
+ * @GUNYAH_DEVICE_RESOURCE_IRQ: Physical interrupt
+ * @GUNYAH_DEVICE_RESOURCE_IOMMU_ENDPOINT: IOMMU stream range
+ * @GUNYAH_DEVICE_RESOURCE_MSI_ENDPOINT: MSI endpoint range
+ * @GUNYAH_DEVICE_RESOURCE_PCIE_FUNCTION: PCIe requester function
+ */
+enum gunyah_device_resource_type {
+	GUNYAH_DEVICE_RESOURCE_MMIO = 1,
+	GUNYAH_DEVICE_RESOURCE_IRQ,
+	GUNYAH_DEVICE_RESOURCE_IOMMU_ENDPOINT,
+	GUNYAH_DEVICE_RESOURCE_MSI_ENDPOINT,
+	GUNYAH_DEVICE_RESOURCE_PCIE_FUNCTION,
+};
+
+/**
+ * struct gunyah_device_resource - RM physical device resource descriptor
+ * @type: One of &enum gunyah_device_resource_type
+ * @data: Type-specific data in RM wire format
+ *
+ * For MMIO, data[0] is size, data[1] is the low 32 bits of the physical
+ * address, and data[2] is the high 32 bits.  For IRQ, data[0] is the physical
+ * interrupt number.  IOMMU and MSI endpoints use data[0] as the interface
+ * handle, data[1] as the first endpoint ID, and data[2] as the endpoint count.
+ * PCIe functions use data[0] as the requester ID and data[1] as the root
+ * complex handle.
+ */
+struct gunyah_device_resource {
+	__u32 type;
+	__u32 data[3];
+};
+
+#define GUNYAH_DEVICE_HANDLE_INVALID	0xffffffffU
+
+/**
+ * struct gunyah_device_find_args - Find an RM-owned physical device
+ * @resource: Any resource descriptor identifying the device
+ * @handle: Returned RM device handle
+ * @flags: Reserved; must be zero
+ */
+struct gunyah_device_find_args {
+	struct gunyah_device_resource resource;
+	__u32 handle;
+	__u32 flags;
+};
+
+#define GUNYAH_FIND_DEVICE	\
+	_IOWR(GUNYAH_IOCTL_TYPE, 0xb, struct gunyah_device_find_args)
+
+/**
+ * enum gunyah_device_get_resources_flags - Flags for resource enumeration
+ * @GUNYAH_DEVICE_GET_RESOURCES_PHYSICAL: Return resources before VM remapping
+ */
+enum gunyah_device_get_resources_flags {
+	GUNYAH_DEVICE_GET_RESOURCES_PHYSICAL = 1UL << 0,
+};
+
+/**
+ * struct gunyah_device_get_resources_args - Describe a device's resources
+ * @handle: Device handle returned by &GUNYAH_FIND_DEVICE
+ * @flags: See &enum gunyah_device_get_resources_flags
+ * @count: On input, capacity of @resources; on output, required entries.
+ *         A null @resources pointer performs a count-only query.
+ * @resources: Pointer to an array of &struct gunyah_device_resource
+ */
+struct gunyah_device_get_resources_args {
+	__u32 handle;
+	__u32 flags;
+	__u32 count;
+	__u32 reserved;
+	__u64 resources;
+};
+
+#define GUNYAH_GET_DEVICE_RESOURCES	\
+	_IOWR(GUNYAH_IOCTL_TYPE, 0xc, \
+	      struct gunyah_device_get_resources_args)
+
+/**
+ * enum gunyah_device_accept_flags - Accept a device offered to this VM
+ * @GUNYAH_DEVICE_ACCEPT_RESET: Reset the device before attaching it
+ * @GUNYAH_DEVICE_ACCEPT_BIND: Bind the device to @bus_handle
+ */
+enum gunyah_device_accept_flags {
+	GUNYAH_DEVICE_ACCEPT_RESET = 1UL << 0,
+	GUNYAH_DEVICE_ACCEPT_BIND = 1UL << 1,
+};
+
+/**
+ * struct gunyah_device_accept_args - Accept a lent or donated device
+ * @handle: Device handle returned by &GUNYAH_FIND_DEVICE in the borrower VM
+ * @flags: See &enum gunyah_device_accept_flags
+ * @bus_handle: Destination bus when &GUNYAH_DEVICE_ACCEPT_BIND is set
+ * @reserved: Reserved for future extension and must be zero
+ */
+struct gunyah_device_accept_args {
+	__u32 handle;
+	__u32 flags;
+	__u32 bus_handle;
+	__u32 reserved;
+};
+
+#define GUNYAH_DEVICE_ACCEPT	\
+	_IOW(GUNYAH_IOCTL_TYPE, 0xd, struct gunyah_device_accept_args)
+
+/**
+ * enum gunyah_device_release_flags - Release a borrowed device
+ * @GUNYAH_DEVICE_RELEASE_RESET: Reset the device while releasing it
+ */
+enum gunyah_device_release_flags {
+	GUNYAH_DEVICE_RELEASE_RESET = 1UL << 0,
+};
+
+/**
+ * struct gunyah_device_release_args - Release a borrowed device
+ * @handle: Device handle returned by &GUNYAH_FIND_DEVICE in the borrower VM
+ * @flags: See &enum gunyah_device_release_flags
+ */
+struct gunyah_device_release_args {
+	__u32 handle;
+	__u32 flags;
+};
+
+#define GUNYAH_DEVICE_RELEASE	\
+	_IOW(GUNYAH_IOCTL_TYPE, 0xe, struct gunyah_device_release_args)
+
 /*
  * ioctls for gunyah-vm fds (returned by GUNYAH_CREATE_VM)
  */
@@ -174,6 +300,33 @@ struct gunyah_fn_desc {
 
 #define GUNYAH_VM_ADD_FUNCTION	_IOW(GUNYAH_IOCTL_TYPE, 0x4, struct gunyah_fn_desc)
 #define GUNYAH_VM_REMOVE_FUNCTION	_IOW(GUNYAH_IOCTL_TYPE, 0x7, struct gunyah_fn_desc)
+
+/**
+ * enum gunyah_device_assignment_flags - Ownership transition for a device
+ * @GUNYAH_DEVICE_ASSIGN_DONATE: Donate ownership instead of lending it.  The
+ *                               device is not returned to the host VM when
+ *                               the target VM exits.
+ * @GUNYAH_DEVICE_ASSIGN_RESET: Reset the device while transferring it
+ */
+enum gunyah_device_assignment_flags {
+	GUNYAH_DEVICE_ASSIGN_DONATE = 1UL << 0,
+	GUNYAH_DEVICE_ASSIGN_RESET = 1UL << 1,
+};
+
+/**
+ * struct gunyah_device_assignment - Assign a physical device at VM start
+ * @handle: Device handle returned by &GUNYAH_FIND_DEVICE
+ * @flags: See &enum gunyah_device_assignment_flags
+ */
+struct gunyah_device_assignment {
+	__u32 handle;
+	__u32 flags;
+};
+
+#define GUNYAH_VM_ASSIGN_DEVICE		\
+	_IOW(GUNYAH_IOCTL_TYPE, 0xb, struct gunyah_device_assignment)
+#define GUNYAH_VM_UNASSIGN_DEVICE	\
+	_IOW(GUNYAH_IOCTL_TYPE, 0xc, struct gunyah_device_assignment)
 
 /**
  * enum gunyah_map_flags- Possible flags on &struct gunyah_map_mem_args
@@ -497,7 +650,10 @@ struct gunyah_auth_desc {
  * GH_CAP_VCPU_TIMER_WAKEUP: kernel handles GUNYAH_VCPU_STATE_EXPECTS_WAKEUP_OR_TIMEOUT,
  *     arming a per-vCPU hrtimer for the hypervisor-provided deadline.
  * GH_CAP_DEMAND_PAGING: the resident resource manager supports VM_SET_DEMAND_PAGING.
+ * GH_CAP_DEVICE_PASSTHROUGH: the RM device manager and kernel physical-device
+ *     UAPI are available.
  */
 #define GH_CAP_VCPU_TIMER_WAKEUP	0
 #define GH_CAP_DEMAND_PAGING		1
+#define GH_CAP_DEVICE_PASSTHROUGH	2
 #endif

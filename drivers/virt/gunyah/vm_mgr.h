@@ -122,6 +122,8 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
  * @resource_lock: Serializing addition of resources and resource tickets
  * @resources: List of &struct gunyah_resource that are associated with this VM
  * @resource_tickets: List of &struct gunyah_vm_resource_ticket
+ * @devices_lock: Serializes physical device assignment and teardown
+ * @devices: Physical devices registered for assignment to the VM
  * @auth: Authentication mechanism to be used by resource manager when
  *        launching the VM
  * @dtb: For tracking dtb configuration when launching the VM
@@ -164,6 +166,9 @@ struct gunyah_vm {
 	struct mutex resources_lock;
 	struct list_head resources;
 	struct list_head resource_tickets;
+	/* Physical device assignments are transferred during VM_CONFIGURE. */
+	struct mutex devices_lock;
+	struct list_head devices;
 
 	struct device *parent;
 	enum gunyah_rm_vm_auth_mechanism auth;

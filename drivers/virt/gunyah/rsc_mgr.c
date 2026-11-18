@@ -159,6 +159,7 @@ struct gunyah_rm_message {
  * @tx_irq_wake: TX interrupt has a wake reference
  * @rx_irq_wake: RX interrupt has a wake reference
  * @no_demand_paging: RM requires all guest memory to be shared up-front
+ * @no_device_passthrough: RM does not implement the physical device interface
  */
 struct gunyah_rm {
 	struct gunyah_resource tx_ghrsc;
@@ -192,6 +193,7 @@ struct gunyah_rm {
 
 	/* RM predates VM_SET_DEMAND_PAGING: share all guest memory up-front */
 	bool no_demand_paging;
+	bool no_device_passthrough;
 };
 
 /**
@@ -1241,6 +1243,16 @@ bool gunyah_rm_has_demand_paging(struct gunyah_rm *rm)
 EXPORT_SYMBOL_GPL(gunyah_rm_has_demand_paging);
 
 /**
+ * gunyah_rm_has_device_passthrough() - query physical device support
+ * @rm: resource manager handle
+ */
+bool gunyah_rm_has_device_passthrough(struct gunyah_rm *rm)
+{
+	return !rm->no_device_passthrough;
+}
+EXPORT_SYMBOL_GPL(gunyah_rm_has_device_passthrough);
+
+/**
  * gunyah_rm_probe_features() - detect optional RM capabilities
  * @rm: resource manager handle
  *
@@ -1250,6 +1262,8 @@ EXPORT_SYMBOL_GPL(gunyah_rm_has_demand_paging);
  */
 static void gunyah_rm_probe_features(struct gunyah_rm *rm)
 {
+	struct gunyah_device_resource *devices = NULL;
+	u32 count = 0;
 	int ret;
 
 	/* Zero ranges: this cannot change any VM state on any RM version. */
@@ -1257,6 +1271,14 @@ static void gunyah_rm_probe_features(struct gunyah_rm *rm)
 	rm->no_demand_paging = (ret == -EOPNOTSUPP);
 	if (rm->no_demand_paging)
 		pr_info("RM has no VM_SET_DEMAND_PAGING; guest memory will be shared up-front\n");
+
+	/* A valid VM is not needed to distinguish an implemented RPC. */
+	ret = gunyah_rm_device_get_resources(rm, GUNYAH_DEVICE_HANDLE_INVALID,
+					     0, &devices, &count);
+	rm->no_device_passthrough = (ret == -EOPNOTSUPP);
+	kfree(devices);
+	if (rm->no_device_passthrough)
+		pr_info("RM has no physical device interface\n");
 }
 
 static struct gunyah_rm *__rm;

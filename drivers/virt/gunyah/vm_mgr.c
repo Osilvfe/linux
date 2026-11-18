@@ -37,6 +37,19 @@
 #define GUNYAH_VM_RECLAIM_ATTEMPTS 3
 #define GUNYAH_VM_STATE_RECOVERY_ATTEMPTS 3
 
+enum gunyah_vm_device_state {
+	GUNYAH_VM_DEVICE_REGISTERED,
+	GUNYAH_VM_DEVICE_LENT,
+	GUNYAH_VM_DEVICE_DONATED,
+};
+
+struct gunyah_vm_device {
+	struct list_head list;
+	u32 handle;
+	u32 flags;
+	enum gunyah_vm_device_state state;
+};
+
 static DEFINE_XARRAY(gunyah_vm_functions);
 static DEFINE_XARRAY(gunyah_auth_vm_mgr);
 static LIST_HEAD(gunyah_quarantined_vms);
@@ -857,6 +870,8 @@ static __must_check struct gunyah_vm *gunyah_vm_alloc(struct gunyah_rm *rm)
 	mutex_init(&ghvm->resources_lock);
 	INIT_LIST_HEAD(&ghvm->resources);
 	INIT_LIST_HEAD(&ghvm->resource_tickets);
+	mutex_init(&ghvm->devices_lock);
+	INIT_LIST_HEAD(&ghvm->devices);
 	xa_init(&ghvm->boot_context);
 	xa_init(&ghvm->folio_states);
 	xa_init(&ghvm->folio_gfns);
@@ -950,6 +965,119 @@ out:
 	return ret;
 }
 
+static int gunyah_vm_reclaim_device_offers(struct gunyah_vm *ghvm)
+{
+	struct gunyah_vm_device *device;
+	int ret = 0;
+
+	mutex_lock(&ghvm->devices_lock);
+	list_for_each_entry(device, &ghvm->devices, list) {
+		int device_ret;
+
+		if (device->state == GUNYAH_VM_DEVICE_REGISTERED)
+			continue;
+
+		device_ret = gunyah_rm_device_reclaim(ghvm->rm, device->handle,
+						      device->flags &
+						      GUNYAH_DEVICE_ASSIGN_RESET);
+		if (device_ret) {
+			dev_err(ghvm->parent,
+				"Failed to roll back device %#x assignment: %d\n",
+				device->handle, device_ret);
+			if (!ret)
+				ret = device_ret;
+			continue;
+		}
+		device->state = GUNYAH_VM_DEVICE_REGISTERED;
+	}
+	mutex_unlock(&ghvm->devices_lock);
+	return ret;
+}
+
+static int gunyah_vm_transfer_devices(struct gunyah_vm *ghvm)
+{
+	struct gunyah_vm_device *device;
+	int ret = 0;
+
+	mutex_lock(&ghvm->devices_lock);
+	list_for_each_entry(device, &ghvm->devices, list) {
+		bool donate = device->flags & GUNYAH_DEVICE_ASSIGN_DONATE;
+		bool reset = device->flags & GUNYAH_DEVICE_ASSIGN_RESET;
+
+		if (!donate)
+			ret = gunyah_rm_device_lend(ghvm->rm, ghvm->vmid,
+						    device->handle, reset);
+		else
+			ret = gunyah_rm_device_donate(ghvm->rm, ghvm->vmid,
+						      device->handle, reset);
+		if (ret) {
+			dev_warn(ghvm->parent,
+				 "Failed to transfer device %#x to VM %u: %d\n",
+				 device->handle, ghvm->vmid, ret);
+			break;
+		}
+		device->state = donate ? GUNYAH_VM_DEVICE_DONATED :
+				       GUNYAH_VM_DEVICE_LENT;
+	}
+	mutex_unlock(&ghvm->devices_lock);
+
+	if (ret) {
+		int rollback_ret = gunyah_vm_reclaim_device_offers(ghvm);
+
+		if (rollback_ret)
+			dev_err(ghvm->parent,
+				"Device assignment rollback failed: %d\n",
+				rollback_ret);
+	}
+	return ret;
+}
+
+static int gunyah_vm_reclaim_lent_devices(struct gunyah_vm *ghvm)
+{
+	struct gunyah_vm_device *device;
+	int ret = 0;
+
+	mutex_lock(&ghvm->devices_lock);
+	list_for_each_entry(device, &ghvm->devices, list) {
+		int device_ret;
+
+		if (device->state == GUNYAH_VM_DEVICE_DONATED) {
+			/* Ownership was explicitly transferred away from the host. */
+			device->state = GUNYAH_VM_DEVICE_REGISTERED;
+			continue;
+		}
+		if (device->state == GUNYAH_VM_DEVICE_REGISTERED)
+			continue;
+
+		device_ret = gunyah_rm_device_reclaim(ghvm->rm, device->handle,
+						      device->flags &
+						      GUNYAH_DEVICE_ASSIGN_RESET);
+		if (device_ret) {
+			dev_err(ghvm->parent,
+				"Failed to reclaim device %#x from VM %u: %d\n",
+				device->handle, ghvm->vmid, device_ret);
+			if (!ret)
+				ret = device_ret;
+			continue;
+		}
+		device->state = GUNYAH_VM_DEVICE_REGISTERED;
+	}
+	mutex_unlock(&ghvm->devices_lock);
+	return ret;
+}
+
+static void gunyah_vm_free_device_assignments(struct gunyah_vm *ghvm)
+{
+	struct gunyah_vm_device *device, *iter;
+
+	mutex_lock(&ghvm->devices_lock);
+	list_for_each_entry_safe(device, iter, &ghvm->devices, list) {
+		list_del(&device->list);
+		kfree(device);
+	}
+	mutex_unlock(&ghvm->devices_lock);
+}
+
 static int gunyah_vm_start(struct gunyah_vm *ghvm)
 {
 	struct gunyah_rm_hyp_resources *resources = NULL;
@@ -992,6 +1120,11 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 	gunyah_uevent_notify_change(GUNYAH_EVENT_CREATE_VM, ghvm);
 
 	ret = gunyah_vm_pre_vm_configure(ghvm);
+	if (ret)
+		goto err_dealloc_vmid;
+
+	/* VM_CONFIGURE consumes devices offered by the owner. */
+	ret = gunyah_vm_transfer_devices(ghvm);
 	if (ret)
 		goto err_dealloc_vmid;
 
@@ -1121,13 +1254,29 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 	kfree(resources);
 	return ret;
 err_dealloc_vmid:
+	cleanup_ret = gunyah_vm_reclaim_device_offers(ghvm);
+	if (cleanup_ret) {
+		dev_err(ghvm->parent,
+			"Leaving VM %u isolated after device rollback failure\n",
+			ghvm->vmid);
+		ghvm->mm_unknown = true;
+	}
 	cleanup_ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
 	if (cleanup_ret)
 		dev_warn(ghvm->parent,
 			 "Failed to deallocate vmid: %d\n", cleanup_ret);
 	else
 		ghvm->vmid = GUNYAH_VMID_INVAL;
+	goto err_cleanup;
 err:
+	cleanup_ret = gunyah_vm_reclaim_device_offers(ghvm);
+	if (cleanup_ret) {
+		dev_err(ghvm->parent,
+			"Leaving VM %u isolated after device rollback failure\n",
+			ghvm->vmid);
+		ghvm->mm_unknown = true;
+	}
+err_cleanup:
 	/* gunyah_vm_free will handle releasing resources and reclaiming memory */
 	if (!gunyah_rm_is_failed(ghvm->rm))
 		gunyah_vm_start_fail(ghvm);
@@ -1308,6 +1457,89 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 
 		return gunyah_vm_set_boot_context(ghvm, &boot_ctx);
 	}
+	case GUNYAH_VM_ASSIGN_DEVICE: {
+		struct gunyah_device_assignment assignment;
+		struct gunyah_vm_device *device, *iter;
+		int ret;
+
+		if (ghvm->mm_s != current->mm)
+			return -EPERM;
+		if (!gunyah_rm_has_device_passthrough(ghvm->rm))
+			return -EOPNOTSUPP;
+		if (copy_from_user(&assignment, argp, sizeof(assignment)))
+			return -EFAULT;
+		if (assignment.handle == GUNYAH_DEVICE_HANDLE_INVALID ||
+		    assignment.flags & ~(GUNYAH_DEVICE_ASSIGN_DONATE |
+					 GUNYAH_DEVICE_ASSIGN_RESET))
+			return -EINVAL;
+
+		down_write(&ghvm->status_lock);
+		if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE) {
+			ret = -EBUSY;
+			goto assign_unlock_status;
+		}
+
+		device = kzalloc(sizeof(*device), GFP_KERNEL);
+		if (!device) {
+			ret = -ENOMEM;
+			goto assign_unlock_status;
+		}
+		device->handle = assignment.handle;
+		device->flags = assignment.flags;
+		device->state = GUNYAH_VM_DEVICE_REGISTERED;
+
+		mutex_lock(&ghvm->devices_lock);
+		list_for_each_entry(iter, &ghvm->devices, list) {
+			if (iter->handle == assignment.handle) {
+				ret = -EEXIST;
+				goto assign_unlock_devices;
+			}
+		}
+		list_add_tail(&device->list, &ghvm->devices);
+		ret = 0;
+
+assign_unlock_devices:
+		mutex_unlock(&ghvm->devices_lock);
+		if (ret)
+			kfree(device);
+assign_unlock_status:
+		up_write(&ghvm->status_lock);
+		return ret;
+	}
+	case GUNYAH_VM_UNASSIGN_DEVICE: {
+		struct gunyah_device_assignment assignment;
+		struct gunyah_vm_device *device;
+		int ret;
+
+		if (ghvm->mm_s != current->mm)
+			return -EPERM;
+		if (copy_from_user(&assignment, argp, sizeof(assignment)))
+			return -EFAULT;
+		if (assignment.flags)
+			return -EINVAL;
+
+		down_write(&ghvm->status_lock);
+		if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE) {
+			ret = -EBUSY;
+			goto unassign_unlock_status;
+		}
+
+		ret = -ENOENT;
+		mutex_lock(&ghvm->devices_lock);
+		list_for_each_entry(device, &ghvm->devices, list) {
+			if (device->handle != assignment.handle)
+				continue;
+			list_del(&device->list);
+			ret = 0;
+			break;
+		}
+		mutex_unlock(&ghvm->devices_lock);
+		if (!ret)
+			kfree(device);
+unassign_unlock_status:
+		up_write(&ghvm->status_lock);
+		return ret;
+	}
 	case GH_VM_ANDROID_SET_AUTH_TYPE: {
 		struct gunyah_auth_desc auth_desc;
 
@@ -1323,6 +1555,9 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		case GH_CAP_DEMAND_PAGING:
 			r = gunyah_rm_has_demand_paging(ghvm->rm);
+			break;
+		case GH_CAP_DEVICE_PASSTHROUGH:
+			r = gunyah_rm_has_device_passthrough(ghvm->rm);
 			break;
 		default:
 			r = 0;
@@ -1565,6 +1800,10 @@ static void _gunyah_vm_put(struct kref *kref)
 			goto quarantine;
 	}
 
+	ret = gunyah_vm_reclaim_lent_devices(ghvm);
+	if (ret)
+		goto quarantine;
+
 	ret = gunyah_vm_reclaim_parcels(ghvm);
 	if (ret)
 		goto quarantine;
@@ -1597,6 +1836,8 @@ static void _gunyah_vm_put(struct kref *kref)
 
 	gunyah_put_auth_vm_mgr(ghvm);
 	xa_destroy(&ghvm->boot_context);
+	gunyah_vm_free_device_assignments(ghvm);
+	mutex_destroy(&ghvm->devices_lock);
 	/* Converted parcels have no binding left to free their descriptors. */
 	if (ghvm->config_image.parcel.paged) {
 		kfree(ghvm->config_image.parcel.parcel.mem_entries);
@@ -1687,6 +1928,126 @@ err_destroy_vm:
 	return err;
 }
 
+static long gunyah_dev_ioctl_find_device(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_device_find_args args;
+	u32 handle;
+	int ret;
+
+	if (!gunyah_rm_has_device_passthrough(rm))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags)
+		return -EINVAL;
+
+	ret = gunyah_rm_device_find(rm, &args.resource, &handle);
+	if (ret)
+		return ret;
+
+	args.handle = handle;
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		return -EFAULT;
+	return 0;
+}
+
+static long gunyah_dev_ioctl_get_device_resources(struct gunyah_rm *rm,
+						  unsigned long arg)
+{
+	struct gunyah_device_get_resources_args args;
+	struct gunyah_device_resource *resources = NULL;
+	u32 capacity;
+	u32 num_resources = 0;
+	int ret;
+
+	if (!gunyah_rm_has_device_passthrough(rm))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.reserved ||
+	    args.flags & ~GUNYAH_DEVICE_GET_RESOURCES_PHYSICAL)
+		return -EINVAL;
+	capacity = args.count;
+
+	ret = gunyah_rm_device_get_resources(rm, args.handle, args.flags,
+					     &resources, &num_resources);
+	if (ret)
+		return ret;
+
+	args.count = num_resources;
+	if (!args.resources) {
+		if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+			ret = -EFAULT;
+		goto out;
+	}
+
+	if (num_resources) {
+		if (num_resources > capacity) {
+			if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+				ret = -EFAULT;
+			else
+				ret = -ENOSPC;
+			goto out;
+		}
+		if (copy_to_user(u64_to_user_ptr(args.resources), resources,
+				 num_resources * sizeof(*resources))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		ret = -EFAULT;
+out:
+	kfree(resources);
+	return ret;
+}
+
+static long gunyah_dev_ioctl_accept_device(struct gunyah_rm *rm,
+					   unsigned long arg)
+{
+	struct gunyah_device_accept_args args;
+	u32 flags = 0;
+
+	if (!gunyah_rm_has_device_passthrough(rm))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.handle == GUNYAH_DEVICE_HANDLE_INVALID || args.reserved ||
+	    args.flags & ~(GUNYAH_DEVICE_ACCEPT_RESET |
+			   GUNYAH_DEVICE_ACCEPT_BIND))
+		return -EINVAL;
+	if ((args.flags & GUNYAH_DEVICE_ACCEPT_BIND) && !args.bus_handle)
+		return -EINVAL;
+	if (!(args.flags & GUNYAH_DEVICE_ACCEPT_BIND) && args.bus_handle)
+		return -EINVAL;
+
+	if (args.flags & GUNYAH_DEVICE_ACCEPT_RESET)
+		flags |= BIT(0);
+	if (args.flags & GUNYAH_DEVICE_ACCEPT_BIND)
+		flags |= BIT(1);
+
+	return gunyah_rm_device_accept(rm, args.handle, flags, args.bus_handle);
+}
+
+static long gunyah_dev_ioctl_release_device(struct gunyah_rm *rm,
+					    unsigned long arg)
+{
+	struct gunyah_device_release_args args;
+
+	if (!gunyah_rm_has_device_passthrough(rm))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.handle == GUNYAH_DEVICE_HANDLE_INVALID ||
+	    args.flags & ~GUNYAH_DEVICE_RELEASE_RESET)
+		return -EINVAL;
+
+	return gunyah_rm_device_release(rm, args.handle,
+					!!(args.flags &
+					   GUNYAH_DEVICE_RELEASE_RESET));
+}
+
 long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -1700,6 +2061,14 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 			return -EFAULT;
 		return gunyah_guest_mem_create(&args);
 	}
+	case GUNYAH_FIND_DEVICE:
+		return gunyah_dev_ioctl_find_device(rm, arg);
+	case GUNYAH_GET_DEVICE_RESOURCES:
+		return gunyah_dev_ioctl_get_device_resources(rm, arg);
+	case GUNYAH_DEVICE_ACCEPT:
+		return gunyah_dev_ioctl_accept_device(rm, arg);
+	case GUNYAH_DEVICE_RELEASE:
+		return gunyah_dev_ioctl_release_device(rm, arg);
 	default:
 		return -ENOTTY;
 	}

@@ -23,6 +23,7 @@ int gunyah_rm_notifier_unregister(struct gunyah_rm *rm,
 				  struct notifier_block *nb);
 struct device *gunyah_rm_get(struct gunyah_rm *rm);
 bool gunyah_rm_has_demand_paging(struct gunyah_rm *rm);
+bool gunyah_rm_has_device_passthrough(struct gunyah_rm *rm);
 void gunyah_rm_put(struct gunyah_rm *rm);
 
 struct gunyah_rm_vm_exited_payload {
@@ -131,6 +132,21 @@ struct gunyah_rm_hyp_resources {
 
 int gunyah_rm_get_hyp_resources(struct gunyah_rm *rm, u16 vmid,
 				struct gunyah_rm_hyp_resources **resources);
+
+int gunyah_rm_device_find(struct gunyah_rm *rm,
+			  const struct gunyah_device_resource *resource,
+			  u32 *handle);
+int gunyah_rm_device_get_resources(struct gunyah_rm *rm, u32 handle,
+				   u32 flags,
+				   struct gunyah_device_resource **resources,
+				   u32 *num_resources);
+int gunyah_rm_device_accept(struct gunyah_rm *rm, u32 handle, u32 flags, u32 bus_handle);
+int gunyah_rm_device_release(struct gunyah_rm *rm, u32 handle, bool reset);
+int gunyah_rm_device_lend(struct gunyah_rm *rm, u16 vmid, u32 handle,
+			  bool reset);
+int gunyah_rm_device_donate(struct gunyah_rm *rm, u16 vmid, u32 handle,
+			    bool reset);
+int gunyah_rm_device_reclaim(struct gunyah_rm *rm, u32 handle, bool reset);
 
 int gunyah_rm_get_vmid(struct gunyah_rm *rm, u16 *vmid);
 

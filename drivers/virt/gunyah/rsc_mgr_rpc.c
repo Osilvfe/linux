@@ -30,7 +30,79 @@
 #define GUNYAH_RM_RPC_VM_SET_FIRMWARE_MEM	0x56000032
 #define GUNYAH_RM_RPC_VM_SET_DEMAND_PAGING	0x56000033
 #define GUNYAH_RM_RPC_VM_SET_ADDRESS_LAYOUT	0x56000034
+#define GUNYAH_RM_RPC_DEVICE_ACCEPT		0x56000060
+#define GUNYAH_RM_RPC_DEVICE_LEND		0x56000061
+#define GUNYAH_RM_RPC_DEVICE_RELEASE		0x56000062
+#define GUNYAH_RM_RPC_DEVICE_RECLAIM		0x56000063
+#define GUNYAH_RM_RPC_DEVICE_FIND_HANDLE	0x56000065
+#define GUNYAH_RM_RPC_DEVICE_GET_RESOURCES	0x56000066
+#define GUNYAH_RM_RPC_DEVICE_DONATE		0x56000069
 /* clang-format on */
+
+#define GUNYAH_RM_DEVICE_RESET_FLAG		BIT(0)
+#define GUNYAH_RM_DEVICE_BIND_FLAG		BIT(1)
+#define GUNYAH_RM_DEVICE_GET_RESOURCES_PHYSICAL	BIT(0)
+
+struct gunyah_rm_device_transfer_req {
+	__le16 vmid;
+	u8 flags;
+	u8 reserved;
+	__le32 handle;
+} __packed;
+
+struct gunyah_rm_device_accept_req {
+	__le32 handle;
+	u8 flags;
+	u8 reserved[3];
+	__le32 bus_handle;
+} __packed;
+
+struct gunyah_rm_device_release_req {
+	__le32 handle;
+	u8 flags;
+	u8 reserved[3];
+} __packed;
+
+struct gunyah_rm_device_reclaim_req {
+	__le32 handle;
+	u8 flags;
+	u8 reserved[3];
+} __packed;
+
+struct gunyah_rm_device_find_resp {
+	__le32 handle;
+} __packed;
+
+struct gunyah_rm_device_get_resources_req {
+	__le32 handle;
+	u8 flags;
+	u8 reserved[3];
+} __packed;
+
+struct gunyah_rm_device_get_resources_resp {
+	__le16 num_entries;
+	__le16 reserved;
+	struct gunyah_device_resource resources[];
+} __packed;
+
+static_assert(sizeof(struct gunyah_device_resource) == 16);
+static_assert(sizeof(struct gunyah_rm_device_transfer_req) == 8);
+static_assert(offsetof(struct gunyah_rm_device_transfer_req, vmid) == 0);
+static_assert(offsetof(struct gunyah_rm_device_transfer_req, flags) == 2);
+static_assert(offsetof(struct gunyah_rm_device_transfer_req, handle) == 4);
+static_assert(sizeof(struct gunyah_rm_device_accept_req) == 12);
+static_assert(offsetof(struct gunyah_rm_device_accept_req, handle) == 0);
+static_assert(offsetof(struct gunyah_rm_device_accept_req, flags) == 4);
+static_assert(offsetof(struct gunyah_rm_device_accept_req, bus_handle) == 8);
+static_assert(sizeof(struct gunyah_rm_device_release_req) == 8);
+static_assert(offsetof(struct gunyah_rm_device_release_req, handle) == 0);
+static_assert(offsetof(struct gunyah_rm_device_release_req, flags) == 4);
+static_assert(sizeof(struct gunyah_rm_device_reclaim_req) == 8);
+static_assert(offsetof(struct gunyah_rm_device_reclaim_req, handle) == 0);
+static_assert(offsetof(struct gunyah_rm_device_reclaim_req, flags) == 4);
+static_assert(sizeof(struct gunyah_rm_device_get_resources_req) == 8);
+static_assert(offsetof(struct gunyah_rm_device_get_resources_req, handle) == 0);
+static_assert(offsetof(struct gunyah_rm_device_get_resources_req, flags) == 4);
 
 struct gunyah_rm_vm_common_vmid_req {
 	__le16 vmid;
@@ -683,6 +755,205 @@ int gunyah_rm_get_hyp_resources(struct gunyah_rm *rm, u16 vmid,
 	return 0;
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_get_hyp_resources, ERRNO);
+
+/**
+ * gunyah_rm_device_find() - Locate a physical device managed by RM
+ * @rm: Handle to a Gunyah resource manager
+ * @resource: A resource descriptor uniquely identifying the device
+ * @handle: Set to the RM device handle on success
+ */
+int gunyah_rm_device_find(struct gunyah_rm *rm,
+			  const struct gunyah_device_resource *resource,
+			  u32 *handle)
+{
+	struct gunyah_rm_device_find_resp *resp;
+	size_t resp_size;
+	int ret;
+
+	if (!resource || !handle)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_DEVICE_FIND_HANDLE, resource,
+			     sizeof(*resource), (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size != sizeof(*resp) ||
+	    le32_to_cpu(resp->handle) == GUNYAH_DEVICE_HANDLE_INVALID) {
+		kfree(resp);
+		gunyah_rm_mark_failed(rm);
+		return -EBADMSG;
+	}
+
+	*handle = le32_to_cpu(resp->handle);
+	kfree(resp);
+	return 0;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_find, ERRNO);
+
+/**
+ * gunyah_rm_device_get_resources() - Return a device's RM resource descriptors
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Device handle returned by gunyah_rm_device_find()
+ * @flags: See &enum gunyah_device_get_resources_flags
+ * @resources: Set to a newly allocated resource array
+ * @num_resources: Number of entries placed in @resources
+ */
+int gunyah_rm_device_get_resources(struct gunyah_rm *rm, u32 handle,
+				   u32 flags,
+				   struct gunyah_device_resource **resources,
+				   u32 *num_resources)
+{
+	struct gunyah_rm_device_get_resources_req req = {
+		.handle = cpu_to_le32(handle),
+		.flags = flags,
+	};
+	struct gunyah_rm_device_get_resources_resp *resp;
+	size_t body_size, resp_size;
+	struct gunyah_device_resource *copy = NULL;
+	u32 count;
+	int ret;
+
+	if (!resources || !num_resources ||
+	    flags & ~GUNYAH_RM_DEVICE_GET_RESOURCES_PHYSICAL)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_DEVICE_GET_RESOURCES, &req,
+			     sizeof(req), (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size < sizeof(*resp)) {
+		kfree(resp);
+		gunyah_rm_mark_failed(rm);
+		return -EBADMSG;
+	}
+
+	count = le16_to_cpu(resp->num_entries);
+	if (check_mul_overflow((size_t)count, sizeof(**resources), &body_size) ||
+	    check_add_overflow((size_t)sizeof(*resp), body_size, &body_size) ||
+	    body_size != resp_size) {
+		kfree(resp);
+		gunyah_rm_mark_failed(rm);
+		return -EBADMSG;
+	}
+
+	if (count) {
+		copy = kmemdup(resp->resources,
+			       count * sizeof(**resources), GFP_KERNEL);
+		if (!copy) {
+			kfree(resp);
+			return -ENOMEM;
+		}
+	}
+
+	kfree(resp);
+	*resources = copy;
+	*num_resources = count;
+	return 0;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_get_resources, ERRNO);
+
+static int gunyah_rm_device_transfer(struct gunyah_rm *rm, u32 message_id,
+				     u16 vmid, u32 handle, bool reset)
+{
+	struct gunyah_rm_device_transfer_req req = {
+		.vmid = cpu_to_le16(vmid),
+		.flags = reset ? GUNYAH_RM_DEVICE_RESET_FLAG : 0,
+		.handle = cpu_to_le32(handle),
+	};
+
+	return gunyah_rm_call(rm, message_id, &req, sizeof(req), NULL, NULL);
+}
+
+/**
+ * gunyah_rm_device_accept() - Accept a device offered by another VM
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Device handle owned by or offered to this VM
+ * @flags: RM accept flags, including reset and destination bus binding
+ * @bus_handle: Destination bus when binding is requested
+ */
+int gunyah_rm_device_accept(struct gunyah_rm *rm, u32 handle, u32 flags, u32 bus_handle)
+{
+	struct gunyah_rm_device_accept_req req = {
+		.handle = cpu_to_le32(handle),
+		.flags = flags,
+		.bus_handle = cpu_to_le32(bus_handle),
+	};
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_DEVICE_ACCEPT, &req, sizeof(req),
+			      NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_accept, ERRNO);
+
+/**
+ * gunyah_rm_device_release() - Return a borrowed device to its owner
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Device handle returned by gunyah_rm_device_find()
+ * @reset: Reset the device while releasing it
+ */
+int gunyah_rm_device_release(struct gunyah_rm *rm, u32 handle, bool reset)
+{
+	struct gunyah_rm_device_release_req req = {
+		.handle = cpu_to_le32(handle),
+		.flags = reset ? GUNYAH_RM_DEVICE_RESET_FLAG : 0,
+	};
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_DEVICE_RELEASE, &req, sizeof(req),
+			      NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_release, ERRNO);
+
+/**
+ * gunyah_rm_device_lend() - Lend a physical device to another VM
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: Recipient VMID
+ * @handle: Device handle owned by this VM
+ * @reset: Reset the device during transfer
+ */
+int gunyah_rm_device_lend(struct gunyah_rm *rm, u16 vmid, u32 handle,
+			  bool reset)
+{
+	return gunyah_rm_device_transfer(rm, GUNYAH_RM_RPC_DEVICE_LEND, vmid,
+					 handle, reset);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_lend, ERRNO);
+
+/**
+ * gunyah_rm_device_donate() - Donate a physical device to another VM
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: Recipient VMID
+ * @handle: Device handle owned by this VM
+ * @reset: Reset the device during transfer
+ */
+int gunyah_rm_device_donate(struct gunyah_rm *rm, u16 vmid, u32 handle,
+			    bool reset)
+{
+	return gunyah_rm_device_transfer(rm, GUNYAH_RM_RPC_DEVICE_DONATE, vmid,
+					 handle, reset);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_donate, ERRNO);
+
+/**
+ * gunyah_rm_device_reclaim() - Reclaim a device offered to another VM
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Device handle owned by this VM
+ * @reset: Reset the device while reclaiming it
+ *
+ * The borrower VM must have released a lent device first.  Reclaim also
+ * rolls back an offer that the borrower has not accepted yet.
+ */
+int gunyah_rm_device_reclaim(struct gunyah_rm *rm, u32 handle, bool reset)
+{
+	struct gunyah_rm_device_reclaim_req req = {
+		.handle = cpu_to_le32(handle),
+		.flags = reset ? GUNYAH_RM_DEVICE_RESET_FLAG : 0,
+	};
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_DEVICE_RECLAIM, &req, sizeof(req),
+			      NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_device_reclaim, ERRNO);
 
 /**
  * gunyah_rm_get_vmid() - Retrieve VMID of this virtual machine
