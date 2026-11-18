@@ -149,6 +149,20 @@
 			reg = <0 0xd4e23000 0 0x2dd000>;
 			no-map;
 		};
+
+		gunyah_cma_mem: gunyah-cma-mem {
+			compatible = "shared-dma-pool";
+			alloc-ranges = <0 0 0 0xffffffff>;
+			size = <0 0x4000000>;
+			alignment = <0 0x200000>;
+			reusable;
+		};
+	};
+
+	gunyah_cma: gunyah-cma-vm-mem {
+		compatible = "gunyah-cma-vm-mem";
+		memory-region = <&gunyah_cma_mem>;
+		memory-region-names = "system-cma";
 	};
 
 	sound {
