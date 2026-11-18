@@ -208,7 +208,7 @@ static inline int gunyah_rm_error_remap(enum gunyah_rm_error rm_error)
 	case GUNYAH_RM_ERROR_NOMEM:
 		return -ENOMEM;
 	case GUNYAH_RM_ERROR_NORESOURCE:
-		return -ENODEV;
+		return -ENOSPC;
 	case GUNYAH_RM_ERROR_DENIED:
 		return -EPERM;
 	case GUNYAH_RM_ERROR_BUSY:

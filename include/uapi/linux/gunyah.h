@@ -496,6 +496,8 @@ struct gunyah_auth_desc {
  *
  * GH_CAP_VCPU_TIMER_WAKEUP: kernel handles GUNYAH_VCPU_STATE_EXPECTS_WAKEUP_OR_TIMEOUT,
  *     arming a per-vCPU hrtimer for the hypervisor-provided deadline.
+ * GH_CAP_DEMAND_PAGING: the resident resource manager supports VM_SET_DEMAND_PAGING.
  */
 #define GH_CAP_VCPU_TIMER_WAKEUP	0
+#define GH_CAP_DEMAND_PAGING		1
 #endif

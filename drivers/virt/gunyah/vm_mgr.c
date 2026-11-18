@@ -1321,6 +1321,9 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 		case GH_CAP_VCPU_TIMER_WAKEUP:
 			r = 1;
 			break;
+		case GH_CAP_DEMAND_PAGING:
+			r = gunyah_rm_has_demand_paging(ghvm->rm);
+			break;
 		default:
 			r = 0;
 			break;
