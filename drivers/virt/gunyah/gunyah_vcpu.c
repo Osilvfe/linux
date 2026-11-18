@@ -29,6 +29,7 @@
 struct gunyah_vcpu_priv {
 	struct gunyah_vcpu vcpu;
 	struct hrtimer wakeup_timer;
+	bool irq_wake;
 };
 
 static void vcpu_release(struct kref *kref)
@@ -494,6 +495,7 @@ static bool gunyah_vcpu_populate(struct gunyah_vm_resource_ticket *ticket,
 {
 	struct gunyah_vcpu *vcpu =
 		container_of(ticket, struct gunyah_vcpu, ticket);
+	struct gunyah_vcpu_priv *priv;
 	int ret;
 
 	mutex_lock(&vcpu->run_lock);
@@ -511,10 +513,12 @@ static bool gunyah_vcpu_populate(struct gunyah_vm_resource_ticket *ticket,
 	if (ret) {
 		pr_warn("Failed to request vcpu irq %d: %d", vcpu->rsc->irq,
 			ret);
+		vcpu->rsc = NULL;
 		goto out;
 	}
 
-	enable_irq_wake(vcpu->rsc->irq);
+	priv = container_of(vcpu, struct gunyah_vcpu_priv, vcpu);
+	priv->irq_wake = !enable_irq_wake(vcpu->rsc->irq);
 
 out:
 	mutex_unlock(&vcpu->run_lock);
@@ -533,6 +537,10 @@ static void gunyah_vcpu_unpopulate(struct gunyah_vm_resource_ticket *ticket,
 	hrtimer_cancel(&priv->wakeup_timer);
 	complete_all(&vcpu->ready);
 	mutex_lock(&vcpu->run_lock);
+	if (priv->irq_wake) {
+		disable_irq_wake(vcpu->rsc->irq);
+		priv->irq_wake = false;
+	}
 	free_irq(vcpu->rsc->irq, vcpu);
 	vcpu->rsc = NULL;
 	mutex_unlock(&vcpu->run_lock);
