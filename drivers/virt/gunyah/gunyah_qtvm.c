@@ -177,16 +177,17 @@ static long gunyah_qtvm_attach(struct gunyah_vm *ghvm, struct gunyah_auth_desc *
 	struct gunyah_qtvm *vm;
 	void __user *argp;
 
-	if (desc->arg_size > sizeof(struct gunyah_qtvm_auth_arg))
+	if (desc->arg_size != sizeof(struct gunyah_qtvm_auth_arg))
 		return -EINVAL;
 
 	argp = u64_to_user_ptr(desc->arg);
-	if (copy_from_user(&arg, argp, desc->arg_size))
+	if (copy_from_user(&arg, argp, sizeof(arg)))
 		return -EFAULT;
 
-	if (overflows_type(arg.guest_phys_addr + arg.size,
-				   u64))
-		return -EOVERFLOW;
+	if (!arg.size || !PAGE_ALIGNED(arg.guest_phys_addr) ||
+	    !PAGE_ALIGNED(arg.size) ||
+	    overflows_type(arg.guest_phys_addr + arg.size, u64))
+		return -EINVAL;
 
 	mutex_lock(&gunyah_qtvm_lock);
 	vm = kzalloc(sizeof(*vm), GFP_KERNEL_ACCOUNT);

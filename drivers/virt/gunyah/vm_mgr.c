@@ -108,17 +108,23 @@ static long gunyah_vm_set_auth_type(struct gunyah_vm *ghvm,
 				struct gunyah_auth_desc *auth_desc)
 {
 	struct gunyah_auth_vm_mgr *auth_vm;
+	int ret;
 
 	guard(rwsem_write)(&ghvm->status_lock);
-	if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE)
+	if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE ||
+	    ghvm->auth != GUNYAH_RM_VM_AUTH_NONE)
 		return -EBUSY;
 
 	auth_vm = gunyah_get_auth_vm_mgr(auth_desc->type);
 	if (IS_ERR(auth_vm))
 		return PTR_ERR(auth_vm);
 
-	/* The auth mgr should be populating the auth_vm_mgr_ops*/
-	return auth_vm->vm_attach(ghvm, auth_desc);
+	/* The auth manager owns the argument validation for its type. */
+	ret = auth_vm->vm_attach(ghvm, auth_desc);
+	if (ret)
+		module_put(auth_vm->mod);
+
+	return ret;
 }
 
 static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
