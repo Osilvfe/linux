@@ -212,6 +212,7 @@ free_mem_entries:
 int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 			    struct gunyah_map_cma_mem_args *cma_map)
 {
+	u8 access = cma_map->flags & GUNYAH_MEM_ACCESS_MASK;
 	struct gunyah_vm_binding *binding;
 	struct file *file;
 	u64 end;
@@ -223,8 +224,18 @@ int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 	    ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE)
 		return -EBUSY;
 
+	if (cma_map->flags & ~(GUNYAH_MEM_ALLOW_RWX |
+			       GUNYAH_MEM_ACCESS_MASK))
+		return -EINVAL;
+
+	if (access != GUNYAH_MEM_DEFAULT_ACCESS &&
+	    access != GUNYAH_MEM_FORCE_LEND &&
+	    access != GUNYAH_MEM_FORCE_SHARE)
+		return -EINVAL;
+
 	if (!cma_map->size || !PAGE_ALIGNED(cma_map->size) ||
-		!PAGE_ALIGNED(cma_map->guest_addr))
+	    !PAGE_ALIGNED(cma_map->guest_addr) ||
+	    !PAGE_ALIGNED(cma_map->offset))
 		return -EINVAL;
 
 	if (check_add_overflow(cma_map->guest_addr, cma_map->size, &end))
