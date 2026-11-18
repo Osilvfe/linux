@@ -14,6 +14,7 @@
 
 #define WRITE_TAG (1 << 0)
 #define SHARE_TAG (1 << 1)
+#define GMEM_TAG BIT(2)
 
 struct gunyah_folio_state {
 	struct folio *folio;
@@ -126,6 +127,8 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 		tag |= SHARE_TAG;
 	if (parcel->acl_entries[0].perms & GUNYAH_RM_ACL_W)
 		tag |= WRITE_TAG;
+	if (b->mem_type == VM_MEM_GUEST_MEM)
+		tag |= GMEM_TAG;
 
 	for (i = 0; i < parcel->n_mem_entries; i++) {
 		entry = &parcel->mem_entries[i];
@@ -306,7 +309,8 @@ static int gunyah_vm_return_folio(struct gunyah_vm *ghvm,
 }
 
 int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
-			    u64 gfn, bool share, bool write, bool *retained)
+			    u64 gfn, bool share, bool write, bool gmem,
+			    bool *retained)
 {
 	struct gunyah_resource *guest_extent, *host_extent, *addrspace;
 	struct gunyah_folio_state *state;
@@ -344,6 +348,8 @@ int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 
 	if (write)
 		tag |= WRITE_TAG;
+	if (gmem)
+		tag |= GMEM_TAG;
 
 	ret = gunyah_vm_index_folio(ghvm, folio, gfn);
 	if (ret)
@@ -438,6 +444,7 @@ static int __gunyah_vm_reclaim_folio_locked(struct gunyah_vm *ghvm, void *entry,
 	struct gunyah_folio_state *state;
 	bool share = !!(xa_pointer_tag(entry) & SHARE_TAG);
 	bool write = !!(xa_pointer_tag(entry) & WRITE_TAG);
+	bool gmem = !!(xa_pointer_tag(entry) & GMEM_TAG);
 	int ret;
 
 	state = xa_load(&ghvm->folio_states, gfn);
@@ -470,8 +477,12 @@ static int __gunyah_vm_reclaim_folio_locked(struct gunyah_vm *ghvm, void *entry,
 	xa_erase(&ghvm->folio_gfns, folio_pfn(folio));
 	kfree(state);
 	gunyah_folio_host_reclaim(folio);
-	unpin_user_page(folio_page(folio, 0));
-	account_locked_vm(ghvm->mm_s, 1, false);
+	if (gmem) {
+		folio_put(folio);
+	} else {
+		unpin_user_page(folio_page(folio, 0));
+		account_locked_vm(ghvm->mm_s, 1, false);
+	}
 	return 0;
 }
 
@@ -667,7 +678,7 @@ static int gunyah_gup_demand_page(struct gunyah_vm *ghvm, struct gunyah_vm_bindi
 	ret = gunyah_vm_provide_folio(ghvm, folio, first,
 				      !(b->share_type == VM_MEM_LEND),
 				      !!(b->flags & GUNYAH_MEM_ALLOW_WRITE),
-				      &retained);
+				      false, &retained);
 	folio_unlock(folio);
 	if (ret) {
 		if (ret != -EAGAIN)
@@ -712,6 +723,8 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write)
 	if (b->mem_type == VM_MEM_CMA) {
 		dev_warn(ghvm->parent, "Demand paging of CMA mem not supported\n");
 		ret = -EOPNOTSUPP;
+	} else if (b->mem_type == VM_MEM_GUEST_MEM) {
+		ret = gunyah_gmem_demand_page(ghvm, b, gpa, write);
 	} else {
 		ret = gunyah_gup_demand_page(ghvm, b, gpa, write);
 	}
@@ -922,6 +935,13 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 			dev_warn(ghvm->parent, "Failed to share CMA memory: %d\n", ret);
 			goto free_acl;
 		}
+	} else if (b->mem_type == VM_MEM_GUEST_MEM) {
+		ret = gunyah_gmem_share_parcel(ghvm, vm_parcel, b, gfn, nr);
+		if (ret) {
+			dev_warn(ghvm->parent, "Failed to share guest_memfd memory: %d\n",
+				 ret);
+			goto free_acl;
+		}
 	} else {
 		ret = gunyah_gup_share_parcel(ghvm, vm_parcel, b, gfn, nr);
 		if (ret) {
@@ -1028,6 +1048,8 @@ static int gunyah_reclaim_parcel(struct gunyah_vm *ghvm,
 
 	if (b->mem_type == VM_MEM_CMA)
 		ret = gunyah_cma_reclaim_parcel(ghvm, vm_parcel, b);
+	else if (b->mem_type == VM_MEM_GUEST_MEM)
+		ret = gunyah_gmem_reclaim_parcel(ghvm, vm_parcel, b);
 	else
 		ret = gunyah_gup_reclaim_parcel(ghvm, vm_parcel, b);
 

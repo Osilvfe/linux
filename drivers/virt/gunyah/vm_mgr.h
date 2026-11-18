@@ -33,14 +33,23 @@ static inline bool gunyah_vm_reclaim_retryable(int error)
 	return error == -EBUSY || error == -EAGAIN || error == -ENOMEM;
 }
 
+struct gunyah_gmem_binding;
+
+enum gunyah_vm_mem_type {
+	VM_MEM_USER,
+	VM_MEM_CMA,
+	VM_MEM_GUEST_MEM,
+};
+
 struct gunyah_vm_binding {
-	enum { VM_MEM_USER, VM_MEM_CMA } mem_type;
+	enum gunyah_vm_mem_type mem_type;
 	union {
 		u64 userspace_addr;
 		struct {
 			struct file *file;
 			u64 offset;
 		} cma;
+		struct gunyah_gmem_binding *gmem;
 	};
 	struct gunyah_vm_parcel *vm_parcel;
 	enum { VM_MEM_SHARE, VM_MEM_LEND } share_type;
@@ -246,13 +255,28 @@ void gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);
 int gunyah_vm_restore_parcel(struct gunyah_vm *ghvm,
 			     struct gunyah_vm_parcel *parcel);
 int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
-			    u64 gfn, bool share, bool write, bool *retained);
+			    u64 gfn, bool share, bool write, bool gmem,
+			    bool *retained);
 int gunyah_vm_reclaim_folio(struct gunyah_vm *ghvm, u64 gfn, struct folio *folio);
 void gunyah_generic_vm_start_fail(struct gunyah_vm *ghvm);
 int gunyah_vm_reclaim_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);
 int gunyah_vm_binding_alloc(struct gunyah_vm *ghvm,
 			    struct gunyah_userspace_memory_region *region,
 			    bool lend);
+int gunyah_guest_mem_create(struct gunyah_create_mem_args *args);
+int gunyah_gmem_modify_mapping(struct gunyah_vm *ghvm,
+			       struct gunyah_map_mem_args *args);
+void gunyah_gmem_remove_binding(struct gunyah_gmem_binding *binding);
+int gunyah_gmem_share_parcel(struct gunyah_vm *ghvm,
+			     struct gunyah_vm_parcel *vm_parcel,
+			     struct gunyah_vm_binding *binding,
+			     u64 *gfn, u64 *nr);
+int gunyah_gmem_reclaim_parcel(struct gunyah_vm *ghvm,
+			       struct gunyah_vm_parcel *vm_parcel,
+			       struct gunyah_vm_binding *binding);
+int gunyah_gmem_demand_page(struct gunyah_vm *ghvm,
+			    struct gunyah_vm_binding *binding,
+			    u64 gpa, bool write);
 int gunyah_share_parcel(struct gunyah_vm *ghvm,
 			      struct gunyah_vm_parcel *parcel,
 			      u64 *gfn, u64 *nr);

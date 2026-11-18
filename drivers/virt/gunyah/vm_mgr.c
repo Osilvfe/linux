@@ -155,7 +155,9 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 		}
 		b = mtree_load(&ghvm->bindings,
 			       gunyah_gpa_to_gfn(ghvm->dtb.config.guest_phys_addr));
-		if (!b || b->mem_type != VM_MEM_USER) {
+		if (!b || (b->mem_type != VM_MEM_USER &&
+			   b->mem_type != VM_MEM_CMA &&
+			   b->mem_type != VM_MEM_GUEST_MEM)) {
 			ret = -EINVAL;
 			goto unlock;
 		}
@@ -178,8 +180,13 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 		mt_for_each(&ghvm->bindings, other, index, ULONG_MAX) {
 			if (other == b)
 				continue;
-			if (other->mem_type != VM_MEM_USER ||
-			    other->share_type != VM_MEM_SHARE) {
+			if (other->mem_type != VM_MEM_USER &&
+			    other->mem_type != VM_MEM_CMA &&
+			    other->mem_type != VM_MEM_GUEST_MEM) {
+				ret = -EOPNOTSUPP;
+				goto unlock;
+			}
+			if (other->share_type != VM_MEM_SHARE) {
 				ret = -EOPNOTSUPP;
 				goto unlock;
 			}
@@ -1279,6 +1286,14 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 		r = gunyah_vm_binding_cma_alloc(ghvm, &cma_mem);
 		break;
 	}
+	case GUNYAH_VM_MAP_MEM: {
+		struct gunyah_map_mem_args map_mem;
+
+		if (copy_from_user(&map_mem, argp, sizeof(map_mem)))
+			return -EFAULT;
+
+		return gunyah_gmem_modify_mapping(ghvm, &map_mem);
+	}
 	case GUNYAH_VM_SET_BOOT_CONTEXT: {
 		struct gunyah_vm_boot_context boot_ctx;
 
@@ -1553,7 +1568,12 @@ static void _gunyah_vm_put(struct kref *kref)
 	kfree(ghvm->shared_parcels);
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
-		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));
+		if (b->mem_type == VM_MEM_GUEST_MEM && b->gmem) {
+			gunyah_gmem_remove_binding(b->gmem);
+			continue;
+		}
+		mtree_erase(&ghvm->bindings,
+			    gunyah_gpa_to_gfn(b->guest_phys_addr));
 		if (b->mem_type == VM_MEM_CMA && b->cma.file)
 			fput(b->cma.file);
 		kfree(b);
@@ -1664,6 +1684,13 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 	switch (cmd) {
 	case GUNYAH_CREATE_VM:
 		return gunyah_dev_ioctl_create_vm(rm, arg);
+	case GUNYAH_CREATE_GUEST_MEM: {
+		struct gunyah_create_mem_args args;
+
+		if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+			return -EFAULT;
+		return gunyah_guest_mem_create(&args);
+	}
 	default:
 		return -ENOTTY;
 	}
