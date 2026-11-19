@@ -660,6 +660,7 @@ struct gunyah_auth_desc {
 #define GH_CAP_VM_TIME_BASE		4
 #define GH_CAP_IRQ_LENDING		5
 #define GH_CAP_VM_CRASH_MSG		6
+#define GH_CAP_VM_CONSOLE		7
 
 /*
  * Host-side Resource Manager services
@@ -830,5 +831,48 @@ struct gunyah_vm_time_base_args {
 
 #define GH_VM_SET_TIME_BASE	_IOW(GH_ANDROID_IOCTL_TYPE, 0x30, \
 				     struct gunyah_vm_time_base_args)
+
+/**
+ * struct gunyah_vm_console_write_args - Bytes written to a guest console
+ * @buf: Userspace buffer holding the data
+ * @len: Number of bytes in @buf
+ * @flags: Must be zero
+ *
+ * Issued on a VM fd after %GH_VM_CONSOLE_OPEN. The kernel forwards the bytes
+ * to the resource manager, which delivers them to the guest console input.
+ */
+struct gunyah_vm_console_write_args {
+	__u64 buf;
+	__u32 len;
+	__u32 flags;
+};
+
+/**
+ * struct gunyah_vm_console_read_args - Guest console output
+ * @buf: Userspace buffer that receives the bytes
+ * @len: Size of @buf in bytes
+ * @flags: Must be zero
+ *
+ * Issued on a VM fd after %GH_VM_CONSOLE_OPEN. Returns the number of bytes
+ * copied, or 0 once the console is closed. Blocks until data arrives; when
+ * the fd is opened with O_NONBLOCK an empty buffer returns -EAGAIN.
+ */
+struct gunyah_vm_console_read_args {
+	__u64 buf;
+	__u32 len;
+	__u32 flags;
+};
+
+/*
+ * Guest console control. The console must be opened before the RM forwards
+ * characters, and closed to release the console session in the RM.
+ */
+#define GH_VM_CONSOLE_OPEN	_IO(GH_ANDROID_IOCTL_TYPE, 0x31)
+#define GH_VM_CONSOLE_CLOSE	_IO(GH_ANDROID_IOCTL_TYPE, 0x32)
+#define GH_VM_CONSOLE_WRITE	_IOW(GH_ANDROID_IOCTL_TYPE, 0x33, \
+				     struct gunyah_vm_console_write_args)
+#define GH_VM_CONSOLE_READ	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x34, \
+				      struct gunyah_vm_console_read_args)
+#define GH_VM_CONSOLE_FLUSH	_IO(GH_ANDROID_IOCTL_TYPE, 0x35)
 
 #endif

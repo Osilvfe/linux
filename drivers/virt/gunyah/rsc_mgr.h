@@ -81,6 +81,13 @@ struct gunyah_rm_irq_event {
 
 #define GUNYAH_RM_IRQ_EVENT_QUEUE_LEN	32
 
+/* Payload of a console character notification from the resource manager */
+struct gunyah_rm_console_chars_payload {
+	__le16 from;
+	__le16 num_bytes;
+	u8 data[];
+} __packed;
+
 struct gunyah_rm_vm_status_payload {
 	__le16 vmid;
 	u16 reserved;
@@ -205,6 +212,13 @@ int gunyah_rm_irq_accept(struct gunyah_rm *rm, u32 handle, u32 virq,
 			 u32 *virq_out);
 int gunyah_rm_irq_event_get(struct gunyah_rm *rm,
 			    struct gunyah_rm_irq_event *event);
+
+/* Guest console */
+int gunyah_rm_console_open(struct gunyah_rm *rm, u16 vmid);
+int gunyah_rm_console_close(struct gunyah_rm *rm, u16 vmid);
+int gunyah_rm_console_flush(struct gunyah_rm *rm, u16 vmid);
+int gunyah_rm_console_write(struct gunyah_rm *rm, u16 vmid, const void *data,
+			    size_t len);
 
 int gunyah_rm_vm_set_demand_paging(struct gunyah_rm *rm, u16 vmid, u32 count,
 				   struct gunyah_rm_mem_entry *mem_entries);

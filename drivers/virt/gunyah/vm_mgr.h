@@ -137,6 +137,8 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
  *
  * Members are grouped by hot path.
  */
+#define GUNYAH_VM_CONSOLE_BUF_SIZE	4096
+
 struct gunyah_vm {
 	u16 vmid;
 	struct maple_tree mm;
@@ -191,6 +193,15 @@ struct gunyah_vm {
 		u64 sys_timer_ref;
 		bool requested;
 	} time_base;
+	/* Guest console: output forwarded by RM, input written through RM */
+	struct {
+		bool open;
+		spinlock_t lock;
+		wait_queue_head_t wait;
+		u8 buf[GUNYAH_VM_CONSOLE_BUF_SIZE];
+		u32 head;
+		u32 count;
+	} console;
 	struct xarray boot_context;
 	struct xarray folio_states;
 	struct xarray folio_gfns;

@@ -36,6 +36,7 @@
 #define GUNYAH_VM_STATUS_TIMEOUT_MS 30000
 #define GUNYAH_VM_RECLAIM_ATTEMPTS 3
 #define GUNYAH_VM_STATE_RECOVERY_ATTEMPTS 3
+#define GUNYAH_VM_CONSOLE_MAX_WRITE	65535
 
 enum gunyah_vm_device_state {
 	GUNYAH_VM_DEVICE_REGISTERED,
@@ -723,6 +724,8 @@ void gunyah_vm_remove_io_handler(struct gunyah_vm *ghvm,
 }
 EXPORT_SYMBOL_GPL(gunyah_vm_remove_io_handler);
 
+static void gunyah_vm_console_close_local(struct gunyah_vm *ghvm);
+
 static int gunyah_vm_rm_notification_status(struct gunyah_vm *ghvm, void *data)
 {
 	struct gunyah_rm_vm_status_payload *payload = data;
@@ -766,6 +769,38 @@ static int gunyah_vm_rm_notification_exited(struct gunyah_vm *ghvm, void *data)
 	up_write(&ghvm->status_lock);
 	wake_up(&ghvm->vm_status_wait);
 
+	/* A dead VM has no console; wake blocked readers with EOF. */
+	gunyah_vm_console_close_local(ghvm);
+
+	return NOTIFY_DONE;
+}
+
+static int gunyah_vm_rm_notification_console(struct gunyah_vm *ghvm,
+					     void *data)
+{
+	const struct gunyah_rm_console_chars_payload *chars = data;
+	u32 num_bytes = le16_to_cpu(chars->num_bytes);
+	unsigned long flags;
+	u32 i;
+
+	if (!ghvm->console.open)
+		return NOTIFY_OK;
+
+	spin_lock_irqsave(&ghvm->console.lock, flags);
+	for (i = 0; i < num_bytes; i++) {
+		u32 tail;
+
+		if (ghvm->console.count == GUNYAH_VM_CONSOLE_BUF_SIZE)
+			break;
+		tail = (ghvm->console.head + ghvm->console.count) %
+		       GUNYAH_VM_CONSOLE_BUF_SIZE;
+		ghvm->console.buf[tail] = chars->data[i];
+		ghvm->console.count++;
+	}
+	spin_unlock_irqrestore(&ghvm->console.lock, flags);
+
+	wake_up_interruptible(&ghvm->console.wait);
+
 	return NOTIFY_DONE;
 }
 
@@ -779,6 +814,8 @@ static int gunyah_vm_rm_notification(struct notifier_block *nb,
 		return gunyah_vm_rm_notification_status(ghvm, data);
 	case GUNYAH_RM_NOTIFICATION_VM_EXITED:
 		return gunyah_vm_rm_notification_exited(ghvm, data);
+	case GUNYAH_RM_NOTIFICATION_CONSOLE_CHARS:
+		return gunyah_vm_rm_notification_console(ghvm, data);
 	default:
 		return NOTIFY_OK;
 	}
@@ -861,6 +898,8 @@ static __must_check struct gunyah_vm *gunyah_vm_alloc(struct gunyah_rm *rm)
 	ghvm->mm_s = current->mm;
 	init_rwsem(&ghvm->status_lock);
 	init_waitqueue_head(&ghvm->vm_status_wait);
+	init_waitqueue_head(&ghvm->console.wait);
+	spin_lock_init(&ghvm->console.lock);
 	kref_init(&ghvm->kref);
 	ghvm->vm_status = GUNYAH_RM_VM_STATUS_NO_STATE;
 
@@ -1323,6 +1362,142 @@ static int gunyah_vm_ensure_started(struct gunyah_vm *ghvm)
 	return ret;
 }
 
+static int gunyah_vm_console_open(struct gunyah_vm *ghvm)
+{
+	unsigned long flags;
+	int ret;
+
+	if (ghvm->vmid == GUNYAH_VMID_INVAL)
+		return -EINVAL;
+	if (READ_ONCE(ghvm->console.open))
+		return -EBUSY;
+
+	ret = gunyah_rm_console_open(ghvm->rm, ghvm->vmid);
+	if (ret)
+		return ret;
+
+	/* Drop output buffered before this session. */
+	spin_lock_irqsave(&ghvm->console.lock, flags);
+	ghvm->console.head = 0;
+	ghvm->console.count = 0;
+	spin_unlock_irqrestore(&ghvm->console.lock, flags);
+	WRITE_ONCE(ghvm->console.open, true);
+
+	return 0;
+}
+
+/*
+ * Drop the local console state. Safe in atomic or RM notification context:
+ * no RM round trip is performed, blocked readers see end of file instead.
+ */
+static void gunyah_vm_console_close_local(struct gunyah_vm *ghvm)
+{
+	unsigned long flags;
+
+	WRITE_ONCE(ghvm->console.open, false);
+	spin_lock_irqsave(&ghvm->console.lock, flags);
+	ghvm->console.head = 0;
+	ghvm->console.count = 0;
+	spin_unlock_irqrestore(&ghvm->console.lock, flags);
+	wake_up_interruptible(&ghvm->console.wait);
+}
+
+static int gunyah_vm_console_close(struct gunyah_vm *ghvm)
+{
+	if (!READ_ONCE(ghvm->console.open))
+		return 0;
+
+	gunyah_vm_console_close_local(ghvm);
+
+	if (ghvm->vmid == GUNYAH_VMID_INVAL)
+		return 0;
+
+	return gunyah_rm_console_close(ghvm->rm, ghvm->vmid);
+}
+
+static int gunyah_vm_console_write(struct gunyah_vm *ghvm, void __user *argp)
+{
+	struct gunyah_vm_console_write_args args;
+	void *kbuf;
+	int ret;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || !args.len || args.len > GUNYAH_VM_CONSOLE_MAX_WRITE)
+		return -EINVAL;
+	if (!READ_ONCE(ghvm->console.open) || ghvm->vmid == GUNYAH_VMID_INVAL)
+		return -EINVAL;
+
+	kbuf = memdup_user(u64_to_user_ptr(args.buf), args.len);
+	if (IS_ERR(kbuf))
+		return PTR_ERR(kbuf);
+
+	ret = gunyah_rm_console_write(ghvm->rm, ghvm->vmid, kbuf, args.len);
+	kfree(kbuf);
+
+	return ret ? ret : (int)args.len;
+}
+
+static int gunyah_vm_console_read(struct gunyah_vm *ghvm, struct file *filp,
+				  void __user *argp)
+{
+	struct gunyah_vm_console_read_args args;
+	unsigned long flags;
+	u32 avail, i, head;
+	u8 *kbuf;
+	int ret;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || !args.len)
+		return -EINVAL;
+
+	avail = min_t(u32, args.len, GUNYAH_VM_CONSOLE_BUF_SIZE);
+	kbuf = kmalloc(avail, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	for (;;) {
+		if (!READ_ONCE(ghvm->console.count)) {
+			if (!READ_ONCE(ghvm->console.open)) {
+				ret = 0;
+				break;
+			}
+			if (filp->f_flags & O_NONBLOCK) {
+				ret = -EAGAIN;
+				break;
+			}
+			ret = wait_event_interruptible(ghvm->console.wait,
+						       READ_ONCE(ghvm->console.count) ||
+						       !READ_ONCE(ghvm->console.open));
+			if (ret) {
+				ret = -ERESTARTSYS;
+				break;
+			}
+			continue;
+		}
+
+		spin_lock_irqsave(&ghvm->console.lock, flags);
+		head = ghvm->console.head;
+		avail = min(avail, ghvm->console.count);
+		for (i = 0; i < avail; i++)
+			kbuf[i] = ghvm->console.buf[(head + i) %
+						   GUNYAH_VM_CONSOLE_BUF_SIZE];
+		ghvm->console.head = (head + avail) % GUNYAH_VM_CONSOLE_BUF_SIZE;
+		ghvm->console.count -= avail;
+		spin_unlock_irqrestore(&ghvm->console.lock, flags);
+
+		if (copy_to_user(u64_to_user_ptr(args.buf), kbuf, avail))
+			ret = -EFAULT;
+		else
+			ret = avail;
+		break;
+	}
+
+	kfree(kbuf);
+	return ret;
+}
+
 static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 			    unsigned long arg)
 {
@@ -1411,6 +1586,25 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 		}
 		break;
 	}
+	case GH_VM_CONSOLE_OPEN:
+		r = gunyah_vm_console_open(ghvm);
+		break;
+	case GH_VM_CONSOLE_CLOSE:
+		r = gunyah_vm_console_close(ghvm);
+		break;
+	case GH_VM_CONSOLE_WRITE:
+		r = gunyah_vm_console_write(ghvm, argp);
+		break;
+	case GH_VM_CONSOLE_READ:
+		r = gunyah_vm_console_read(ghvm, filp, argp);
+		break;
+	case GH_VM_CONSOLE_FLUSH:
+		if (!READ_ONCE(ghvm->console.open) ||
+		    ghvm->vmid == GUNYAH_VMID_INVAL)
+			r = -EINVAL;
+		else
+			r = gunyah_rm_console_flush(ghvm->rm, ghvm->vmid);
+		break;
 	case GUNYAH_VM_START: {
 		r = gunyah_vm_ensure_started(ghvm);
 		break;
@@ -1615,6 +1809,7 @@ unassign_unlock_status:
 			r = 1;
 			break;
 		case GH_CAP_IRQ_LENDING:
+		case GH_CAP_VM_CONSOLE:
 			r = 1;
 			break;
 		default:
@@ -1865,6 +2060,7 @@ static void _gunyah_vm_put(struct kref *kref)
 	ret = gunyah_vm_reclaim_parcels(ghvm);
 	if (ret)
 		goto quarantine;
+	gunyah_vm_console_close(ghvm);
 	if (ghvm->vmid != GUNYAH_VMID_INVAL) {
 		ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
 		if (ret)

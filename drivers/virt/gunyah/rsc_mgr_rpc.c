@@ -1443,3 +1443,111 @@ malformed:
 	return -EBADMSG;
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_irq_accept, ERRNO);
+
+/* Message IDs: guest console */
+/* clang-format off */
+#define GUNYAH_RM_RPC_VM_CONSOLE_OPEN	0x56000081
+#define GUNYAH_RM_RPC_VM_CONSOLE_CLOSE	0x56000082
+#define GUNYAH_RM_RPC_VM_CONSOLE_WRITE	0x56000083
+#define GUNYAH_RM_RPC_VM_CONSOLE_FLUSH	0x56000084
+/* clang-format on */
+
+struct gunyah_rm_vm_console_req {
+	__le16 vmid;
+	__le16 reserved;
+} __packed;
+
+struct gunyah_rm_vm_console_write_req {
+	__le16 vmid;
+	__le16 num_bytes;
+	u8 data[];
+} __packed;
+
+/* The RM validates the payload length exactly, so write in bounded chunks. */
+#define GUNYAH_RM_CONSOLE_CHUNK	1024
+
+static int gunyah_rm_console_cmd(struct gunyah_rm *rm, u32 message_id, u16 vmid)
+{
+	struct gunyah_rm_vm_console_req req = {
+		.vmid = cpu_to_le16(vmid),
+	};
+
+	return gunyah_rm_call(rm, message_id, &req, sizeof(req), NULL, NULL);
+}
+
+/**
+ * gunyah_rm_console_open() - Start receiving a VM's console output
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM whose console to open
+ */
+int gunyah_rm_console_open(struct gunyah_rm *rm, u16 vmid)
+{
+	return gunyah_rm_console_cmd(rm, GUNYAH_RM_RPC_VM_CONSOLE_OPEN, vmid);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_console_open, ERRNO);
+
+/**
+ * gunyah_rm_console_close() - Stop receiving a VM's console output
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM whose console to close
+ */
+int gunyah_rm_console_close(struct gunyah_rm *rm, u16 vmid)
+{
+	return gunyah_rm_console_cmd(rm, GUNYAH_RM_RPC_VM_CONSOLE_CLOSE, vmid);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_console_close, ERRNO);
+
+/**
+ * gunyah_rm_console_flush() - Ask the RM to flush pending console output
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM whose console to flush
+ */
+int gunyah_rm_console_flush(struct gunyah_rm *rm, u16 vmid)
+{
+	return gunyah_rm_console_cmd(rm, GUNYAH_RM_RPC_VM_CONSOLE_FLUSH, vmid);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_console_flush, ERRNO);
+
+/**
+ * gunyah_rm_console_write() - Send bytes to a VM's console input
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM whose console receives the bytes
+ * @data: Bytes to send
+ * @len: Number of bytes
+ *
+ * The RM requires the console to be open on both ends and rejects any payload
+ * whose length does not exactly match the declared byte count, so long writes
+ * are split into chunks.
+ */
+int gunyah_rm_console_write(struct gunyah_rm *rm, u16 vmid, const void *data,
+			    size_t len)
+{
+	struct gunyah_rm_vm_console_write_req *req;
+	size_t chunk, sent = 0;
+	int ret;
+
+	if (!data && len)
+		return -EINVAL;
+
+	while (sent < len) {
+		chunk = min_t(size_t, len - sent, GUNYAH_RM_CONSOLE_CHUNK);
+		req = kmalloc(sizeof(*req) + chunk, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+
+		req->vmid = cpu_to_le16(vmid);
+		req->num_bytes = cpu_to_le16(chunk);
+		memcpy(req->data, (const u8 *)data + sent, chunk);
+
+		ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_CONSOLE_WRITE, req,
+				     sizeof(*req) + chunk, NULL, NULL);
+		kfree(req);
+		if (ret)
+			return ret;
+
+		sent += chunk;
+	}
+
+	return 0;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_console_write, ERRNO);

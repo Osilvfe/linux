@@ -550,6 +550,15 @@ static bool gunyah_rm_validate_notif(const struct gunyah_rm_message *message)
 		return message->size == sizeof(struct gunyah_rm_irq_handle_payload);
 	case GUNYAH_RM_NOTIFICATION_VM_SHUTDOWN:
 		return message->size >= sizeof(__le16);
+	case GUNYAH_RM_NOTIFICATION_CONSOLE_CHARS: {
+		const struct gunyah_rm_console_chars_payload *chars =
+			message->payload;
+
+		if (message->size < sizeof(*chars))
+			return false;
+		return message->size ==
+		       sizeof(*chars) + le16_to_cpu(chars->num_bytes);
+	}
 	default:
 		return true;
 	}
