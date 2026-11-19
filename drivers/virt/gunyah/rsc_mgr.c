@@ -194,6 +194,12 @@ struct gunyah_rm {
 	bool tx_irq_wake;
 	bool rx_irq_wake;
 
+	/* Interrupt lending events queued for userspace */
+	struct list_head irq_events;
+	spinlock_t irq_events_lock;
+	unsigned int irq_events_count;
+	struct notifier_block irq_events_nb;
+
 	/* RM predates VM_SET_DEMAND_PAGING: share all guest memory up-front */
 	bool no_demand_paging;
 	bool no_device_passthrough;
@@ -410,6 +416,121 @@ static bool gunyah_rm_cancel_call(struct gunyah_rm *rm,
 	return pending;
 }
 
+struct gunyah_rm_irq_lent_payload {
+	__le16 owner;
+	__le16 reserved;
+	__le32 handle;
+	__le32 label;
+} __packed;
+
+struct gunyah_rm_irq_handle_payload {
+	__le32 handle;
+} __packed;
+
+static void gunyah_rm_queue_irq_event(struct gunyah_rm *rm,
+				      enum gunyah_rm_irq_event_type type,
+				      u32 handle, u32 label, u16 vmid)
+{
+	struct gunyah_rm_irq_event *event, *old;
+	unsigned long flags;
+
+	event = kmalloc(sizeof(*event), GFP_ATOMIC);
+	if (!event)
+		return;
+
+	event->type = type;
+	event->handle = handle;
+	event->label = label;
+	event->vmid = vmid;
+	event->flags = 0;
+
+	spin_lock_irqsave(&rm->irq_events_lock, flags);
+	if (rm->irq_events_count >= GUNYAH_RM_IRQ_EVENT_QUEUE_LEN) {
+		/* Drop the oldest event so lending keeps working without a reader. */
+		old = list_first_entry(&rm->irq_events,
+				       struct gunyah_rm_irq_event, node);
+		list_del(&old->node);
+		rm->irq_events_count--;
+		kfree(old);
+	}
+	list_add_tail(&event->node, &rm->irq_events);
+	rm->irq_events_count++;
+	spin_unlock_irqrestore(&rm->irq_events_lock, flags);
+}
+
+/**
+ * gunyah_rm_irq_event_get() - Dequeue one interrupt lending event
+ * @rm: Handle to a Gunyah resource manager
+ * @event: Set to the oldest queued event
+ *
+ * Return: 0 on success, -ENODATA when the queue is empty.
+ */
+int gunyah_rm_irq_event_get(struct gunyah_rm *rm,
+			    struct gunyah_rm_irq_event *event)
+{
+	struct gunyah_rm_irq_event *queued;
+	unsigned long flags;
+
+	if (!rm || !event)
+		return -EINVAL;
+
+	spin_lock_irqsave(&rm->irq_events_lock, flags);
+	queued = list_first_entry_or_null(&rm->irq_events,
+					  struct gunyah_rm_irq_event, node);
+	if (!queued) {
+		spin_unlock_irqrestore(&rm->irq_events_lock, flags);
+		return -ENODATA;
+	}
+
+	list_del(&queued->node);
+	rm->irq_events_count--;
+	spin_unlock_irqrestore(&rm->irq_events_lock, flags);
+
+	*event = *queued;
+	kfree(queued);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gunyah_rm_irq_event_get);
+
+static int gunyah_rm_events_notify(struct notifier_block *nb,
+				   unsigned long action, void *data)
+{
+	struct gunyah_rm *rm = container_of(nb, struct gunyah_rm, irq_events_nb);
+
+	switch (action) {
+	case GUNYAH_RM_NOTIFICATION_IRQ_LENT: {
+		const struct gunyah_rm_irq_lent_payload *lent = data;
+
+		gunyah_rm_queue_irq_event(rm, GUNYAH_RM_IRQ_LENT,
+					  le32_to_cpu(lent->handle),
+					  le32_to_cpu(lent->label),
+					  le16_to_cpu(lent->owner));
+		break;
+	}
+	case GUNYAH_RM_NOTIFICATION_IRQ_RELEASED: {
+		const struct gunyah_rm_irq_handle_payload *rel = data;
+
+		gunyah_rm_queue_irq_event(rm, GUNYAH_RM_IRQ_RELEASED,
+					  le32_to_cpu(rel->handle), 0, 0);
+		break;
+	}
+	case GUNYAH_RM_NOTIFICATION_IRQ_ACCEPTED: {
+		const struct gunyah_rm_irq_handle_payload *acc = data;
+
+		gunyah_rm_queue_irq_event(rm, GUNYAH_RM_IRQ_ACCEPTED,
+					  le32_to_cpu(acc->handle), 0, 0);
+		break;
+	}
+	case GUNYAH_RM_NOTIFICATION_VM_SHUTDOWN:
+		pr_info("RM reports a VM shut down\n");
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
 static bool gunyah_rm_validate_notif(const struct gunyah_rm_message *message)
 {
 	const struct gunyah_rm_vm_exited_payload *exited = message->payload;
@@ -422,6 +543,13 @@ static bool gunyah_rm_validate_notif(const struct gunyah_rm_message *message)
 			return false;
 		return le32_to_cpu(exited->exit_reason_size) <=
 		       message->size - sizeof(*exited);
+	case GUNYAH_RM_NOTIFICATION_IRQ_LENT:
+		return message->size == sizeof(struct gunyah_rm_irq_lent_payload);
+	case GUNYAH_RM_NOTIFICATION_IRQ_RELEASED:
+	case GUNYAH_RM_NOTIFICATION_IRQ_ACCEPTED:
+		return message->size == sizeof(struct gunyah_rm_irq_handle_payload);
+	case GUNYAH_RM_NOTIFICATION_VM_SHUTDOWN:
+		return message->size >= sizeof(__le16);
 	default:
 		return true;
 	}
@@ -1314,6 +1442,8 @@ static int __init gunyah_rm_init(void)
 
 	mutex_init(&rm->send_lock);
 	mutex_init(&rm->recv_lock);
+	spin_lock_init(&rm->irq_events_lock);
+	INIT_LIST_HEAD(&rm->irq_events);
 	init_completion(&rm->send_ready);
 	BLOCKING_INIT_NOTIFIER_HEAD(&rm->nh);
 	xa_init_flags(&rm->call_xarray, XA_FLAGS_ALLOC);
@@ -1336,6 +1466,11 @@ static int __init gunyah_rm_init(void)
 		goto free_irqs;
 
 	gunyah_rm_probe_features(rm);
+
+	rm->irq_events_nb.notifier_call = gunyah_rm_events_notify;
+	ret = gunyah_rm_notifier_register(rm, &rm->irq_events_nb);
+	if (ret)
+		goto free_irqs;
 
 	rm->miscdev.name = "gunyah";
 	rm->miscdev.minor = MISC_DYNAMIC_MINOR;

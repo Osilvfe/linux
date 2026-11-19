@@ -185,6 +185,12 @@ struct gunyah_vm {
 		struct gunyah_vm_firmware_config config;
 		struct gunyah_vm_parcel parcel;
 	} fw;
+	/* Guest virtual RTC reference, applied once the VM reaches INIT */
+	struct {
+		u64 time_base;
+		u64 sys_timer_ref;
+		bool requested;
+	} time_base;
 	struct xarray boot_context;
 	struct xarray folio_states;
 	struct xarray folio_gfns;

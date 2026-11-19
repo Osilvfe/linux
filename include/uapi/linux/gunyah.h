@@ -656,4 +656,179 @@ struct gunyah_auth_desc {
 #define GH_CAP_VCPU_TIMER_WAKEUP	0
 #define GH_CAP_DEMAND_PAGING		1
 #define GH_CAP_DEVICE_PASSTHROUGH	2
+#define GH_CAP_VM_REGISTRY		3
+#define GH_CAP_VM_TIME_BASE		4
+#define GH_CAP_IRQ_LENDING		5
+#define GH_CAP_VM_CRASH_MSG		6
+
+/*
+ * Host-side Resource Manager services
+ *
+ * These ioctls are issued on the /dev/gunyah file descriptor and reach RM
+ * services that do not belong to a single VM: the VM registry, the interrupt
+ * lending service and the host identity query.
+ */
+enum gunyah_vm_id_type {
+	GUNYAH_VM_ID_URI	= 0,
+	GUNYAH_VM_ID_GUID	= 1,
+	GUNYAH_VM_ID_NAME	= 2,
+};
+
+/**
+ * struct gunyah_vm_lookup_args - Look up a VM in the RM registry
+ * @id_type: See &enum gunyah_vm_id_type
+ * @key_len: Length of the key in bytes (ignored for %GUNYAH_VM_ID_GUID)
+ * @key: User pointer to the key
+ * @vmid: Out: first matching VM identifier
+ * @flags: Reserved, must be 0
+ *
+ * Returns -ENOENT when no VM matches.
+ */
+struct gunyah_vm_lookup_args {
+	__u32 id_type;
+	__u32 key_len;
+	__u64 key;
+	__u16 vmid;
+	__u16 reserved;
+	__u32 flags;
+};
+
+#define GH_SERVICE_VM_LOOKUP	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x20, \
+				      struct gunyah_vm_lookup_args)
+
+/**
+ * struct gunyah_vm_id_args - Read a VM's RM identifier blob
+ * @vmid: In: VM to query, 0 for the caller
+ * @num_entries: Out: number of identifier entries in the blob
+ * @size: In: capacity of @buf, out: bytes written
+ * @buf: User pointer receiving the RM identifier TLV blob
+ * @flags: Reserved, must be 0
+ *
+ * The blob is RM-defined: a sequence of
+ * &struct gunyah_vm_id_entry records.
+ */
+struct gunyah_vm_id_args {
+	__u16 vmid;
+	__u16 num_entries;
+	__u32 size;
+	__u64 buf;
+	__u32 flags;
+	__u32 reserved;
+};
+
+/** struct gunyah_vm_id_entry - One entry of the identifier blob */
+struct gunyah_vm_id_entry {
+	__u8 type;
+	__u8 reserved;
+	__u16 len;
+	__u8 data[];
+};
+
+#define GH_SERVICE_VM_GET_ID	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x21, \
+				      struct gunyah_vm_id_args)
+
+/**
+ * struct gunyah_vm_crash_msg_args - Read a VM's crash message
+ * @vmid: VM to query
+ * @msg_len: In: capacity of @msg, out: message length
+ * @msg: User pointer receiving the crash message
+ *
+ * Returns -ENOSPC (with @msg_len set) when the message does not fit.
+ */
+struct gunyah_vm_crash_msg_args {
+	__u16 vmid;
+	__u16 msg_len;
+	__u32 reserved;
+	__u64 msg;
+};
+
+#define GH_SERVICE_VM_CRASH_MSG	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x22, \
+				      struct gunyah_vm_crash_msg_args)
+
+/**
+ * struct gunyah_irq_lend_args - Lend an interrupt to another VM
+ * @borrower: VM that receives the interrupt
+ * @virq: Interrupt number in the caller's VM
+ * @label: Caller-defined label echoed back in notifications
+ * @handle: Out: handle used to release or reclaim the interrupt
+ * @flags: Reserved, must be 0
+ */
+struct gunyah_irq_lend_args {
+	__u16 borrower;
+	__u16 reserved;
+	__u32 virq;
+	__u32 label;
+	__u32 handle;
+	__u32 flags;
+};
+
+#define GH_SERVICE_IRQ_LEND	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x23, \
+				      struct gunyah_irq_lend_args)
+
+/** struct gunyah_irq_handle_args - Address an interrupt by RM handle */
+struct gunyah_irq_handle_args {
+	__u32 handle;
+	__u32 flags;
+};
+
+#define GH_SERVICE_IRQ_RELEASE	_IOW(GH_ANDROID_IOCTL_TYPE, 0x24, \
+				     struct gunyah_irq_handle_args)
+#define GH_SERVICE_IRQ_RECLAIM	_IOW(GH_ANDROID_IOCTL_TYPE, 0x25, \
+				     struct gunyah_irq_handle_args)
+
+/**
+ * struct gunyah_irq_accept_args - Accept an interrupt lent to the caller
+ * @handle: Handle from the corresponding lend notification
+ * @virq: In: destination interrupt or %GUNYAH_VIRQ_AUTO, out: assigned number
+ * @flags: Reserved, must be 0
+ */
+struct gunyah_irq_accept_args {
+	__u32 handle;
+	__u32 virq;
+	__u32 flags;
+	__u32 reserved;
+};
+
+#define GUNYAH_VIRQ_AUTO	0xffffffff
+#define GH_SERVICE_IRQ_ACCEPT	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x26, \
+				      struct gunyah_irq_accept_args)
+
+/** Interrupt lending event types reported by %GH_SERVICE_IRQ_GET_EVENT */
+#define GUNYAH_IRQ_EVENT_LENT		1
+#define GUNYAH_IRQ_EVENT_RELEASED	2
+#define GUNYAH_IRQ_EVENT_ACCEPTED	3
+
+/** struct gunyah_irq_event - One queued interrupt lending event */
+struct gunyah_irq_event {
+	__u32 type;
+	__u32 handle;
+	__u32 label;
+	__u16 vmid;
+	__u16 reserved;
+	__u32 flags;
+};
+
+#define GH_SERVICE_IRQ_GET_EVENT _IOR(GH_ANDROID_IOCTL_TYPE, 0x27, \
+				      struct gunyah_irq_event)
+
+#define GH_SERVICE_HOST_GET_TYPE _IOR(GH_ANDROID_IOCTL_TYPE, 0x28, __u32)
+
+/**
+ * struct gunyah_vm_time_base_args - Set the guest's virtual RTC reference
+ * @time_base: Guest time base in nanoseconds
+ * @sys_timer_ref: Host system timer reference matching @time_base
+ *
+ * Issued on a VM fd. Before %GUNYAH_VM_START the value is remembered and
+ * applied by the kernel when the VM reaches the RM INIT state; afterwards the
+ * call is forwarded to RM directly and needs the VM to be in INIT or READY.
+ * The RM rejects the call with -EPERM when the VM has no vRTC device.
+ */
+struct gunyah_vm_time_base_args {
+	__u64 time_base;
+	__u64 sys_timer_ref;
+};
+
+#define GH_VM_SET_TIME_BASE	_IOW(GH_ANDROID_IOCTL_TYPE, 0x30, \
+				     struct gunyah_vm_time_base_args)
+
 #endif

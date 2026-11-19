@@ -1208,6 +1208,17 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		}
 	}
 
+	if (ghvm->time_base.requested) {
+		ret = gunyah_rm_vm_set_time_base(ghvm->rm, ghvm->vmid,
+						 ghvm->time_base.time_base,
+						 ghvm->time_base.sys_timer_ref);
+		if (ret) {
+			dev_warn(ghvm->parent,
+				 "Failed to set the guest time base: %d\n", ret);
+			goto err;
+		}
+	}
+
 	ret = gunyah_vm_pre_vm_init(ghvm);
 	if (ret)
 		goto err;
@@ -1362,6 +1373,42 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 			ghvm->auth = GUNYAH_RM_VM_AUTH_QCOM_ANDROID_PVM;
 
 		r = 0;
+		break;
+	}
+	case GH_VM_SET_TIME_BASE: {
+		struct gunyah_vm_time_base_args args;
+
+		if (copy_from_user(&args, argp, sizeof(args)))
+			return -EFAULT;
+
+		guard(rwsem_write)(&ghvm->status_lock);
+		/*
+		 * Before the VM exists in RM the value is remembered and
+		 * applied by gunyah_vm_start() once the VM reaches INIT.
+		 */
+		if (ghvm->vm_status == GUNYAH_RM_VM_STATUS_NO_STATE) {
+			ghvm->time_base.time_base = args.time_base;
+			ghvm->time_base.sys_timer_ref = args.sys_timer_ref;
+			ghvm->time_base.requested = true;
+			r = 0;
+			break;
+		}
+
+		if (ghvm->vmid == GUNYAH_VMID_INVAL ||
+		    (ghvm->vm_status != GUNYAH_RM_VM_STATUS_INIT &&
+		     ghvm->vm_status != GUNYAH_RM_VM_STATUS_READY)) {
+			r = -EBUSY;
+			break;
+		}
+
+		r = gunyah_rm_vm_set_time_base(ghvm->rm, ghvm->vmid,
+					       args.time_base,
+					       args.sys_timer_ref);
+		if (!r) {
+			ghvm->time_base.time_base = args.time_base;
+			ghvm->time_base.sys_timer_ref = args.sys_timer_ref;
+			ghvm->time_base.requested = true;
+		}
 		break;
 	}
 	case GUNYAH_VM_START: {
@@ -1558,6 +1605,17 @@ unassign_unlock_status:
 			break;
 		case GH_CAP_DEVICE_PASSTHROUGH:
 			r = gunyah_rm_has_device_passthrough(ghvm->rm);
+			break;
+		case GH_CAP_VM_REGISTRY:
+		case GH_CAP_VM_CRASH_MSG:
+			/* Kernel side implemented; the RM decides at call time. */
+			r = 1;
+			break;
+		case GH_CAP_VM_TIME_BASE:
+			r = 1;
+			break;
+		case GH_CAP_IRQ_LENDING:
+			r = 1;
 			break;
 		default:
 			r = 0;
@@ -2048,6 +2106,215 @@ static long gunyah_dev_ioctl_release_device(struct gunyah_rm *rm,
 					   GUNYAH_DEVICE_RELEASE_RESET));
 }
 
+
+static long gunyah_dev_ioctl_vm_lookup(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_vm_lookup_args args;
+	void *key;
+	long ret;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || args.reserved)
+		return -EINVAL;
+
+	switch (args.id_type) {
+	case GUNYAH_VM_ID_URI:
+	case GUNYAH_VM_ID_NAME:
+		if (!args.key_len || args.key_len > GUNYAH_RM_VM_MAX_NAME_LEN)
+			return -EINVAL;
+		break;
+	case GUNYAH_VM_ID_GUID:
+		if (args.key_len && args.key_len != GUNYAH_RM_VM_GUID_LEN)
+			return -EINVAL;
+		args.key_len = GUNYAH_RM_VM_GUID_LEN;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	key = memdup_user((const void __user *)args.key, args.key_len);
+	if (IS_ERR(key))
+		return PTR_ERR(key);
+
+	ret = gunyah_rm_vm_lookup(rm, args.id_type, key, args.key_len,
+				  &args.vmid);
+	kfree(key);
+	if (ret)
+		return ret;
+
+	args.reserved = 0;
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long gunyah_dev_ioctl_vm_get_id(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_vm_id_args args;
+	size_t payload_size = 0;
+	u8 *buf;
+	long ret;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || args.reserved || args.size > PAGE_SIZE)
+		return -EINVAL;
+
+	buf = kzalloc(max_t(size_t, args.size, 1), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = gunyah_rm_vm_get_id(rm, args.vmid, buf, args.size,
+				  &payload_size, &args.num_entries);
+	if (ret)
+		goto out;
+
+	if (payload_size &&
+	    copy_to_user((void __user *)args.buf, buf, payload_size)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	args.size = payload_size;
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		ret = -EFAULT;
+
+out:
+	kfree(buf);
+	return ret;
+}
+
+static long gunyah_dev_ioctl_vm_crash_msg(struct gunyah_rm *rm,
+					  unsigned long arg)
+{
+	struct gunyah_vm_crash_msg_args args;
+	size_t msg_len = 0;
+	u8 *buf;
+	long ret;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.reserved)
+		return -EINVAL;
+
+	buf = kzalloc(GUNYAH_RM_VM_MAX_CRASH_MSG_LEN, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = gunyah_rm_vm_get_crash_msg(rm, args.vmid, buf,
+					 GUNYAH_RM_VM_MAX_CRASH_MSG_LEN,
+					 &msg_len);
+	if (!ret) {
+		if (msg_len > args.msg_len) {
+			ret = -ENOSPC;
+		} else if (msg_len &&
+			   copy_to_user((void __user *)args.msg, buf, msg_len)) {
+			ret = -EFAULT;
+		}
+	}
+
+	args.msg_len = msg_len;
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		ret = -EFAULT;
+
+	kfree(buf);
+	return ret;
+}
+
+static long gunyah_dev_ioctl_host_get_type(struct gunyah_rm *rm,
+					   unsigned long arg)
+{
+	u32 host_type;
+	int ret;
+
+	ret = gunyah_rm_host_get_type(rm, &host_type);
+	if (ret)
+		return ret;
+
+	if (put_user(host_type, (u32 __user *)arg))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long gunyah_dev_ioctl_irq_lend(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_irq_lend_args args;
+	long ret;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || args.reserved || args.borrower == GUNYAH_VMID_INVAL)
+		return -EINVAL;
+
+	ret = gunyah_rm_irq_lend(rm, args.borrower, args.virq, args.label,
+				 &args.handle);
+	if (ret)
+		return ret;
+
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long gunyah_dev_ioctl_irq_handle(struct gunyah_rm *rm, unsigned long arg,
+					bool reclaim)
+{
+	struct gunyah_irq_handle_args args;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags)
+		return -EINVAL;
+
+	return reclaim ? gunyah_rm_irq_reclaim(rm, args.handle) :
+			 gunyah_rm_irq_release(rm, args.handle);
+}
+
+static long gunyah_dev_ioctl_irq_accept(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_irq_accept_args args;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || args.reserved)
+		return -EINVAL;
+
+	if (gunyah_rm_irq_accept(rm, args.handle, args.virq, &args.virq))
+		return -EINVAL;
+
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long gunyah_dev_ioctl_irq_event(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_rm_irq_event event;
+	struct gunyah_irq_event out;
+	int ret;
+
+	ret = gunyah_rm_irq_event_get(rm, &event);
+	if (ret)
+		return ret;
+
+	memset(&out, 0, sizeof(out));
+	out.type = event.type;
+	out.handle = event.handle;
+	out.label = event.label;
+	out.vmid = event.vmid;
+	out.flags = event.flags;
+
+	if (copy_to_user((void __user *)arg, &out, sizeof(out)))
+		return -EFAULT;
+
+	return 0;
+}
+
 long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -2069,6 +2336,24 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 		return gunyah_dev_ioctl_accept_device(rm, arg);
 	case GUNYAH_DEVICE_RELEASE:
 		return gunyah_dev_ioctl_release_device(rm, arg);
+	case GH_SERVICE_VM_LOOKUP:
+		return gunyah_dev_ioctl_vm_lookup(rm, arg);
+	case GH_SERVICE_VM_GET_ID:
+		return gunyah_dev_ioctl_vm_get_id(rm, arg);
+	case GH_SERVICE_VM_CRASH_MSG:
+		return gunyah_dev_ioctl_vm_crash_msg(rm, arg);
+	case GH_SERVICE_HOST_GET_TYPE:
+		return gunyah_dev_ioctl_host_get_type(rm, arg);
+	case GH_SERVICE_IRQ_LEND:
+		return gunyah_dev_ioctl_irq_lend(rm, arg);
+	case GH_SERVICE_IRQ_RELEASE:
+		return gunyah_dev_ioctl_irq_handle(rm, arg, false);
+	case GH_SERVICE_IRQ_RECLAIM:
+		return gunyah_dev_ioctl_irq_handle(rm, arg, true);
+	case GH_SERVICE_IRQ_ACCEPT:
+		return gunyah_dev_ioctl_irq_accept(rm, arg);
+	case GH_SERVICE_IRQ_GET_EVENT:
+		return gunyah_dev_ioctl_irq_event(rm, arg);
 	default:
 		return -ENOTTY;
 	}

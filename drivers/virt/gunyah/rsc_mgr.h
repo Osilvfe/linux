@@ -6,6 +6,7 @@
 #define __GUNYAH_RSC_MGR_PRIV_H
 
 #include <linux/gunyah.h>
+#include <linux/list.h>
 #include <linux/notifier.h>
 #include <linux/types.h>
 
@@ -36,7 +37,12 @@ struct gunyah_rm_vm_exited_payload {
 enum gunyah_rm_notification_id {
 	/* clang-format off */
 	GUNYAH_RM_NOTIFICATION_VM_EXITED		 = 0x56100001,
+	GUNYAH_RM_NOTIFICATION_VM_SHUTDOWN		 = 0x56100002,
 	GUNYAH_RM_NOTIFICATION_VM_STATUS		 = 0x56100008,
+	GUNYAH_RM_NOTIFICATION_IRQ_LENT			 = 0x56100011,
+	GUNYAH_RM_NOTIFICATION_IRQ_RELEASED		 = 0x56100012,
+	GUNYAH_RM_NOTIFICATION_IRQ_ACCEPTED		 = 0x56100013,
+	GUNYAH_RM_NOTIFICATION_CONSOLE_CHARS		 = 0x56100080,
 	/* clang-format on */
 };
 
@@ -56,6 +62,24 @@ enum gunyah_rm_vm_status {
 	GUNYAH_RM_VM_STATUS_RESET_FAILED	= 12,
 	/* clang-format on */
 };
+
+/* Interrupt lending notifications, one queue per resource manager */
+enum gunyah_rm_irq_event_type {
+	GUNYAH_RM_IRQ_LENT = 1,
+	GUNYAH_RM_IRQ_RELEASED = 2,
+	GUNYAH_RM_IRQ_ACCEPTED = 3,
+};
+
+struct gunyah_rm_irq_event {
+	struct list_head node;
+	enum gunyah_rm_irq_event_type type;
+	u32 handle;
+	u32 label;
+	u16 vmid;
+	u32 flags;
+};
+
+#define GUNYAH_RM_IRQ_EVENT_QUEUE_LEN	32
 
 struct gunyah_rm_vm_status_payload {
 	__le16 vmid;
@@ -149,6 +173,38 @@ int gunyah_rm_device_donate(struct gunyah_rm *rm, u16 vmid, u32 handle,
 int gunyah_rm_device_reclaim(struct gunyah_rm *rm, u32 handle, bool reset);
 
 int gunyah_rm_get_vmid(struct gunyah_rm *rm, u16 *vmid);
+
+/* VM registry, host identity and guest service RPCs */
+enum gunyah_rm_vm_id_type {
+	GUNYAH_RM_VM_ID_URI = 0,
+	GUNYAH_RM_VM_ID_GUID = 1,
+	GUNYAH_RM_VM_ID_NAME = 2,
+};
+
+#define GUNYAH_RM_VM_MAX_NAME_LEN	79
+#define GUNYAH_RM_VM_MAX_URI_LEN	79
+#define GUNYAH_RM_VM_GUID_LEN		16
+#define GUNYAH_RM_VM_MAX_CRASH_MSG_LEN	192
+
+int gunyah_rm_vm_lookup(struct gunyah_rm *rm, enum gunyah_rm_vm_id_type type,
+			const void *key, size_t key_len, u16 *vmid);
+int gunyah_rm_vm_get_id(struct gunyah_rm *rm, u16 vmid, void *buf,
+			size_t buf_size, size_t *payload_size, u16 *n_entries);
+int gunyah_rm_vm_get_crash_msg(struct gunyah_rm *rm, u16 vmid, void *buf,
+			       size_t buf_size, size_t *msg_len);
+int gunyah_rm_vm_set_time_base(struct gunyah_rm *rm, u16 vmid, u64 time_base,
+			       u64 sys_timer_ref);
+int gunyah_rm_host_get_type(struct gunyah_rm *rm, u32 *host_type);
+
+/* Interrupt lending */
+int gunyah_rm_irq_lend(struct gunyah_rm *rm, u16 borrower, u32 virq,
+		       u32 label, u32 *handle);
+int gunyah_rm_irq_release(struct gunyah_rm *rm, u32 handle);
+int gunyah_rm_irq_reclaim(struct gunyah_rm *rm, u32 handle);
+int gunyah_rm_irq_accept(struct gunyah_rm *rm, u32 handle, u32 virq,
+			 u32 *virq_out);
+int gunyah_rm_irq_event_get(struct gunyah_rm *rm,
+			    struct gunyah_rm_irq_event *event);
 
 int gunyah_rm_vm_set_demand_paging(struct gunyah_rm *rm, u16 vmid, u32 count,
 				   struct gunyah_rm_mem_entry *mem_entries);

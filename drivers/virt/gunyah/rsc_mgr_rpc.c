@@ -1067,3 +1067,379 @@ int gunyah_rm_vm_set_firmware_mem(struct gunyah_rm *rm, u16 vmid, struct gunyah_
 	return gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_SET_FIRMWARE_MEM, &req, sizeof(req), NULL, NULL);
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_vm_set_firmware_mem, ERRNO);
+
+/* Message IDs: VM registry, host identity and guest services */
+/* clang-format off */
+#define GUNYAH_RM_RPC_VM_GET_ID			0x56000010
+#define GUNYAH_RM_RPC_VM_LOOKUP_URI		0x56000011
+#define GUNYAH_RM_RPC_VM_LOOKUP_GUID		0x56000012
+#define GUNYAH_RM_RPC_VM_LOOKUP_NAME		0x56000013
+#define GUNYAH_RM_RPC_VM_GET_CRASH_MSG		0x56000019
+#define GUNYAH_RM_RPC_VM_SET_TIME_BASE		0x56000030
+#define GUNYAH_RM_RPC_VM_HOST_GET_TYPE		0x560000A0
+#define GUNYAH_RM_RPC_VM_IRQ_ACCEPT		0x56000050
+#define GUNYAH_RM_RPC_VM_IRQ_LEND		0x56000051
+#define GUNYAH_RM_RPC_VM_IRQ_RELEASE		0x56000052
+#define GUNYAH_RM_RPC_VM_IRQ_RECLAIM		0x56000053
+/* clang-format on */
+
+struct gunyah_rm_vm_string_id_req {
+	__le16 len;
+	__le16 reserved;
+	u8 key[];
+} __packed;
+
+struct gunyah_rm_vm_time_base_req {
+	__le16 vmid;
+	__le16 reserved;
+	__le64 time_base;
+	__le64 sys_timer_ref;
+} __packed;
+
+struct gunyah_rm_vm_irq_lend_req {
+	__le16 borrower;
+	__le16 reserved;
+	__le32 virq;
+	__le32 label;
+} __packed;
+
+struct gunyah_rm_vm_irq_accept_req {
+	__le32 handle;
+	__le32 virq;
+} __packed;
+
+/**
+ * gunyah_rm_vm_lookup() - Find a VM identifier in the RM VM registry
+ * @rm: Handle to a Gunyah resource manager
+ * @type: Kind of key supplied
+ * @key: Key bytes (URI or name string, or a 16 byte GUID)
+ * @key_len: Length of @key
+ * @vmid: Set to the first matching VM identifier
+ *
+ * Return: 0 on success, -ENOENT if nothing matched, negative errno otherwise.
+ */
+int gunyah_rm_vm_lookup(struct gunyah_rm *rm, enum gunyah_rm_vm_id_type type,
+			const void *key, size_t key_len, u16 *vmid)
+{
+	struct gunyah_rm_vm_string_id_req *string_req;
+	__le32 *resp __free(kfree) = NULL;
+	u8 *req __free(kfree) = NULL;
+	size_t req_size, resp_size;
+	u32 message_id, count;
+	int ret;
+
+	if (!key || !vmid)
+		return -EINVAL;
+
+	switch (type) {
+	case GUNYAH_RM_VM_ID_URI:
+	case GUNYAH_RM_VM_ID_NAME:
+		if (!key_len || key_len > GUNYAH_RM_VM_MAX_NAME_LEN)
+			return -EINVAL;
+		message_id = type == GUNYAH_RM_VM_ID_URI ?
+				     GUNYAH_RM_RPC_VM_LOOKUP_URI :
+				     GUNYAH_RM_RPC_VM_LOOKUP_NAME;
+		req_size = sizeof(*string_req) + ALIGN(key_len, 4);
+		req = kzalloc(req_size, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		string_req = (struct gunyah_rm_vm_string_id_req *)req;
+		string_req->len = cpu_to_le16(key_len);
+		memcpy(string_req->key, key, key_len);
+		break;
+	case GUNYAH_RM_VM_ID_GUID:
+		if (key_len != GUNYAH_RM_VM_GUID_LEN)
+			return -EINVAL;
+		message_id = GUNYAH_RM_RPC_VM_LOOKUP_GUID;
+		req_size = GUNYAH_RM_VM_GUID_LEN;
+		req = kmemdup(key, req_size, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ret = gunyah_rm_call(rm, message_id, req, req_size, (void **)&resp,
+			     &resp_size);
+	if (ret)
+		return ret;
+
+	/* FIFO replies carry the RM error in the header; the payload is the
+	 * match count followed by the matching VMIDs. */
+	if (!resp || resp_size < sizeof(u32))
+		goto malformed;
+
+	count = le32_to_cpu(resp[0]);
+	if (!count)
+		return -ENOENT;
+	if (resp_size < sizeof(u32) + count * sizeof(u32))
+		goto malformed;
+
+	*vmid = (u16)le32_to_cpu(resp[1]);
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_lookup, ERRNO);
+
+/**
+ * gunyah_rm_vm_get_id() - Read the RM identifier blob of a VM
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM to query, 0 for the caller
+ * @buf: Destination for the identifier entries
+ * @buf_size: Capacity of @buf
+ * @payload_size: Set to the number of bytes the RM returned
+ * @n_entries: Set to the number of identifier entries
+ *
+ * Return: 0 on success, -ENOSPC if @buf is too small, negative errno otherwise.
+ */
+int gunyah_rm_vm_get_id(struct gunyah_rm *rm, u16 vmid, void *buf,
+			size_t buf_size, size_t *payload_size, u16 *n_entries)
+{
+	struct gunyah_rm_vm_common_vmid_req req = {
+		.vmid = cpu_to_le16(vmid),
+	};
+	u8 *resp __free(kfree) = NULL;
+	size_t resp_size;
+	u32 entries;
+	int ret;
+
+	if (!buf || !payload_size)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_GET_ID, &req, sizeof(req),
+			     (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size < sizeof(u32))
+		goto malformed;
+
+	entries = le32_to_cpu(*(__le32 *)resp);
+	resp_size -= sizeof(u32);
+	memmove(resp, resp + sizeof(u32), resp_size);
+
+	if (resp_size > buf_size)
+		return -ENOSPC;
+
+	memcpy(buf, resp, resp_size);
+	*payload_size = resp_size;
+	if (n_entries)
+		*n_entries = (u16)entries;
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_get_id, ERRNO);
+
+/**
+ * gunyah_rm_vm_get_crash_msg() - Read the crash message the VM reported
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM to query
+ * @buf: Destination buffer
+ * @buf_size: Capacity of @buf
+ * @msg_len: Set to the length of the stored message
+ *
+ * Return: 0 on success, -ENOSPC if @buf is too small, negative errno otherwise.
+ */
+int gunyah_rm_vm_get_crash_msg(struct gunyah_rm *rm, u16 vmid, void *buf,
+			       size_t buf_size, size_t *msg_len)
+{
+	struct gunyah_rm_vm_common_vmid_req req = {
+		.vmid = cpu_to_le16(vmid),
+	};
+	u8 *resp __free(kfree) = NULL;
+	size_t resp_size, len;
+	int ret;
+
+	if (!buf || !msg_len)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_GET_CRASH_MSG, &req,
+			     sizeof(req), (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	/* length (2) | padding (2) | message */
+	if (!resp || resp_size < 4)
+		goto malformed;
+
+	len = le16_to_cpu(*(__le16 *)resp);
+	if (resp_size < 4 + len)
+		goto malformed;
+
+	*msg_len = len;
+	if (len > buf_size)
+		return -ENOSPC;
+
+	memcpy(buf, resp + 4, len);
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_get_crash_msg, ERRNO);
+
+/**
+ * gunyah_rm_vm_set_time_base() - Set the virtual RTC reference of a VM
+ * @rm: Handle to a Gunyah resource manager
+ * @vmid: VM in INIT or READY state
+ * @time_base: Guest time base in nanoseconds
+ * @sys_timer_ref: Host system timer value matching @time_base
+ */
+int gunyah_rm_vm_set_time_base(struct gunyah_rm *rm, u16 vmid, u64 time_base,
+			       u64 sys_timer_ref)
+{
+	struct gunyah_rm_vm_time_base_req req = {
+		.vmid = cpu_to_le16(vmid),
+		.time_base = cpu_to_le64(time_base),
+		.sys_timer_ref = cpu_to_le64(sys_timer_ref),
+	};
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_SET_TIME_BASE, &req,
+			      sizeof(req), NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_set_time_base, ERRNO);
+
+/**
+ * gunyah_rm_host_get_type() - Query the RM's view of the host
+ * @rm: Handle to a Gunyah resource manager
+ * @host_type: Set to the RM host type word (arch/type/version fields)
+ */
+int gunyah_rm_host_get_type(struct gunyah_rm *rm, u32 *host_type)
+{
+	__le32 *resp __free(kfree) = NULL;
+	size_t resp_size;
+	int ret;
+
+	if (!host_type)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_HOST_GET_TYPE, NULL, 0,
+			     (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size != sizeof(*resp))
+		goto malformed;
+
+	*host_type = le32_to_cpu(*resp);
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_host_get_type, ERRNO);
+
+/**
+ * gunyah_rm_irq_lend() - Offer an interrupt of this VM to another VM
+ * @rm: Handle to a Gunyah resource manager
+ * @borrower: VM that may accept the interrupt
+ * @virq: Interrupt number in this VM
+ * @label: Caller-defined label echoed back in notifications
+ * @handle: Set to the RM handle for the lent interrupt
+ */
+int gunyah_rm_irq_lend(struct gunyah_rm *rm, u16 borrower, u32 virq,
+		       u32 label, u32 *handle)
+{
+	struct gunyah_rm_vm_irq_lend_req req = {
+		.borrower = cpu_to_le16(borrower),
+		.virq = cpu_to_le32(virq),
+		.label = cpu_to_le32(label),
+	};
+	__le32 *resp __free(kfree) = NULL;
+	size_t resp_size;
+	int ret;
+
+	if (!handle)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_IRQ_LEND, &req, sizeof(req),
+			     (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size != sizeof(*resp))
+		goto malformed;
+
+	*handle = le32_to_cpu(*resp);
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_irq_lend, ERRNO);
+
+/**
+ * gunyah_rm_irq_release() - Withdraw a lent interrupt from the borrower
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Handle returned by gunyah_rm_irq_lend()
+ */
+int gunyah_rm_irq_release(struct gunyah_rm *rm, u32 handle)
+{
+	__le32 req = cpu_to_le32(handle);
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_IRQ_RELEASE, &req,
+			      sizeof(req), NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_irq_release, ERRNO);
+
+/**
+ * gunyah_rm_irq_reclaim() - Take a lent interrupt back
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Handle returned by gunyah_rm_irq_lend()
+ */
+int gunyah_rm_irq_reclaim(struct gunyah_rm *rm, u32 handle)
+{
+	__le32 req = cpu_to_le32(handle);
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_IRQ_RECLAIM, &req,
+			      sizeof(req), NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_irq_reclaim, ERRNO);
+
+/**
+ * gunyah_rm_irq_accept() - Accept an interrupt lent to this VM
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Handle received in a lend notification
+ * @virq: Destination interrupt number, or %GUNYAH_VIRQ_AUTO
+ * @virq_out: Set to the interrupt number the RM assigned
+ */
+int gunyah_rm_irq_accept(struct gunyah_rm *rm, u32 handle, u32 virq,
+			 u32 *virq_out)
+{
+	struct gunyah_rm_vm_irq_accept_req req = {
+		.handle = cpu_to_le32(handle),
+		.virq = cpu_to_le32(virq),
+	};
+	__le32 *resp __free(kfree) = NULL;
+	size_t resp_size;
+	int ret;
+
+	if (!virq_out)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_IRQ_ACCEPT, &req,
+			     sizeof(req), (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size != sizeof(*resp))
+		goto malformed;
+
+	*virq_out = le32_to_cpu(*resp);
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_irq_accept, ERRNO);
