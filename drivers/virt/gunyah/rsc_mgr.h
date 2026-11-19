@@ -216,6 +216,14 @@ int gunyah_rm_irq_accept(struct gunyah_rm *rm, u32 handle, u32 virq,
 int gunyah_rm_irq_event_get(struct gunyah_rm *rm,
 			    struct gunyah_rm_irq_event *event);
 
+/* VM_IRQ_NOTIFY flag values */
+#define GUNYAH_RM_IRQ_NOTIFY_LENT	0x1
+#define GUNYAH_RM_IRQ_NOTIFY_RELEASED	0x2
+#define GUNYAH_RM_IRQ_NOTIFY_ACCEPTED	0x4
+
+int gunyah_rm_irq_notify(struct gunyah_rm *rm, u32 handle, u32 flags,
+			 u16 borrower);
+
 /* Guest console */
 int gunyah_rm_console_open(struct gunyah_rm *rm, u16 vmid);
 int gunyah_rm_console_close(struct gunyah_rm *rm, u16 vmid);

@@ -812,6 +812,33 @@ struct gunyah_irq_event {
 #define GH_SERVICE_IRQ_GET_EVENT _IOR(GH_ANDROID_IOCTL_TYPE, 0x27, \
 				      struct gunyah_irq_event)
 
+/** Notify flag values for %GH_SERVICE_IRQ_NOTIFY */
+#define GUNYAH_IRQ_NOTIFY_LENT		0x1
+#define GUNYAH_IRQ_NOTIFY_RELEASED	0x2
+#define GUNYAH_IRQ_NOTIFY_ACCEPTED	0x4
+
+/**
+ * struct gunyah_irq_notify_args - Deliver an interrupt borrow offer
+ * @handle: Handle returned by %GH_SERVICE_IRQ_LEND
+ * @flags: One of the GUNYAH_IRQ_NOTIFY_* values
+ * @vmid: Recipient for GUNYAH_IRQ_NOTIFY_LENT, zero to let the resource
+ *        manager notify the borrower it recorded; must be zero otherwise
+ * @reserved: Must be zero
+ *
+ * Lending an interrupt only reserves it in the resource manager.  The borrower
+ * learns about the offer through this request, so it belongs to every lend
+ * sequence; releasing or accepting an interrupt reports it the same way.
+ */
+struct gunyah_irq_notify_args {
+	__u32 handle;
+	__u32 flags;
+	__u16 vmid;
+	__u16 reserved;
+};
+
+#define GH_SERVICE_IRQ_NOTIFY _IOW(GH_ANDROID_IOCTL_TYPE, 0x2b, \
+				   struct gunyah_irq_notify_args)
+
 #define GH_SERVICE_HOST_GET_TYPE _IOR(GH_ANDROID_IOCTL_TYPE, 0x28, __u32)
 
 /**

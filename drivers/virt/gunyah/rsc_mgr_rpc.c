@@ -1083,6 +1083,7 @@ ALLOW_ERROR_INJECTION(gunyah_rm_vm_set_firmware_mem, ERRNO);
 #define GUNYAH_RM_RPC_VM_IRQ_LEND		0x56000051
 #define GUNYAH_RM_RPC_VM_IRQ_RELEASE		0x56000052
 #define GUNYAH_RM_RPC_VM_IRQ_RECLAIM		0x56000053
+#define GUNYAH_RM_RPC_VM_IRQ_NOTIFY		0x56000054
 /* clang-format on */
 
 struct gunyah_rm_vm_string_id_req {
@@ -1528,6 +1529,68 @@ malformed:
 	return -EBADMSG;
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_irq_accept, ERRNO);
+
+/**
+ * struct gunyah_rm_irq_notify_req - Payload of a VM_IRQ_NOTIFY request
+ * @handle: Handle of the lent interrupt
+ * @flags: One of the notify flag values
+ * @notify_entries: Number of optional recipient VMIDs (lend only)
+ * @reserved: Must be zero
+ *
+ * The RM expands this into the release/accept payload (8 bytes) or the lend
+ * payload (12 bytes, optionally followed by recipient VMIDs).
+ */
+struct gunyah_rm_irq_notify_req {
+	__le32 handle;
+	__le32 flags;
+	__le16 notify_entries;
+	__le16 reserved;
+	__le16 vmid;
+	__le16 pad;
+} __packed;
+
+/**
+ * gunyah_rm_irq_notify() - Tell the RM to deliver a lend/release/accept offer
+ * @rm: Handle to a Gunyah resource manager
+ * @handle: Handle returned by gunyah_rm_irq_lend()
+ * @flags: GUNYAH_RM_IRQ_NOTIFY_LENT, _RELEASED or _ACCEPTED
+ * @borrower: Recipient VMID for the lend case, GUNYAH_VMID_INVAL to let the
+ *            RM notify the borrower it recorded when the interrupt was lent
+ *
+ * Lending an interrupt only reserves it in the RM; the borrower is told about
+ * the offer through this request, so it is part of every lend sequence.
+ *
+ * Return: 0 on success, negative errno otherwise.
+ */
+int gunyah_rm_irq_notify(struct gunyah_rm *rm, u32 handle, u32 flags,
+			 u16 borrower)
+{
+	struct gunyah_rm_irq_notify_req req = {
+		.handle = cpu_to_le32(handle),
+		.flags = cpu_to_le32(flags),
+	};
+	size_t req_size = 2 * sizeof(__le32);
+
+	switch (flags) {
+	case GUNYAH_RM_IRQ_NOTIFY_LENT:
+		req_size += 2 * sizeof(__le16);
+		if (borrower != GUNYAH_VMID_INVAL) {
+			req.notify_entries = cpu_to_le16(1);
+			req.vmid = cpu_to_le16(borrower);
+			req_size += sizeof(__le16) * 2;
+		}
+		break;
+	case GUNYAH_RM_IRQ_NOTIFY_RELEASED:
+	case GUNYAH_RM_IRQ_NOTIFY_ACCEPTED:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_IRQ_NOTIFY, &req, req_size,
+			      NULL, NULL);
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_irq_notify, ERRNO);
 
 /* Message IDs: guest console */
 /* clang-format off */
