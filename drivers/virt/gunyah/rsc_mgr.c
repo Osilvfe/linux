@@ -85,6 +85,9 @@ enum gunyah_rm_error {
 	GUNYAH_RM_ERROR_IRQ_INVALID		= 0xF,
 	GUNYAH_RM_ERROR_IRQ_INUSE		= 0x10,
 	GUNYAH_RM_ERROR_IRQ_RELEASED		= 0x11,
+	GUNYAH_RM_ERROR_VM_STATE		= 0x14,
+	GUNYAH_RM_ERROR_HYP_NOMEM		= 0x15,
+	GUNYAH_RM_ERROR_RM_NOMEM		= 0x16,
 	/* clang-format on */
 };
 
@@ -228,7 +231,11 @@ static inline int gunyah_rm_error_remap(enum gunyah_rm_error rm_error)
 	case GUNYAH_RM_ERROR_IRQ_INVALID:
 	case GUNYAH_RM_ERROR_IRQ_INUSE:
 	case GUNYAH_RM_ERROR_IRQ_RELEASED:
+	case GUNYAH_RM_ERROR_VM_STATE:
 		return -EINVAL;
+	case GUNYAH_RM_ERROR_HYP_NOMEM:
+	case GUNYAH_RM_ERROR_RM_NOMEM:
+		return -ENOMEM;
 	default:
 		return -EBADMSG;
 	}
