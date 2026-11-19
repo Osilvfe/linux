@@ -1251,11 +1251,15 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		ret = gunyah_rm_vm_set_time_base(ghvm->rm, ghvm->vmid,
 						 ghvm->time_base.time_base,
 						 ghvm->time_base.sys_timer_ref);
-		if (ret) {
+		/*
+		 * The time base only seeds the guest RTC.  Platforms whose VM
+		 * configuration has no vRTC device reject it, and refusing to
+		 * start the VM over a missing wall clock would be worse than
+		 * booting with an unset RTC.
+		 */
+		if (ret)
 			dev_warn(ghvm->parent,
-				 "Failed to set the guest time base: %d\n", ret);
-			goto err;
-		}
+				 "Guest time base was not applied: %d\n", ret);
 	}
 
 	ret = gunyah_vm_pre_vm_init(ghvm);
@@ -2508,6 +2512,25 @@ static long gunyah_dev_ioctl_irq_lend(struct gunyah_rm *rm, unsigned long arg)
 	return 0;
 }
 
+static long gunyah_dev_ioctl_irq_notify(struct gunyah_rm *rm,
+					unsigned long arg)
+{
+	struct gunyah_irq_notify_args args;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.reserved ||
+	    (args.flags != GUNYAH_IRQ_NOTIFY_LENT &&
+	     args.flags != GUNYAH_IRQ_NOTIFY_RELEASED &&
+	     args.flags != GUNYAH_IRQ_NOTIFY_ACCEPTED))
+		return -EINVAL;
+	if (args.vmid && args.flags != GUNYAH_IRQ_NOTIFY_LENT)
+		return -EINVAL;
+
+	return gunyah_rm_irq_notify(rm, args.handle, args.flags,
+				    args.vmid ? args.vmid : GUNYAH_VMID_INVAL);
+}
+
 static long gunyah_dev_ioctl_irq_handle(struct gunyah_rm *rm, unsigned long arg,
 					bool reclaim)
 {
@@ -2606,6 +2629,8 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 		return gunyah_dev_ioctl_irq_accept(rm, arg);
 	case GH_SERVICE_IRQ_GET_EVENT:
 		return gunyah_dev_ioctl_irq_event(rm, arg);
+	case GH_SERVICE_IRQ_NOTIFY:
+		return gunyah_dev_ioctl_irq_notify(rm, arg);
 	default:
 		return -ENOTTY;
 	}
