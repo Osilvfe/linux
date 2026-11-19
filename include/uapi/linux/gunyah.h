@@ -815,6 +815,31 @@ struct gunyah_irq_event {
 #define GH_SERVICE_HOST_GET_TYPE _IOR(GH_ANDROID_IOCTL_TYPE, 0x28, __u32)
 
 /**
+ * struct gunyah_vm_peers_args - Peer VM IDs of the calling VM
+ * @num_entries: On input the capacity of @buf in entries, on output the
+ *               number of peer VM IDs the RM reported
+ * @size: On output the number of bytes written to @buf
+ * @buf: Userspace array of __u32 peer VM IDs
+ * @flags: Must be zero
+ *
+ * The resource manager answers about the calling VM, so a host call lists the
+ * VMs the resource manager registered as peers of the host.
+ */
+struct gunyah_vm_peers_args {
+	__u32 num_entries;
+	__u32 size;
+	__u64 buf;
+	__u32 flags;
+	__u32 reserved;
+};
+
+#define GH_SERVICE_VM_GET_PEERS _IOWR(GH_ANDROID_IOCTL_TYPE, 0x2a, \
+				      struct gunyah_vm_peers_args)
+
+/** Owner VM ID the resource manager recorded for the calling VM */
+#define GH_SERVICE_VM_GET_OWNER _IOR(GH_ANDROID_IOCTL_TYPE, 0x29, __u32)
+
+/**
  * struct gunyah_vm_time_base_args - Set the guest's virtual RTC reference
  * @time_base: Guest time base in nanoseconds
  * @sys_timer_ref: Host system timer reference matching @time_base

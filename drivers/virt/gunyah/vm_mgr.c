@@ -2419,6 +2419,58 @@ static long gunyah_dev_ioctl_vm_crash_msg(struct gunyah_rm *rm,
 	return ret;
 }
 
+static long gunyah_dev_ioctl_vm_get_owner(struct gunyah_rm *rm,
+					  unsigned long arg)
+{
+	u16 owner;
+	int ret;
+
+	ret = gunyah_rm_vm_get_owner(rm, &owner);
+	if (ret)
+		return ret;
+
+	if (put_user((u32)owner, (u32 __user *)arg))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long gunyah_dev_ioctl_vm_get_peers(struct gunyah_rm *rm, unsigned long arg)
+{
+	struct gunyah_vm_peers_args args;
+	size_t payload_size = 0;
+	u8 *buf;
+	long ret;
+
+	if (copy_from_user(&args, (const void __user *)arg, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || args.reserved || args.size > PAGE_SIZE)
+		return -EINVAL;
+
+	buf = kzalloc(max_t(size_t, args.size, 1), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = gunyah_rm_vm_get_peers(rm, buf, args.size, &payload_size,
+				     &args.num_entries);
+	if (ret)
+		goto out;
+
+	if (payload_size &&
+	    copy_to_user((void __user *)args.buf, buf, payload_size)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	args.size = payload_size;
+	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+		ret = -EFAULT;
+
+out:
+	kfree(buf);
+	return ret;
+}
+
 static long gunyah_dev_ioctl_host_get_type(struct gunyah_rm *rm,
 					   unsigned long arg)
 {
@@ -2540,6 +2592,10 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 		return gunyah_dev_ioctl_vm_crash_msg(rm, arg);
 	case GH_SERVICE_HOST_GET_TYPE:
 		return gunyah_dev_ioctl_host_get_type(rm, arg);
+	case GH_SERVICE_VM_GET_OWNER:
+		return gunyah_dev_ioctl_vm_get_owner(rm, arg);
+	case GH_SERVICE_VM_GET_PEERS:
+		return gunyah_dev_ioctl_vm_get_peers(rm, arg);
 	case GH_SERVICE_IRQ_LEND:
 		return gunyah_dev_ioctl_irq_lend(rm, arg);
 	case GH_SERVICE_IRQ_RELEASE:

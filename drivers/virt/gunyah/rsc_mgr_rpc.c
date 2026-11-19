@@ -1074,7 +1074,9 @@ ALLOW_ERROR_INJECTION(gunyah_rm_vm_set_firmware_mem, ERRNO);
 #define GUNYAH_RM_RPC_VM_LOOKUP_URI		0x56000011
 #define GUNYAH_RM_RPC_VM_LOOKUP_GUID		0x56000012
 #define GUNYAH_RM_RPC_VM_LOOKUP_NAME		0x56000013
+#define GUNYAH_RM_RPC_VM_GET_OWNER		0x56000015
 #define GUNYAH_RM_RPC_VM_GET_CRASH_MSG		0x56000019
+#define GUNYAH_RM_RPC_VM_GET_PEERS		0x56000025
 #define GUNYAH_RM_RPC_VM_SET_TIME_BASE		0x56000030
 #define GUNYAH_RM_RPC_VM_HOST_GET_TYPE		0x560000A0
 #define GUNYAH_RM_RPC_VM_IRQ_ACCEPT		0x56000050
@@ -1184,6 +1186,89 @@ malformed:
 	return -EBADMSG;
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_vm_lookup, ERRNO);
+
+/**
+ * gunyah_rm_vm_get_owner() - Read the owner VMID the RM recorded for us
+ * @rm: Handle to a Gunyah resource manager
+ * @owner: Set to the owner VMID
+ *
+ * The RM answers about the calling VM, so this reports the host's owner.
+ *
+ * Return: 0 on success, negative errno otherwise.
+ */
+int gunyah_rm_vm_get_owner(struct gunyah_rm *rm, u16 *owner)
+{
+	__le32 *resp __free(kfree) = NULL;
+	size_t resp_size;
+	int ret;
+
+	if (!owner)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_GET_OWNER, NULL, 0,
+			     (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size < sizeof(*resp))
+		goto malformed;
+
+	*owner = (u16)le32_to_cpu(*resp);
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_get_owner, ERRNO);
+
+/**
+ * gunyah_rm_vm_get_peers() - List the peer VMIDs the RM registered for us
+ * @rm: Handle to a Gunyah resource manager
+ * @buf: Destination for the peer VMID array
+ * @buf_size: Capacity of @buf
+ * @payload_size: Set to the number of bytes the RM returned
+ * @n_entries: Set to the number of peer VMIDs
+ *
+ * Return: 0 on success, -ENOSPC if @buf is too small, negative errno otherwise.
+ */
+int gunyah_rm_vm_get_peers(struct gunyah_rm *rm, void *buf, size_t buf_size,
+			   size_t *payload_size, u32 *n_entries)
+{
+	__le32 *resp __free(kfree) = NULL;
+	size_t resp_size;
+	u32 count;
+	int ret;
+
+	if (!buf || !payload_size)
+		return -EINVAL;
+
+	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_VM_GET_PEERS, NULL, 0,
+			     (void **)&resp, &resp_size);
+	if (ret)
+		return ret;
+
+	if (!resp || resp_size < sizeof(*resp))
+		goto malformed;
+
+	count = le32_to_cpu(resp[0]);
+	resp_size -= sizeof(*resp);
+	if (resp_size != count * sizeof(*resp))
+		goto malformed;
+	if (resp_size > buf_size)
+		return -ENOSPC;
+
+	memcpy(buf, resp + 1, resp_size);
+	*payload_size = resp_size;
+	if (n_entries)
+		*n_entries = count;
+	return 0;
+
+malformed:
+	gunyah_rm_mark_failed(rm);
+	return -EBADMSG;
+}
+ALLOW_ERROR_INJECTION(gunyah_rm_vm_get_peers, ERRNO);
 
 /**
  * gunyah_rm_vm_get_id() - Read the RM identifier blob of a VM

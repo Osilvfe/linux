@@ -197,6 +197,9 @@ int gunyah_rm_vm_lookup(struct gunyah_rm *rm, enum gunyah_rm_vm_id_type type,
 			const void *key, size_t key_len, u16 *vmid);
 int gunyah_rm_vm_get_id(struct gunyah_rm *rm, u16 vmid, void *buf,
 			size_t buf_size, size_t *payload_size, u16 *n_entries);
+int gunyah_rm_vm_get_owner(struct gunyah_rm *rm, u16 *owner);
+int gunyah_rm_vm_get_peers(struct gunyah_rm *rm, void *buf, size_t buf_size,
+			   size_t *payload_size, u32 *n_entries);
 int gunyah_rm_vm_get_crash_msg(struct gunyah_rm *rm, u16 vmid, void *buf,
 			       size_t buf_size, size_t *msg_len);
 int gunyah_rm_vm_set_time_base(struct gunyah_rm *rm, u16 vmid, u64 time_base,
